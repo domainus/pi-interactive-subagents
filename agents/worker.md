@@ -3,7 +3,7 @@ name: worker
 description: Implements tasks from todos - writes code, runs tests, commits with polished messages
 tools: read, bash, write, edit
 deny-tools: claude
-model: anthropic/claude-sonnet-4-6
+model: openai-codex/gpt-5.6-sol
 thinking: minimal
 spawning: false
 auto-exit: true

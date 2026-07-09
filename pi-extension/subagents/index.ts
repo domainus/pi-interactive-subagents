@@ -64,24 +64,68 @@ const WIDGET_INTERVAL_KEY = Symbol.for("pi-subagents/widget-interval");
 const STATUS_INTERVAL_KEY = Symbol.for("pi-subagents/status-interval");
 const POLL_ABORT_KEY = Symbol.for("pi-subagents/poll-abort-controller");
 
-{
-  const prevInterval = (globalThis as any)[WIDGET_INTERVAL_KEY];
-  if (prevInterval) {
-    clearInterval(prevInterval);
-    (globalThis as any)[WIDGET_INTERVAL_KEY] = null;
-  }
-  const prevStatusInterval = (globalThis as any)[STATUS_INTERVAL_KEY];
-  if (prevStatusInterval) {
-    clearInterval(prevStatusInterval);
-    (globalThis as any)[STATUS_INTERVAL_KEY] = null;
-  }
-  const prevAbort = (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
-  if (prevAbort) prevAbort.abort();
-  (globalThis as any)[POLL_ABORT_KEY] = new AbortController();
+type PollAbortOwner = {
+  owner: symbol;
+  controller: AbortController;
+};
+
+type IntervalOwner = {
+  owner: symbol;
+  timer: ReturnType<typeof setInterval>;
+};
+
+function getIntervalTimer(value: IntervalOwner | ReturnType<typeof setInterval> | null | undefined) {
+  return value && typeof value === "object" && "timer" in value ? value.timer : value;
 }
 
-function getModuleAbortSignal(): AbortSignal {
-  return ((globalThis as any)[POLL_ABORT_KEY] as AbortController).signal;
+function retireGlobalInterval(
+  key: symbol,
+  interval: IntervalOwner | ReturnType<typeof setInterval>,
+) {
+  const timer = getIntervalTimer(interval);
+  if (timer) clearInterval(timer);
+  if ((globalThis as any)[key] === interval) {
+    (globalThis as any)[key] = null;
+  }
+}
+
+const MODULE_POLL_OWNER = Symbol("pi-subagents/module-generation");
+
+{
+  const prevInterval = (globalThis as any)[WIDGET_INTERVAL_KEY] as IntervalOwner | ReturnType<typeof setInterval> | undefined;
+  if (prevInterval) retireGlobalInterval(WIDGET_INTERVAL_KEY, prevInterval);
+  const prevStatusInterval = (globalThis as any)[STATUS_INTERVAL_KEY] as IntervalOwner | ReturnType<typeof setInterval> | undefined;
+  if (prevStatusInterval) retireGlobalInterval(STATUS_INTERVAL_KEY, prevStatusInterval);
+  const prevAbort = (globalThis as any)[POLL_ABORT_KEY] as PollAbortOwner | undefined;
+  prevAbort?.controller.abort();
+  (globalThis as any)[POLL_ABORT_KEY] = {
+    owner: MODULE_POLL_OWNER,
+    controller: new AbortController(),
+  } satisfies PollAbortOwner;
+}
+
+function activatePollAbortOwner(owner: symbol): AbortSignal {
+  const current = (globalThis as any)[POLL_ABORT_KEY] as PollAbortOwner | undefined;
+  if (current?.owner === owner && !current.controller.signal.aborted) {
+    return current.controller.signal;
+  }
+
+  current?.controller.abort();
+  const next = { owner, controller: new AbortController() } satisfies PollAbortOwner;
+  (globalThis as any)[POLL_ABORT_KEY] = next;
+  return next.controller.signal;
+}
+
+function getOwnedModuleAbortSignal(owner: symbol): AbortSignal {
+  const current = (globalThis as any)[POLL_ABORT_KEY] as PollAbortOwner | undefined;
+  return current?.owner === owner && !current.controller.signal.aborted
+    ? current.controller.signal
+    : activatePollAbortOwner(owner);
+}
+
+function abortPollAbortOwner(owner: symbol) {
+  const current = (globalThis as any)[POLL_ABORT_KEY] as PollAbortOwner | undefined;
+  if (current?.owner === owner) current.controller.abort();
 }
 
 const SubagentParams = Type.Object({
@@ -488,6 +532,8 @@ interface SubagentResult {
  */
 interface RunningSubagent {
   id: string;
+  /** Extension/session generation that launched and owns this watcher. */
+  owner: symbol;
   name: string;
   task: string;
   agent?: string;
@@ -523,11 +569,11 @@ const runningSubagents = new Map<string, RunningSubagent>();
 /** Latest ExtensionContext from session_start, used for widget updates. */
 let latestCtx: ExtensionContext | null = null;
 
-/** Interval timer for widget re-renders. */
-let widgetInterval: ReturnType<typeof setInterval> | null = null;
+/** Generation-owned interval timer for widget re-renders. */
+let widgetInterval: IntervalOwner | null = null;
 
-/** Interval timer for status transition checks. */
-let statusInterval: ReturnType<typeof setInterval> | null = null;
+/** Generation-owned interval timer for status transition checks. */
+let statusInterval: IntervalOwner | null = null;
 
 function formatElapsedMMSS(startTime: number): string {
   const seconds = Math.floor((Date.now() - startTime) / 1000);
@@ -627,9 +673,9 @@ function updateWidget() {
   if (runningSubagents.size === 0) {
     latestCtx.ui.setWidget("subagent-status", undefined);
     if (widgetInterval) {
-      clearInterval(widgetInterval);
+      const interval = widgetInterval;
       widgetInterval = null;
-      (globalThis as any)[WIDGET_INTERVAL_KEY] = null;
+      retireGlobalInterval(WIDGET_INTERVAL_KEY, interval);
     }
     return;
   }
@@ -834,57 +880,62 @@ function handleSubagentInterrupt(
   };
 }
 
-function startStatusRefresh(pi: ExtensionAPI) {
-  if (!statusConfig.enabled || statusInterval) return;
+function refreshSubagentStatuses(pi: Pick<ExtensionAPI, "sendMessage">, now = Date.now()) {
+  const transitionLines: string[] = [];
+  let shouldRefreshWidget = false;
 
-  statusInterval = setInterval(() => {
-    if (runningSubagents.size === 0) {
-      if (statusInterval) {
-        clearInterval(statusInterval);
-        statusInterval = null;
-        (globalThis as any)[STATUS_INTERVAL_KEY] = null;
-      }
-      return;
+  for (const running of runningSubagents.values()) {
+    observeRunningSubagent(running, now);
+    const { nextState, snapshot, transition } = advanceStatusState(running.statusState, now);
+    if (nextState.currentKind !== running.statusState.currentKind) {
+      shouldRefreshWidget = true;
     }
+    running.statusState = nextState;
 
-    const transitionLines: string[] = [];
-    const now = Date.now();
-    let shouldRefreshWidget = false;
-
-    for (const running of runningSubagents.values()) {
-      observeRunningSubagent(running, now);
-      const { nextState, snapshot, transition } = advanceStatusState(running.statusState, now);
-      if (nextState.currentKind !== running.statusState.currentKind) {
-        shouldRefreshWidget = true;
-      }
-      running.statusState = nextState;
-
-      // Interactive subagents (long-running, user-driven) intentionally don't
-      // wake the parent session on stalled/recovered transitions — the user is
-      // working in the subagent's pane, and a steer message here would burn an
-      // orchestrator turn on a no-op "still waiting" ping. Widget still updates.
-      if (transition && !running.interactive) {
-        transitionLines.push(formatTransitionLine(running.name, snapshot, transition));
-      }
+    // Status observation never owns pane cleanup. Even a final `done` snapshot
+    // can arrive before the completion watcher consumes the exit sidecar and
+    // extracts the result. Only watchSubagent closes completed surfaces.
+    if (transition && !running.interactive) {
+      transitionLines.push(formatTransitionLine(running.name, snapshot, transition));
     }
+  }
 
-    if (shouldRefreshWidget) updateWidget();
+  if (shouldRefreshWidget) updateWidget();
 
-    if (transitionLines.length > 0) {
-      const capped = capStatusLines(transitionLines, statusConfig.lineLimit);
-      pi.sendMessage(
-        {
-          customType: "subagent_status",
-          content: formatStatusAggregate(transitionLines, statusConfig.lineLimit),
-          display: true,
-          details: { lines: capped.visibleLines, overflow: capped.overflow },
-        },
-        { triggerTurn: true, deliverAs: "steer" },
-      );
-    }
-  }, 1000);
+  if (transitionLines.length > 0) {
+    const capped = capStatusLines(transitionLines, statusConfig.lineLimit);
+    pi.sendMessage(
+      {
+        customType: "subagent_status",
+        content: formatStatusAggregate(transitionLines, statusConfig.lineLimit),
+        display: true,
+        details: { lines: capped.visibleLines, overflow: capped.overflow },
+      },
+      { triggerTurn: true, deliverAs: "steer" },
+    );
+  }
+}
 
-  (globalThis as any)[STATUS_INTERVAL_KEY] = statusInterval;
+function startStatusRefresh(pi: ExtensionAPI, owner: symbol) {
+  if (!statusConfig.enabled || statusInterval?.owner === owner) return;
+  if (statusInterval) clearInterval(statusInterval.timer);
+
+  const interval: IntervalOwner = {
+    owner,
+    timer: setInterval(() => {
+      if (runningSubagents.size === 0) {
+        if (statusInterval === interval) {
+          statusInterval = null;
+          retireGlobalInterval(STATUS_INTERVAL_KEY, interval);
+        }
+        return;
+      }
+
+      refreshSubagentStatuses(pi);
+    }, 1000),
+  };
+  statusInterval = interval;
+  (globalThis as any)[STATUS_INTERVAL_KEY] = interval;
 }
 
 function resolveResumeLaunchBehavior(params: { autoExit?: boolean }): { autoExit: boolean; interactive: boolean } {
@@ -911,17 +962,29 @@ export const __test__ = {
   handleSubagentInterrupt,
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
+  activatePollAbortOwner,
+  getOwnedModuleAbortSignal,
+  abortPollAbortOwner,
+  retireGlobalInterval,
+  startWidgetRefresh,
+  startStatusRefresh,
+  refreshSubagentStatuses,
   runningSubagents,
   formatElapsed,
 };
 
-function startWidgetRefresh() {
-  if (widgetInterval) return;
+function startWidgetRefresh(owner: symbol) {
+  if (widgetInterval?.owner === owner) return;
+  if (widgetInterval) clearInterval(widgetInterval.timer);
   updateWidget(); // immediate first render
-  widgetInterval = setInterval(() => {
-    updateWidget();
-  }, 1000);
-  (globalThis as any)[WIDGET_INTERVAL_KEY] = widgetInterval;
+  const interval: IntervalOwner = {
+    owner,
+    timer: setInterval(() => {
+      updateWidget();
+    }, 1000),
+  };
+  widgetInterval = interval;
+  (globalThis as any)[WIDGET_INTERVAL_KEY] = interval;
 }
 
 /**
@@ -933,6 +996,7 @@ function startWidgetRefresh() {
 async function launchSubagent(
   params: typeof SubagentParams.static,
   ctx: { sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string }; cwd: string },
+  owner: symbol,
   options?: { surface?: string },
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
@@ -1059,6 +1123,7 @@ async function launchSubagent(
 
     const running: RunningSubagent = {
       id,
+      owner,
       name: params.name,
       task: params.task,
       agent: params.agent,
@@ -1198,6 +1263,7 @@ async function launchSubagent(
 
   const running: RunningSubagent = {
     id,
+    owner,
     name: params.name,
     task: params.task,
     agent: params.agent,
@@ -1246,11 +1312,12 @@ function copyClaudeSession(sentinelFile: string): string | null {
 async function watchSubagent(
   running: RunningSubagent,
   signal: AbortSignal,
+  moduleSignal: AbortSignal,
 ): Promise<SubagentResult> {
   const { name, task, surface, startTime, sessionFile } = running;
 
   try {
-    const result = await pollForExit(surface, AbortSignal.any([signal, getModuleAbortSignal()]), {
+    const result = await pollForExit(surface, AbortSignal.any([signal, moduleSignal]), {
       interval: 1000,
       sessionFile,
       sentinelFile: running.sentinelFile,
@@ -1358,29 +1425,36 @@ async function watchSubagent(
 }
 
 export default function subagentsExtension(pi: ExtensionAPI) {
+  // Pi documents shutdown-before-start ordering for replacements. Keep a unique
+  // owner anyway so a delayed shutdown callback from an old binding cannot abort
+  // watchers launched by a newer binding of this module.
+  const extensionOwner = Symbol("pi-subagents/extension-session-generation");
+  let moduleAbortSignal = activatePollAbortOwner(extensionOwner);
+
   // Capture the UI context for widget updates
   pi.on("session_start", (_event, ctx) => {
     latestCtx = ctx;
+    moduleAbortSignal = getOwnedModuleAbortSignal(extensionOwner);
   });
 
   // Clean up on session shutdown
   pi.on("session_shutdown", (_event, _ctx) => {
-    if (widgetInterval) {
-      clearInterval(widgetInterval);
+    if (widgetInterval?.owner === extensionOwner) {
+      const interval = widgetInterval;
       widgetInterval = null;
-      (globalThis as any)[WIDGET_INTERVAL_KEY] = null;
+      retireGlobalInterval(WIDGET_INTERVAL_KEY, interval);
     }
-    if (statusInterval) {
-      clearInterval(statusInterval);
+    if (statusInterval?.owner === extensionOwner) {
+      const interval = statusInterval;
       statusInterval = null;
-      (globalThis as any)[STATUS_INTERVAL_KEY] = null;
+      retireGlobalInterval(STATUS_INTERVAL_KEY, interval);
     }
-    const moduleAbort = (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
-    if (moduleAbort) moduleAbort.abort();
-    for (const [_id, agent] of runningSubagents) {
+    abortPollAbortOwner(extensionOwner);
+    for (const [id, agent] of runningSubagents) {
+      if (agent.owner !== extensionOwner) continue;
       agent.abortController?.abort();
+      runningSubagents.delete(id);
     }
-    runningSubagents.clear();
   });
 
   // Tools denied via PI_DENY_TOOLS env var (set by parent agent based on frontmatter)
@@ -1447,7 +1521,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
 
         // Launch the subagent (creates pane, sends command)
-        const running = await launchSubagent(params, ctx);
+        const running = await launchSubagent(params, ctx, extensionOwner);
 
         // Create a separate AbortController for the watcher
         // (the tool's signal completes when we return)
@@ -1455,11 +1529,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         running.abortController = watcherAbort;
 
         // Start widget refresh and status supervision when the first agent launches
-        startWidgetRefresh();
-        startStatusRefresh(pi);
+        startWidgetRefresh(extensionOwner);
+        startStatusRefresh(pi, extensionOwner);
 
         // Fire-and-forget: start watching in background
-        watchSubagent(running, watcherAbort.signal)
+        watchSubagent(running, watcherAbort.signal, moduleAbortSignal)
           .then((result) => {
             updateWidget(); // reflect removal from Map immediately
 
@@ -1865,6 +1939,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Register as a running subagent for widget tracking
         const running: RunningSubagent = {
           id,
+          owner: extensionOwner,
           name,
           task: params.message ?? "resumed session",
           surface,
@@ -1879,14 +1954,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           }),
         };
         runningSubagents.set(id, running);
-        startWidgetRefresh();
-        startStatusRefresh(pi);
+        startWidgetRefresh(extensionOwner);
+        startStatusRefresh(pi, extensionOwner);
 
         // Fire-and-forget watcher
         const watcherAbort = new AbortController();
         running.abortController = watcherAbort;
 
-        watchSubagent(running, watcherAbort.signal)
+        watchSubagent(running, watcherAbort.signal, moduleAbortSignal)
           .then((result) => {
             updateWidget();
 

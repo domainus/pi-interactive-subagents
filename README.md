@@ -81,13 +81,16 @@ Subagent panes are created without stealing keyboard focus (cmux, tmux). Launch 
 
 | Agent             | Model                  | Role                                                                                     |
 | ----------------- | ---------------------- | ---------------------------------------------------------------------------------------- |
-| **planner**       | Opus (medium thinking) | Brainstorming — clarifies requirements, explores approaches, writes plans, creates todos |
-| **scout**         | Haiku                  | Fast codebase reconnaissance — maps files, patterns, conventions                         |
-| **worker**        | Sonnet                 | Implements tasks from todos — writes code, runs tests, makes polished commits            |
-| **reviewer**      | Opus (medium thinking) | Reviews code for bugs, security issues, correctness                                      |
-| **visual-tester** | Sonnet                 | Visual QA via Chrome CDP — screenshots, responsive testing, interaction testing          |
+| **planner**       | GPT-5.6 Terra (medium thinking) | Brainstorming — clarifies requirements, explores approaches, writes plans, creates todos |
+| **scout**         | GPT-5.6 Luna                    | Fast codebase reconnaissance — maps files, patterns, conventions                         |
+| **worker**        | GPT-5.6 Sol                     | Implements tasks from todos — writes code, runs tests, makes polished commits            |
+| **reviewer**      | GPT-5.6 Sol (medium thinking)   | Reviews code for bugs, security issues, correctness                                      |
+| **visual-tester** | GPT-5.6 Terra                   | Visual QA via Chrome CDP — screenshots, responsive testing, interaction testing          |
+| **chatgpt-code**  | GPT-5.6 Sol                     | Self-driving ChatGPT/OpenAI Codex coding session for deep investigation                  |
 
 Agent discovery follows priority: **project-local** (`.pi/agents/`) > **global** (`~/.pi/agent/agents/`) > **package-bundled**. Override any bundled agent by placing your own version in the higher-priority location.
+
+> **Migration:** `chatgpt-code` replaces `claude-code` as the visible bundled agent. Existing explicit `agent: "claude-code"` configurations remain supported through a deprecated hidden alias, but now run the same OpenAI Codex-backed Pi flow rather than the external Claude CLI. Update saved configurations to `agent: "chatgpt-code"`.
 
 ---
 
@@ -277,7 +280,7 @@ Place a `.md` file in `.pi/agents/` (project) or `~/.pi/agent/agents/` (global):
 ---
 name: my-agent
 description: Does something specific
-model: anthropic/claude-sonnet-4-6
+model: openai-codex/gpt-5.6-sol
 thinking: minimal
 tools: read, bash, edit, write
 session-mode: lineage-only
@@ -295,7 +298,7 @@ You are a specialized agent that does X...
 | ------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `name`        | string  | Agent name (used in `agent: "my-agent"`)                                                                                                                                                                                                                                    |
 | `description` | string  | Shown in `subagents_list` output                                                                                                                                                                                                                                            |
-| `model`       | string  | Default model (e.g. `anthropic/claude-sonnet-4-6`)                                                                                                                                                                                                                          |
+| `model`       | string  | Default model (e.g. `openai-codex/gpt-5.6-sol`)                                                                                                                                                                                                                          |
 | `thinking`    | string  | Thinking level: `minimal`, `medium`, `high`                                                                                                                                                                                                                                 |
 | `tools`       | string  | Comma-separated **native pi tools only**: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`                                                                                                                                                                             |
 | `skills`      | string  | Comma-separated skill names to auto-load                                                                                                                                                                                                                                    |

@@ -84,14 +84,20 @@ function createMockExtensionApi() {
   const registeredMessageRenderers: Array<any> = [];
   const sentUserMessages: string[] = [];
   const sentMessages: Array<any> = [];
+  const eventHandlers = new Map<string, Array<(...args: any[]) => void>>();
   return {
     registeredTools,
     registeredCommands,
     registeredMessageRenderers,
     sentUserMessages,
     sentMessages,
+    eventHandlers,
     api: {
-      on() {},
+      on(event: string, handler: (...args: any[]) => void) {
+        const handlers = eventHandlers.get(event) ?? [];
+        handlers.push(handler);
+        eventHandlers.set(event, handlers);
+      },
       registerTool(tool: any) {
         registeredTools.push(tool);
       },
@@ -1007,6 +1013,29 @@ describe("subagent discovery", () => {
     );
   });
 
+  it("bundles ChatGPT Code visibly and keeps claude-code as a hidden OpenAI compatibility alias", async () => {
+    await withIsolatedAgentEnv(async () => {
+      const bundled = testApi.discoverAgentDefinitions()
+        .filter((definition: any) => definition.source === "package");
+      const visibleNames = bundled
+        .filter((definition: any) => !definition.disableModelInvocation)
+        .map((definition: any) => definition.name);
+
+      assert.ok(visibleNames.includes("chatgpt-code"));
+      assert.equal(visibleNames.includes("claude-code"), false);
+
+      const alias = testApi.loadAgentDefaults("claude-code");
+      assert.ok(alias, "expected deprecated alias to remain directly loadable from the bundle");
+      assert.equal(alias.disableModelInvocation, true);
+      assert.match(alias.model, /^openai-codex\/gpt-5\.6-(?:luna|terra|sol)$/);
+      assert.equal(alias.cli, undefined, "compatibility alias must not invoke the Claude CLI");
+
+      for (const definition of bundled) {
+        assert.match(definition.model, /^openai-codex\/gpt-5\.6-(?:luna|terra|sol)$/);
+      }
+    });
+  });
+
   it("ignores invalid session-mode values", async () => {
     await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
       writeAgentFile(
@@ -1584,6 +1613,154 @@ describe("subagent activity snapshots", () => {
       });
     } finally {
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("subagent lifecycle hardening", () => {
+  it("replaces an aborted poll controller for a restarted owner", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const owner = Symbol("session-a");
+    const firstSignal = testApi.activatePollAbortOwner(owner);
+
+    testApi.abortPollAbortOwner(owner);
+    assert.equal(firstSignal.aborted, true);
+
+    const nextSignal = testApi.getOwnedModuleAbortSignal(owner);
+    assert.equal(nextSignal.aborted, false);
+    assert.notEqual(nextSignal, firstSignal);
+  });
+
+  it("does not let a late old shutdown remove a watcher launched by a newer binding", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    const pollAbortKey = Symbol.for("pi-subagents/poll-abort-controller");
+    const widgetIntervalKey = Symbol.for("pi-subagents/widget-interval");
+    const statusIntervalKey = Symbol.for("pi-subagents/status-interval");
+    const oldBinding = createMockExtensionApi();
+    const newBinding = createMockExtensionApi();
+    runningMap.clear();
+
+    (subagentsModule as any).default(oldBinding.api);
+    const oldStart = oldBinding.eventHandlers.get("session_start")![0];
+    const oldShutdown = oldBinding.eventHandlers.get("session_shutdown")![0];
+    oldStart({}, {});
+    const oldOwner = (globalThis as any)[pollAbortKey].owner as symbol;
+    testApi.startWidgetRefresh(oldOwner);
+    testApi.startStatusRefresh(oldBinding.api, oldOwner);
+    const oldWidgetInterval = (globalThis as any)[widgetIntervalKey];
+    const oldStatusInterval = (globalThis as any)[statusIntervalKey];
+
+    (subagentsModule as any).default(newBinding.api);
+    const newStart = newBinding.eventHandlers.get("session_start")![0];
+    const newShutdown = newBinding.eventHandlers.get("session_shutdown")![0];
+    newStart({}, {});
+    const newOwner = (globalThis as any)[pollAbortKey].owner as symbol;
+    let newWatcherAborted = false;
+    const newRunning = {
+      id: "new-generation-child",
+      owner: newOwner,
+      name: "New child",
+      task: "",
+      surface: "new-pane",
+      startTime: 0,
+      sessionFile: "new-child.jsonl",
+      interactive: false,
+      abortController: { abort() { newWatcherAborted = true; } },
+      statusState: createStatusState({ source: "pi", startTimeMs: 0 }),
+    };
+    let oldWatcherAborted = false;
+    runningMap.set("old-generation-child", {
+      ...newRunning,
+      id: "old-generation-child",
+      owner: oldOwner,
+      abortController: { abort() { oldWatcherAborted = true; } },
+    });
+    runningMap.set(newRunning.id, newRunning);
+    testApi.startWidgetRefresh(newOwner);
+    testApi.startStatusRefresh(newBinding.api, newOwner);
+    const newWidgetInterval = (globalThis as any)[widgetIntervalKey];
+    const newStatusInterval = (globalThis as any)[statusIntervalKey];
+    assert.equal(newWidgetInterval.owner, newOwner);
+    assert.equal(newStatusInterval.owner, newOwner);
+    assert.equal(oldWidgetInterval.timer._destroyed, true, "new launch should retire the old widget interval");
+    assert.equal(oldStatusInterval.timer._destroyed, true, "new launch should retire the old status interval");
+
+    try {
+      oldShutdown({}, {}); // delayed delivery after the new start and launch
+      assert.equal(oldWatcherAborted, true, "old shutdown should still abort its own watcher");
+      assert.equal(runningMap.has("old-generation-child"), false);
+      assert.equal(newWatcherAborted, false, "old shutdown must not abort the new watcher");
+      assert.equal(runningMap.get(newRunning.id), newRunning, "old shutdown must not remove the new watcher");
+      assert.equal((globalThis as any)[pollAbortKey].controller.signal.aborted, false);
+      assert.equal((globalThis as any)[widgetIntervalKey], newWidgetInterval, "new widget interval must remain registered");
+      assert.equal((globalThis as any)[statusIntervalKey], newStatusInterval, "new status interval must remain registered");
+      assert.equal(newWidgetInterval.timer.hasRef(), true, "new widget interval must remain active");
+      assert.equal(newStatusInterval.timer.hasRef(), true, "new status interval must remain active");
+    } finally {
+      newShutdown({}, {});
+      runningMap.clear();
+    }
+  });
+
+  it("does not let old module-local cleanup unregister newer global interval slots", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const widgetIntervalKey = Symbol.for("pi-subagents/widget-interval");
+    const statusIntervalKey = Symbol.for("pi-subagents/status-interval");
+    const oldWidget = { owner: Symbol("old-widget"), timer: setInterval(() => {}, 60_000) };
+    const oldStatus = { owner: Symbol("old-status"), timer: setInterval(() => {}, 60_000) };
+    const newWidget = { owner: Symbol("new-widget"), timer: setInterval(() => {}, 60_000) };
+    const newStatus = { owner: Symbol("new-status"), timer: setInterval(() => {}, 60_000) };
+    (globalThis as any)[widgetIntervalKey] = newWidget;
+    (globalThis as any)[statusIntervalKey] = newStatus;
+
+    try {
+      // Models delayed final update and shutdown from an old, separately loaded
+      // module instance whose local interval state is no longer in the slots.
+      testApi.retireGlobalInterval(widgetIntervalKey, oldWidget);
+      testApi.retireGlobalInterval(statusIntervalKey, oldStatus);
+
+      assert.equal((globalThis as any)[widgetIntervalKey], newWidget);
+      assert.equal((globalThis as any)[statusIntervalKey], newStatus);
+      assert.equal(newWidget.timer.hasRef(), true);
+      assert.equal(newStatus.timer.hasRef(), true);
+      assert.equal(oldWidget.timer._destroyed, true);
+      assert.equal(oldStatus.timer._destroyed, true);
+    } finally {
+      testApi.retireGlobalInterval(widgetIntervalKey, newWidget);
+      testApi.retireGlobalInterval(statusIntervalKey, newStatus);
+    }
+  });
+
+  it("leaves a status-phase done pane registered for the completion watcher", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    const { api } = createMockExtensionApi();
+    const running = {
+      id: "done-child",
+      name: "Done child",
+      task: "",
+      surface: "pane-must-stay-open",
+      startTime: 0,
+      sessionFile: "done-child.jsonl",
+      interactive: false,
+      statusState: createStatusState({ source: "pi", startTimeMs: 0 }),
+    };
+    running.statusState.phase = "done";
+    runningMap.clear();
+    runningMap.set(running.id, running);
+
+    try {
+      testApi.refreshSubagentStatuses(api, 1_000_000);
+      assert.equal(runningMap.get(running.id), running);
+      assert.equal(running.statusState.phase, "done");
+      assert.doesNotMatch(
+        testApi.refreshSubagentStatuses.toString(),
+        /closeSurface|runningSubagents\.delete/,
+        "status refresh must not take pane-close or result-removal ownership",
+      );
+    } finally {
+      runningMap.clear();
     }
   });
 });

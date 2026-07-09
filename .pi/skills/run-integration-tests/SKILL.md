@@ -30,7 +30,7 @@ Run the fast unit tests first — if these fail, skip integration tests:
 cd /Users/haza/Projects/pi-interactive-subagents && node --test test/test.ts
 ```
 
-All 114 unit tests must pass. If any fail, stop and fix them before proceeding.
+Every unit test must pass. Use the test runner's reported totals rather than maintaining a hard-coded expected count. If any fail, stop and fix them before proceeding.
 
 ## Step 3: Run Integration Tests
 
@@ -66,7 +66,7 @@ cmux close-surface --surface $SURFACE
 | `mux-surface` | 8 | ~45s |
 | `subagent-lifecycle` | 7 | ~170s |
 
-All 15 tests must pass. If any fail, report the failure output and stop.
+Every integration test must pass. Use the test runner's reported totals rather than maintaining a hard-coded expected count. If any fail, report the failure output and stop.
 
 The long-running `keeps a long active tool call from surfacing false stalled status` test in `subagent-lifecycle` runs ~100s on its own — total wall time is ~3:30.
 
@@ -76,7 +76,7 @@ Override defaults with environment variables:
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `PI_TEST_MODEL` | `anthropic/claude-haiku-4-5` | Model for LLM-backed tests |
+| `PI_TEST_MODEL` | `openai-codex/gpt-5.6-luna` | Model for LLM-backed tests |
 | `PI_TEST_TIMEOUT` | `120000` | Per-test timeout in ms |
 
 ## Step 4: Introspect Sessions
@@ -234,9 +234,9 @@ Print a final summary:
 ╭─────────────────────────────────────────────╮
 │ Integration Test Results                    │
 ├─────────────────────────────────────────────┤
-│ Unit tests:        114/114 ✅               │
-│ Mux surface:       8/8  ✅                  │
-│ Subagent lifecycle: 7/7  ✅                 │
+│ Unit tests:        all passed ✅            │
+│ Mux surface:       all passed ✅            │
+│ Subagent lifecycle: all passed ✅           │
 │ Session validation: X sessions verified ✅  │
 │ Fork linkage:      verified ✅              │
 ╰─────────────────────────────────────────────╯
