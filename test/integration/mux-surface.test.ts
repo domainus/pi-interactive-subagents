@@ -83,7 +83,7 @@ for (const backend of backends) {
         const paneB = getSurfacePane(backend, childB);
         assert.ok(paneA, `Expected pane ref for ${childA}`);
         assert.ok(paneB, `Expected pane ref for ${childB}`);
-        assert.equal(paneB, paneA);
+        assert.notEqual(paneB, paneA, "each normal launch must create a distinct cmux pane");
       }
 
       const markerA = uniqueId();

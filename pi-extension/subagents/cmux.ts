@@ -6,7 +6,29 @@ import { basename, dirname, join } from "node:path";
 
 const execFileAsync = promisify(execFile);
 
-export type MuxBackend = "cmux" | "tmux" | "zellij" | "wezterm";
+export type MuxBackend = "cmux" | "tmux" | "zellij" | "wezterm" | "herdr";
+export type SplitDirection = "right" | "down";
+
+const SPLIT_STATE_KEY = Symbol.for("pi-subagents/split-direction-state");
+
+type SplitState = Map<string, SplitDirection>;
+
+function splitState(): SplitState {
+  const root = globalThis as typeof globalThis & { [SPLIT_STATE_KEY]?: SplitState };
+  return (root[SPLIT_STATE_KEY] ??= new Map());
+}
+
+export function nextSplitDirection(key: string): SplitDirection {
+  return splitState().get(key) ?? "right";
+}
+
+export function recordSuccessfulSplit(key: string, direction: SplitDirection): void {
+  splitState().set(key, direction === "right" ? "down" : "right");
+}
+
+export function __resetSplitDirectionStateForTest__(): void {
+  splitState().clear();
+}
 
 const commandAvailability = new Map<string, boolean>();
 
@@ -43,7 +65,7 @@ function hasCommand(command: string): boolean {
 
 function muxPreference(): MuxBackend | null {
   const pref = (process.env.PI_SUBAGENT_MUX ?? "").trim().toLowerCase();
-  if (pref === "cmux" || pref === "tmux" || pref === "zellij" || pref === "wezterm") return pref;
+  if (pref === "cmux" || pref === "tmux" || pref === "zellij" || pref === "wezterm" || pref === "herdr") return pref;
   return null;
 }
 
@@ -63,6 +85,10 @@ function isWezTermRuntimeAvailable(): boolean {
   return !!process.env.WEZTERM_UNIX_SOCKET && hasCommand("wezterm");
 }
 
+function isHerdrRuntimeAvailable(): boolean {
+  return process.env.HERDR_ENV === "1" && !!process.env.HERDR_PANE_ID && hasCommand("herdr");
+}
+
 export function isCmuxAvailable(): boolean {
   return isCmuxRuntimeAvailable();
 }
@@ -79,13 +105,19 @@ export function isWezTermAvailable(): boolean {
   return isWezTermRuntimeAvailable();
 }
 
+export function isHerdrAvailable(): boolean {
+  return isHerdrRuntimeAvailable();
+}
+
 export function getMuxBackend(): MuxBackend | null {
   const pref = muxPreference();
   if (pref === "cmux") return isCmuxRuntimeAvailable() ? "cmux" : null;
   if (pref === "tmux") return isTmuxRuntimeAvailable() ? "tmux" : null;
   if (pref === "zellij") return isZellijRuntimeAvailable() ? "zellij" : null;
   if (pref === "wezterm") return isWezTermRuntimeAvailable() ? "wezterm" : null;
+  if (pref === "herdr") return isHerdrRuntimeAvailable() ? "herdr" : null;
 
+  if (isHerdrRuntimeAvailable()) return "herdr";
   if (isCmuxRuntimeAvailable()) return "cmux";
   if (isTmuxRuntimeAvailable()) return "tmux";
   if (isZellijRuntimeAvailable()) return "zellij";
@@ -111,7 +143,10 @@ export function muxSetupHint(): string {
   if (pref === "wezterm") {
     return "Start pi inside WezTerm.";
   }
-  return "Start pi inside cmux (`cmux pi`), tmux (`tmux new -A -s pi 'pi'`), zellij (`zellij --session pi`, then run `pi`), or WezTerm.";
+  if (pref === "herdr") {
+    return "Start pi inside Herdr.";
+  }
+  return "Start pi inside Herdr, cmux (`cmux pi`), tmux (`tmux new -A -s pi 'pi'`), zellij (`zellij --session pi`, then run `pi`), or WezTerm.";
 }
 
 function requireMuxBackend(): MuxBackend {
@@ -198,9 +233,6 @@ async function zellijActionAsync(args: string[], surface?: string): Promise<stri
   });
   return stdout;
 }
-
-/** Tracked subagent pane for cmux — reused across subagent launches. */
-let cmuxSubagentPane: string | null = null;
 
 // Mirrors Zellij 0.44.x tab minimums, used to predict which pane Zellij itself
 // will choose for a directionless split.
@@ -513,6 +545,9 @@ function createZellijSurfaceUnlocked(name: string): string {
     : null;
 
   if (plan?.mode === "split") {
+    // Zellij 0.44's new-pane can target a tab, but not the exact pane whose
+    // geometry was validated. Keep the proven directionless behavior so its
+    // layout engine splits the same safe candidate set considered above.
     return createZellijTiledPane(name, plan.tabId);
   }
 
@@ -525,6 +560,49 @@ function createZellijSurfaceUnlocked(name: string): string {
 
 function createZellijSurface(name: string): string {
   return withZellijSurfaceLock(() => createZellijSurfaceUnlocked(name));
+}
+
+export function parseHerdrPaneId(output: string): string {
+  let value: unknown;
+  try {
+    value = JSON.parse(output);
+  } catch {
+    throw new Error(`Unexpected herdr pane split output (invalid JSON): ${output || "(empty)"}`);
+  }
+  const response = value as any;
+  const paneId = response?.result?.pane?.pane_id;
+  if (
+    response?.id !== "cli:pane:split" ||
+    response?.result?.type !== "pane_info" ||
+    typeof paneId !== "string" ||
+    !/^w[^:]+:p[^:]+$/.test(paneId)
+  ) {
+    throw new Error(`Unexpected Herdr 0.7.3 pane split response: ${output}`);
+  }
+  return paneId;
+}
+
+export function herdrSplitArgs(parent: string, direction: SplitDirection, cwd: string): string[] {
+  return ["pane", "split", "--pane", parent, "--direction", direction, "--cwd", cwd, "--no-focus"];
+}
+
+export const herdrPaneArgs = {
+  run: (pane: string, command: string) => ["pane", "run", pane, command],
+  read: (pane: string, lines: number) => {
+    if (!Number.isInteger(lines) || lines <= 0) throw new Error("Herdr read lines must be a positive integer");
+    return ["pane", "read", pane, "--source", "recent-unwrapped", "--lines", String(lines)];
+  },
+  close: (pane: string) => ["pane", "close", pane],
+  escape: (pane: string) => ["pane", "send-keys", pane, "esc"],
+};
+
+function createHerdrSurface(direction: SplitDirection): string {
+  const parent = process.env.HERDR_PANE_ID;
+  if (!parent) throw new Error("HERDR_PANE_ID not set");
+  const output = execFileSync("herdr", herdrSplitArgs(parent, direction, process.cwd()), {
+    encoding: "utf8",
+  });
+  return parseHerdrPaneId(output.trim());
 }
 
 type CmuxFocusSnapshot = {
@@ -741,45 +819,43 @@ function createCmuxSplitSurface(
   }
 }
 
-/**
- * Create a new terminal surface for a subagent.
- *
- * For cmux: the first call creates a right-split pane; subsequent calls add
- * tabs to that same pane (avoiding ever-narrower splits).
- * For zellij: chooses a tab-aware tiled or stacked placement.
- * For tmux/wezterm: falls back to split behavior.
- *
- * Returns an identifier (`surface:42` in cmux, `%12` in tmux, `pane:7` in zellij, `42` in wezterm).
- */
+export interface SurfaceCreationBoundary {
+  split(name: string, direction: SplitDirection, parent?: string): string;
+  zellij(name: string): string;
+  herdr(direction: SplitDirection): string;
+}
+
+export function createSurfaceForBackend(
+  backend: MuxBackend,
+  name: string,
+  parent: string | undefined,
+  boundary: SurfaceCreationBoundary,
+): string {
+  const key = `${backend}:${parent ?? "default"}`;
+  const direction = nextSplitDirection(key);
+  const surface = backend === "herdr"
+    ? boundary.herdr(direction)
+    : backend === "zellij"
+      ? boundary.zellij(name)
+      : boundary.split(name, direction, parent);
+  recordSuccessfulSplit(key, direction);
+  return surface;
+}
+
+/** Create a new pane, alternating right/down per backend and stable parent pane. */
 export function createSurface(name: string): string {
-  const backend = getMuxBackend();
-
-  if (backend === "cmux" && cmuxSubagentPane) {
-    // Verify the pane still exists before adding a tab to it
-    try {
-      const tree = execSync(`cmux tree`, { encoding: "utf8" });
-      if (tree.includes(cmuxSubagentPane)) {
-        return createSurfaceInPane(name, cmuxSubagentPane);
-      }
-    } catch {}
-    // Pane is gone — fall through to create a new split
-    cmuxSubagentPane = null;
-  }
-
-  if (backend === "cmux") {
-    const created = createCmuxSplitSurface(name, "right", process.env.CMUX_SURFACE_ID);
-    cmuxSubagentPane = created.paneRef ?? null;
-    return created.surface;
-  }
-
-  if (backend === "zellij") {
-    return createZellijSurface(name);
-  }
-
-  // On tmux, target the parent pi's pane so splits follow the agent, not the user's focus.
-  // See https://github.com/HazAT/pi-interactive-subagents/issues/12
-  const fromSurface = backend === "tmux" ? process.env.TMUX_PANE : undefined;
-  return createSurfaceSplit(name, "right", fromSurface);
+  const backend = requireMuxBackend();
+  const parent =
+    backend === "cmux" ? process.env.CMUX_SURFACE_ID :
+    backend === "tmux" ? process.env.TMUX_PANE :
+    backend === "zellij" ? process.env.ZELLIJ_PANE_ID :
+    backend === "wezterm" ? process.env.WEZTERM_PANE :
+    process.env.HERDR_PANE_ID;
+  return createSurfaceForBackend(backend, name, parent, {
+    split: createSurfaceSplit,
+    zellij: createZellijSurface,
+    herdr: createHerdrSurface,
+  });
 }
 
 /**
@@ -870,6 +946,10 @@ export function createSurfaceSplit(
     return paneId;
   }
 
+  if (backend === "herdr") {
+    return createHerdrSurface(direction === "left" || direction === "right" ? "right" : "down");
+  }
+
   // zellij
   const directionArg = direction === "left" || direction === "right" ? "right" : "down";
   const args = ["new-pane", "--direction", directionArg, "--name", name, "--cwd", process.cwd()];
@@ -932,6 +1012,8 @@ export function renameCurrentTab(title: string): void {
     return;
   }
 
+  if (backend === "herdr") return;
+
   if (backend === "wezterm") {
     const paneId = process.env.WEZTERM_PANE;
     const args = ["cli", "set-tab-title"];
@@ -983,6 +1065,8 @@ export function renameWorkspace(title: string): void {
     return;
   }
 
+  if (backend === "herdr") return;
+
   if (backend === "wezterm") {
     const paneId = process.env.WEZTERM_PANE;
     const args = ["cli", "set-window-title"];
@@ -1033,6 +1117,11 @@ export function sendCommand(surface: string, command: string): void {
     return;
   }
 
+  if (backend === "herdr") {
+    execFileSync("herdr", herdrPaneArgs.run(surface, command), { encoding: "utf8" });
+    return;
+  }
+
   zellijActionSync(["write-chars", command], surface);
   zellijActionSync(["write", "13"], surface);
 }
@@ -1057,6 +1146,11 @@ export function sendEscape(surface: string): void {
     execFileSync("wezterm", ["cli", "send-text", "--pane-id", surface, "--no-paste", "\u001b"], {
       encoding: "utf8",
     });
+    return;
+  }
+
+  if (backend === "herdr") {
+    execFileSync("herdr", herdrPaneArgs.escape(surface), { encoding: "utf8" });
     return;
   }
 
@@ -1132,6 +1226,10 @@ export function readScreen(surface: string, lines = 50): string {
     return tailLines(raw, lines);
   }
 
+  if (backend === "herdr") {
+    return execFileSync("herdr", herdrPaneArgs.read(surface, lines), { encoding: "utf8" });
+  }
+
   // Zellij 0.44+: use --pane-id flag + stdout instead of env var + temp file.
   // The ZELLIJ_PANE_ID env var doesn't reliably target other panes for dump-screen,
   // and --path may silently fail to create the file. Stdout capture is robust.
@@ -1177,6 +1275,11 @@ export async function readScreenAsync(surface: string, lines = 50): Promise<stri
     return tailLines(stdout, lines);
   }
 
+  if (backend === "herdr") {
+    const { stdout } = await execFileAsync("herdr", herdrPaneArgs.read(surface, lines), { encoding: "utf8" });
+    return stdout;
+  }
+
   // Zellij 0.44+: use --pane-id flag + stdout instead of env var + temp file.
   const paneId = zellijPaneId(surface);
   const { stdout } = await execFileAsync(
@@ -1209,6 +1312,11 @@ export function closeSurface(surface: string): void {
     execFileSync("wezterm", ["cli", "kill-pane", "--pane-id", surface], {
       encoding: "utf8",
     });
+    return;
+  }
+
+  if (backend === "herdr") {
+    execFileSync("herdr", herdrPaneArgs.close(surface), { encoding: "utf8" });
     return;
   }
 

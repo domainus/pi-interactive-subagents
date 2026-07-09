@@ -26,11 +26,16 @@ subagent({ name: "Scout: DB", agent: "scout", task: "Map database schema" });
 ## Install
 
 ```bash
-pi install git:github.com/HazAT/pi-interactive-subagents
+pi install git:github.com/domainus/pi-interactive-subagents
+
+# Later, update that installed package explicitly:
+pi update --extension git:github.com/domainus/pi-interactive-subagents
 ```
+
 
 Supported multiplexers:
 
+- [Herdr](https://herdr.dev)
 - [cmux](https://github.com/manaflow-ai/cmux)
 - [tmux](https://github.com/tmux/tmux)
 - [zellij](https://zellij.dev)
@@ -46,9 +51,10 @@ tmux new -A -s pi 'pi'
 zellij --session pi   # then run: pi
 # or
 # just run pi inside WezTerm — no wrapper needed
+# or run pi in a Herdr pane
 ```
 
-Optional: set `PI_SUBAGENT_MUX=cmux|tmux|zellij|wezterm` to force a specific backend.
+Optional: set `PI_SUBAGENT_MUX=herdr|cmux|tmux|zellij|wezterm` to force a specific backend.
 
 If your shell startup is slow and subagent commands sometimes get dropped before the prompt is ready, set `PI_SUBAGENT_SHELL_READY_DELAY_MS` to a higher value (defaults to `500`):
 
@@ -56,7 +62,9 @@ If your shell startup is slow and subagent commands sometimes get dropped before
 export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500
 ```
 
-Subagent panes are created without stealing keyboard focus (cmux, tmux). Launch commands target child surfaces by explicit ID, so focus and command delivery are independent. Note: the `interactive` option controls parent status notifications, not terminal focus.
+Every normal launch creates a new pane, alternating placement **right, down, right, down** for each multiplexer/parent-pane pair on cmux, tmux, WezTerm, and Herdr. The sequence survives `/reload` and advances only after pane creation succeeds. Zellij creates a new pane while retaining its directionless minimum-size stacking/new-tab safety fallbacks because supported Zellij versions cannot explicitly target the exact validated pane for a directional split. Panes are created without intentionally stealing keyboard focus (including Herdr's `--no-focus`); launch commands always target the child by explicit ID. The `interactive` option controls parent status notifications, not terminal focus.
+
+Herdr support uses its documented JSON CLI (`pane split/run/read/close`). It has deterministic unit coverage and was smoke-tested against Herdr 0.7.3, including no-focus splitting, command delivery, screen reads, Escape delivery, and cleanup.
 
 ## What's Included
 
@@ -81,7 +89,7 @@ Subagent panes are created without stealing keyboard focus (cmux, tmux). Launch 
 
 | Agent             | Model                  | Role                                                                                     |
 | ----------------- | ---------------------- | ---------------------------------------------------------------------------------------- |
-| **planner**       | GPT-5.6 Terra (medium thinking) | Brainstorming — clarifies requirements, explores approaches, writes plans, creates todos |
+| **planner**       | GPT-5.6 Terra (medium thinking) | Autonomous planning — investigates context, resolves factual gaps, and returns a complete implementation plan |
 | **scout**         | GPT-5.6 Luna                    | Fast codebase reconnaissance — maps files, patterns, conventions                         |
 | **worker**        | GPT-5.6 Sol                     | Implements tasks from todos — writes code, runs tests, makes polished commits            |
 | **reviewer**      | GPT-5.6 Sol (medium thinking)   | Reviews code for bugs, security issues, correctness                                      |
@@ -128,7 +136,7 @@ The widget tracks each Pi-backed sub-agent from a child-written runtime snapshot
 
 These labels are no longer derived from session-file growth. Session JSONL is still used for transcript, resume, lineage, and result extraction, but Pi-backed liveness now comes from a small activity snapshot written by the child extension. A fixed internal watchdog marks a run as `stalled` when valid snapshots never appear, stop being readable, or stop matching the current child; valid long-running `active` or `waiting` states do not become `stalled` just because time passes. When a run enters `stalled` or recovers from it, the parent agent receives a steer message so it can react. All other status transitions stay in the widget only.
 
-**Interactive subagents stay silent.** Long-running user-driven subagents (e.g. `planner`, or any `/iterate` fork) do not wake the parent session on `stalled`/`recovered` transitions — the user is working directly in the subagent's pane, and a steer message there would just burn an orchestrator turn on a no-op "still waiting" ping. The widget still updates normally, and child snapshots are still recorded/classified regardless of the `interactive` setting. By default, agents with `auto-exit: true` are treated as autonomous and get stall pings; agents without it are treated as interactive and stay quiet. Override per-agent with `interactive: true|false` in frontmatter, or per-spawn with `interactive: true|false` on the tool call.
+**Interactive subagents stay silent.** Long-running user-driven subagents (e.g. an `/iterate` fork or an explicitly `interactive: true` spawn) do not wake the parent session on `stalled`/`recovered` transitions — the user is working directly in the subagent's pane, and a steer message there would just burn an orchestrator turn on a no-op "still waiting" ping. The widget still updates normally, and child snapshots are still recorded/classified regardless of the `interactive` setting. By default, agents with `auto-exit: true` are treated as autonomous and get stall pings; agents without it are treated as interactive and stay quiet. Override per-agent with `interactive: true|false` in frontmatter, or per-spawn with `interactive: true|false` on the tool call.
 
 #### Configuration
 
@@ -160,7 +168,7 @@ subagent({ name: "Scout", agent: "scout", task: "Analyze the codebase..." });
 subagent({ name: "Iterate", fork: true, task: "Fix the bug where..." });
 
 // Agent defaults can choose a different session-mode via frontmatter
-subagent({ name: "Planner", agent: "planner", task: "Work through the design with me" });
+subagent({ name: "Planner", agent: "planner", task: "Produce a design plan and return it" });
 
 // Custom working directory
 subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer", task: "..." });
@@ -245,7 +253,7 @@ The `/plan` command orchestrates a full planning-to-implementation pipeline.
 
 ```
 Phase 1: Investigation    → Quick codebase scan
-Phase 2: Planning         → Interactive planner subagent (user collaborates)
+Phase 2: Planning         → Autonomous planner subagent (returns and closes)
 Phase 3: Review Plan      → Confirm todos, adjust if needed
 Phase 4: Execute          → Scout + sequential workers implement todos
 Phase 5: Review           → Reviewer subagent checks all changes
@@ -305,7 +313,7 @@ You are a specialized agent that does X...
 | `session-mode` | string | Default child-session mode: `standalone`, `lineage-only`, or `fork` |
 | `spawning`    | boolean | Set `false` to deny all subagent-spawning tools                                                                                                                                                                                                                             |
 | `deny-tools`  | string  | Comma-separated extension tool names to deny                                                                                                                                                                                                                                |
-| `auto-exit`   | boolean | Auto-shutdown when the agent finishes its turn — no `subagent_done` call needed. If the user sends any input, auto-exit is permanently disabled and the user takes over the session. Recommended for autonomous agents (scout, worker); not for interactive ones (planner). Also determines the default value of `interactive` (see below). |
+| `auto-exit`   | boolean | Auto-shutdown when the agent finishes its turn — no `subagent_done` call needed. If the user sends any input, auto-exit is permanently disabled and the user takes over the session. Recommended for autonomous agents (scout, worker, planner); not for interactive `/iterate` sessions. Also determines the default value of `interactive` (see below). |
 | `interactive` | boolean | derived        | Override whether stall/recovery transitions wake the parent session. Defaults to the inverse of `auto-exit`: autonomous agents (`auto-exit: true`) are non-interactive and get stall pings; agents without `auto-exit` are interactive and stay quiet. Explicit values take precedence. |
 | `cwd`         | string  | Default working directory (absolute or relative to project root)                                                                                                                                                                                                            |
 | `disable-model-invocation` | boolean | Hide this agent from discovery surfaces like `subagents_list`. The agent still remains directly invokable by explicit name via `subagent({ agent: "name", ... })`. |
@@ -345,8 +353,8 @@ When set to `true`, the agent session shuts down automatically as soon as the ag
 
 **When to use:**
 
-- ✅ Autonomous agents (scout, worker, reviewer) that run to completion
-- ❌ Interactive agents (planner, iterate) where the user drives the session
+- ✅ Autonomous agents (scout, planner, worker, reviewer) that run to completion
+- ❌ Interactive agents (such as `/iterate`) where the user drives the session
 
 ```yaml
 ---
@@ -370,7 +378,7 @@ Controls whether status transitions (`stalled`, `recovered`) wake the parent ses
 
 ```yaml
 ---
-name: planner
+name: interactive-helper
 # interactive defaults to true because auto-exit is not set
 ---
 ```
@@ -471,12 +479,15 @@ Every sub-agent session displays a compact tools widget showing available and de
 
 - [pi](https://github.com/badlogic/pi-mono) — the coding agent
 - One supported multiplexer:
+  - [Herdr](https://herdr.dev)
   - [cmux](https://github.com/manaflow-ai/cmux)
   - [tmux](https://github.com/tmux/tmux)
   - [zellij](https://zellij.dev)
   - [WezTerm](https://wezfurlong.org/wezterm/)
 
 ```bash
+# run pi inside a Herdr pane
+# or
 cmux pi
 # or
 tmux new -A -s pi 'pi'
@@ -489,7 +500,7 @@ zellij --session pi   # then run: pi
 Optional backend override:
 
 ```bash
-export PI_SUBAGENT_MUX=cmux   # or tmux, zellij, wezterm
+export PI_SUBAGENT_MUX=herdr   # or cmux, tmux, zellij, wezterm
 ```
 
 ---

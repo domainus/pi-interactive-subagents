@@ -30,6 +30,13 @@ import {
   predictZellijSplitDirection,
   selectZellijPlacement,
   selectZellijStackPlacement,
+  nextSplitDirection,
+  recordSuccessfulSplit,
+  __resetSplitDirectionStateForTest__,
+  parseHerdrPaneId,
+  herdrSplitArgs,
+  herdrPaneArgs,
+  createSurfaceForBackend,
 } from "../pi-extension/subagents/cmux.ts";
 import {
   advanceStatusState,
@@ -993,7 +1000,7 @@ describe("subagent discovery", () => {
     );
   });
 
-  it("bundled scout/worker/reviewer agents resolve as non-interactive; planner resolves as interactive", () => {
+  it("bundled scout/worker/reviewer/planner agents resolve as non-interactive", () => {
     for (const name of ["scout", "worker", "reviewer"]) {
       const defs = testApi.loadAgentDefaults(name);
       assert.ok(defs, `expected bundled agent ${name} to be discoverable`);
@@ -1006,10 +1013,18 @@ describe("subagent discovery", () => {
 
     const planner = testApi.loadAgentDefaults("planner");
     assert.ok(planner, "expected bundled planner to be discoverable");
+    assert.equal(planner.autoExit, true, "planner must auto-exit after non-interactive planning");
+    const bundledPlanner = readFileSync(
+      join(fileURLToPath(new URL("..", import.meta.url)), "agents", "planner.md"),
+      "utf8",
+    );
+    assert.match(bundledPlanner, /Complete the task in one autonomous run/);
+    assert.match(bundledPlanner, /Never stop to ask the user a question/);
+    assert.doesNotMatch(bundledPlanner, /wait for the user to reply/i);
     assert.equal(
       testApi.resolveEffectiveInteractive({ name: "planner", task: "" }, planner),
-      true,
-      "planner should resolve as interactive (no auto-exit)",
+      false,
+      "planner should close and deliver instead of waiting indefinitely",
     );
   });
 
@@ -2259,6 +2274,79 @@ describe("subagents widget rendering", () => {
         );
       }
     }
+  });
+});
+
+describe("mux split sequencing and Herdr helpers", () => {
+  before(() => __resetSplitDirectionStateForTest__());
+  after(() => __resetSplitDirectionStateForTest__());
+
+  it("alternates independently and advances only when success is recorded", () => {
+    assert.equal(nextSplitDirection("tmux:%1"), "right");
+    assert.equal(nextSplitDirection("tmux:%1"), "right", "a failed creation must not advance");
+    recordSuccessfulSplit("tmux:%1", "right");
+    assert.equal(nextSplitDirection("tmux:%1"), "down");
+    assert.equal(nextSplitDirection("tmux:%2"), "right");
+    recordSuccessfulSplit("tmux:%1", "down");
+    assert.equal(nextSplitDirection("tmux:%1"), "right");
+  });
+
+  it("routes complete backend launches, targets stable parents, and retries direction after failure", () => {
+    const calls: any[] = [];
+    let fail = true;
+    const boundary = {
+      split(name: string, direction: string, parent?: string) {
+        calls.push(["split", name, direction, parent]);
+        if (fail) { fail = false; throw new Error("creation failed"); }
+        return `surface-${calls.length}`;
+      },
+      zellij(name: string) { calls.push(["zellij", name]); return "pane-z"; },
+      herdr(direction: string) { calls.push(["herdr", direction]); return "w1:p2"; },
+    };
+    assert.throws(() => createSurfaceForBackend("tmux", "one", "%7", boundary), /creation failed/);
+    assert.equal(createSurfaceForBackend("tmux", "retry", "%7", boundary), "surface-2");
+    assert.equal(createSurfaceForBackend("tmux", "next", "%7", boundary), "surface-3");
+    createSurfaceForBackend("tmux", "independent", "%8", boundary);
+    createSurfaceForBackend("cmux", "cmux", "surface:1", boundary);
+    createSurfaceForBackend("wezterm", "wez", "41", boundary);
+    createSurfaceForBackend("herdr", "herdr", "w1:p1", boundary);
+    createSurfaceForBackend("zellij", "zellij", "9", boundary);
+    assert.deepEqual(calls.slice(0, 4), [
+      ["split", "one", "right", "%7"],
+      ["split", "retry", "right", "%7"],
+      ["split", "next", "down", "%7"],
+      ["split", "independent", "right", "%8"],
+    ]);
+    assert.ok(calls.some((call) => call[0] === "herdr" && call[1] === "right"));
+    assert.ok(calls.some((call) => call[0] === "zellij"));
+  });
+
+  it("stores sequence state on Symbol.for global state for reload persistence", () => {
+    const key = Symbol.for("pi-subagents/split-direction-state");
+    recordSuccessfulSplit("cmux:surface:1", "right");
+    assert.equal((globalThis as any)[key].get("cmux:surface:1"), "down");
+  });
+
+  it("builds documented Herdr split arguments", () => {
+    assert.deepEqual(herdrSplitArgs("pane-1", "down", "/repo"), [
+      "pane", "split", "--pane", "pane-1", "--direction", "down", "--cwd", "/repo", "--no-focus",
+    ]);
+  });
+
+  it("builds documented Herdr delivery, polling, cleanup, and escape commands", () => {
+    assert.deepEqual(herdrPaneArgs.run("p2", "echo ok"), ["pane", "run", "p2", "echo ok"]);
+    assert.deepEqual(herdrPaneArgs.read("p2", 80), ["pane", "read", "p2", "--source", "recent-unwrapped", "--lines", "80"]);
+    assert.deepEqual(herdrPaneArgs.close("p2"), ["pane", "close", "p2"]);
+    assert.throws(() => herdrPaneArgs.read("p2", 0), /positive integer/);
+    assert.deepEqual(herdrPaneArgs.escape("p2"), ["pane", "send-keys", "p2", "esc"]);
+  });
+
+  it("defensively parses Herdr pane ids from documented and nested JSON", () => {
+    const response = '{"id":"cli:pane:split","result":{"pane":{"pane_id":"w1:p2"},"type":"pane_info"}}';
+    assert.equal(parseHerdrPaneId(response), "w1:p2");
+    assert.throws(() => parseHerdrPaneId("not json"), /invalid JSON/);
+    assert.throws(() => parseHerdrPaneId('{"id":"request-1","result":{"pane":{"pane_id":"w1:p2"},"type":"pane_info"}}'), /Unexpected Herdr 0.7.3/);
+    assert.throws(() => parseHerdrPaneId('{"id":"cli:pane:split","result":{"pane":{"id":"w1:p2"},"type":"pane_info"}}'), /Unexpected Herdr 0.7.3/);
   });
 });
 
