@@ -74,6 +74,12 @@ type IntervalOwner = {
   timer: ReturnType<typeof setInterval>;
 };
 
+function abortPollController(value: PollAbortOwner | AbortController | undefined) {
+  if (!value) return;
+  const controller = "controller" in value ? value.controller : value;
+  controller.abort();
+}
+
 function getIntervalTimer(value: IntervalOwner | ReturnType<typeof setInterval> | null | undefined) {
   return value && typeof value === "object" && "timer" in value ? value.timer : value;
 }
@@ -96,8 +102,8 @@ const MODULE_POLL_OWNER = Symbol("pi-subagents/module-generation");
   if (prevInterval) retireGlobalInterval(WIDGET_INTERVAL_KEY, prevInterval);
   const prevStatusInterval = (globalThis as any)[STATUS_INTERVAL_KEY] as IntervalOwner | ReturnType<typeof setInterval> | undefined;
   if (prevStatusInterval) retireGlobalInterval(STATUS_INTERVAL_KEY, prevStatusInterval);
-  const prevAbort = (globalThis as any)[POLL_ABORT_KEY] as PollAbortOwner | undefined;
-  prevAbort?.controller.abort();
+  const prevAbort = (globalThis as any)[POLL_ABORT_KEY] as PollAbortOwner | AbortController | undefined;
+  abortPollController(prevAbort);
   (globalThis as any)[POLL_ABORT_KEY] = {
     owner: MODULE_POLL_OWNER,
     controller: new AbortController(),

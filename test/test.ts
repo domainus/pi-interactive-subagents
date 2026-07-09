@@ -1633,6 +1633,22 @@ describe("subagent activity snapshots", () => {
 });
 
 describe("subagent lifecycle hardening", () => {
+  it("loads across the legacy raw AbortController reload state", async () => {
+    const pollAbortKey = Symbol.for("pi-subagents/poll-abort-controller");
+    const legacyController = new AbortController();
+    (globalThis as any)[pollAbortKey] = legacyController;
+
+    try {
+      await import(`../pi-extension/subagents/index.ts?legacy-abort-state=${Date.now()}`);
+      assert.equal(legacyController.signal.aborted, true);
+      assert.ok((globalThis as any)[pollAbortKey].controller instanceof AbortController);
+    } finally {
+      const current = (globalThis as any)[pollAbortKey];
+      current?.controller?.abort();
+      delete (globalThis as any)[pollAbortKey];
+    }
+  });
+
   it("replaces an aborted poll controller for a restarted owner", () => {
     const testApi = (subagentsModule as any).__test__;
     const owner = Symbol("session-a");
