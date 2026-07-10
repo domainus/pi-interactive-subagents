@@ -20,7 +20,7 @@ import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import {
-  getAvailableBackends,
+  getAvailableLifecycleBackends,
   setBackend,
   restoreBackend,
   createTestEnv,
@@ -37,7 +37,7 @@ import {
   type TestEnv,
 } from "./harness.ts";
 
-const backends = getAvailableBackends();
+const backends = getAvailableLifecycleBackends();
 
 if (backends.length === 0) {
   console.log("⚠️  No mux backend available — skipping subagent lifecycle integration tests");

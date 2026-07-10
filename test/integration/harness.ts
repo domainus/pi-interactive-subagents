@@ -85,11 +85,11 @@ export const PI_TIMEOUT = Number(process.env.PI_TEST_TIMEOUT ?? "120000");
  * Detect which mux backends are actually available in the current environment.
  * Temporarily sets PI_SUBAGENT_MUX to probe each backend.
  */
-export function getAvailableBackends(): MuxBackend[] {
+function detectAvailableBackends(candidates: MuxBackend[]): MuxBackend[] {
   const backends: MuxBackend[] = [];
   const orig = process.env.PI_SUBAGENT_MUX;
 
-  for (const backend of ["cmux", "tmux", "zellij"] as MuxBackend[]) {
+  for (const backend of candidates) {
     process.env.PI_SUBAGENT_MUX = backend;
     try {
       if (getMuxBackend() === backend) backends.push(backend);
@@ -100,6 +100,14 @@ export function getAvailableBackends(): MuxBackend[] {
   else process.env.PI_SUBAGENT_MUX = orig;
 
   return backends;
+}
+
+export function getAvailableBackends(): MuxBackend[] {
+  return detectAvailableBackends(["cmux", "tmux", "zellij"]);
+}
+
+export function getAvailableLifecycleBackends(): MuxBackend[] {
+  return detectAvailableBackends(["cmux", "tmux", "zellij", "herdr"]);
 }
 
 export function setBackend(backend: MuxBackend): string | undefined {

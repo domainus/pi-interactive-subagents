@@ -60,6 +60,7 @@ import {
   shouldMarkUserTookOver,
   shouldAutoExitOnAgentEnd,
   findLatestAssistantError,
+  buildAutoExitSidecar,
 } from "../pi-extension/subagents/subagent-done.ts";
 import { __pollForExitTest__ } from "../pi-extension/subagents/cmux.ts";
 
@@ -1293,6 +1294,29 @@ describe("subagent-done.ts", () => {
       // failure detail; staying open would just strand the worker.
       const messages = [{ role: "assistant", stopReason: "error", errorMessage: "529 overloaded" }];
       assert.equal(shouldAutoExitOnAgentEnd(false, messages), true);
+    });
+  });
+
+  describe("buildAutoExitSidecar", () => {
+    it("returns a done payload after normal auto-exit completion", () => {
+      const messages = [{ role: "assistant", stopReason: "stop" }];
+      assert.deepEqual(buildAutoExitSidecar(false, messages), { type: "done" });
+    });
+
+    it("preserves provider error details in the auto-exit payload", () => {
+      const messages = [
+        { role: "assistant", stopReason: "error", errorMessage: "401 Unauthorized" },
+      ];
+      assert.deepEqual(buildAutoExitSidecar(false, messages), {
+        type: "error",
+        errorMessage: "401 Unauthorized",
+        stopReason: "error",
+      });
+    });
+
+    it("returns no payload when an aborted turn must remain open", () => {
+      const messages = [{ role: "assistant", stopReason: "aborted" }];
+      assert.equal(buildAutoExitSidecar(false, messages), null);
     });
   });
 

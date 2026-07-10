@@ -42,6 +42,10 @@ export interface SubagentErrorInfo {
   stopReason: "error";
 }
 
+export type AutoExitSidecar =
+  | { type: "done" }
+  | ({ type: "error" } & SubagentErrorInfo);
+
 /**
  * If the last assistant message in the turn ended with `stopReason: "error"`
  * (typically auto-retry exhausted on an overload / rate limit / server error),
@@ -66,6 +70,15 @@ export function findLatestAssistantError(
     };
   }
   return null;
+}
+
+export function buildAutoExitSidecar(
+  userTookOver: boolean,
+  messages: any[] | undefined,
+): AutoExitSidecar | null {
+  if (!shouldAutoExitOnAgentEnd(userTookOver, messages)) return null;
+  const errorInfo = findLatestAssistantError(messages);
+  return errorInfo ? { type: "error", ...errorInfo } : { type: "done" };
 }
 
 export function parseDeniedTools(rawValue: string | undefined): string[] {
@@ -173,29 +186,18 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("agent_end", (event, ctx) => {
     const messages = (event as any).messages as any[] | undefined;
-    const shouldExit = autoExit && shouldAutoExitOnAgentEnd(userTookOver, messages);
+    const exitSidecar = autoExit ? buildAutoExitSidecar(userTookOver, messages) : null;
 
-    if (shouldExit) {
-      // Surface stopReason: "error" turns (auto-retry exhausted, provider
-      // overload, etc.) to the parent via the .exit sidecar so the watcher
-      // can report a clear failure with the underlying error message.
-      // Without this the parent would only see exit code 0 and a stale
-      // assistant message, mistaking the crash for a successful completion.
-      const errorInfo = findLatestAssistantError(messages);
+    if (exitSidecar) {
+      // Persist completion before shutdown so the parent watcher does not depend
+      // on a multiplexer pane retaining the same identifier long enough to read
+      // the shell sentinel. Error payloads preserve their provider detail.
       const sessionFile = process.env.PI_SUBAGENT_SESSION;
-      if (errorInfo && sessionFile) {
+      if (sessionFile) {
         try {
-          writeFileSync(
-            `${sessionFile}.exit`,
-            JSON.stringify({
-              type: "error",
-              errorMessage: errorInfo.errorMessage,
-              stopReason: errorInfo.stopReason,
-            }),
-          );
+          writeFileSync(`${sessionFile}.exit`, JSON.stringify(exitSidecar));
         } catch {
-          // Best effort — even without the sidecar, watcher's session-file
-          // fallback can still recover the errorMessage.
+          // Best effort — terminal sentinel polling remains the crash fallback.
         }
       }
 
