@@ -30,8 +30,9 @@ import {
 } from "./cmux.ts";
 
 import {
-  findLastAssistantMessage,
-  getNewEntries,
+  capDeliveredResult,
+  findLastAssistantMessageInSession,
+  getSessionBoundary,
   seedSubagentSessionFile,
 } from "./session.ts";
 import {
@@ -1373,9 +1374,8 @@ async function watchSubagent(
     // Pi subagent result extraction
     let summary: string;
     if (existsSync(sessionFile)) {
-      const allEntries = getNewEntries(sessionFile, 0);
       summary =
-        findLastAssistantMessage(allEntries) ??
+        findLastAssistantMessageInSession(sessionFile) ??
         (result.errorMessage
           ? `Subagent error: ${result.errorMessage}`
           : result.exitCode !== 0
@@ -1563,7 +1563,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               return;
             }
 
-            const presentation = resolveResultPresentation(result, running.name);
+            const presentation = capDeliveredResult(resolveResultPresentation(result, running.name), result.sessionFile ?? running.sessionFile);
 
             pi.sendMessage(
               {
@@ -1871,7 +1871,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
 
         // Record entry count before resuming so we can extract new messages
-        const entryCountBefore = getNewEntries(params.sessionPath, 0).length;
+        const sessionBoundaryBefore = getSessionBoundary(params.sessionPath);
 
         const surface = createSurface(name);
         await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
@@ -1989,17 +1989,16 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               return;
             }
 
-            const allEntries = getNewEntries(params.sessionPath, entryCountBefore);
-            const summary = findLastAssistantMessage(allEntries) ??
+            const summary = findLastAssistantMessageInSession(params.sessionPath, sessionBoundaryBefore) ??
               (result.errorMessage
                 ? `Subagent error: ${result.errorMessage}`
                 : result.exitCode !== 0
                   ? `Resumed session exited with code ${result.exitCode}`
                   : "Resumed session exited without new output");
-            const presentation = resolveResultPresentation(
+            const presentation = capDeliveredResult(resolveResultPresentation(
               { ...result, summary, sessionFile: params.sessionPath },
               name,
-            );
+            ), params.sessionPath);
 
             pi.sendMessage(
               {

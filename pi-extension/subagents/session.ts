@@ -1,4 +1,4 @@
-import { appendFileSync, copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, copyFileSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, writeFileSync } from "node:fs";
 import { randomBytes, randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 
@@ -100,6 +100,74 @@ export function getNewEntries(sessionFile: string, afterLine: number): SessionEn
  * auto-retry exhausts on a provider overload / rate limit / server error, and
  * without this fallback the parent would silently see a stale earlier message.
  */
+export const MAX_DELIVERED_RESULT_BYTES = 64 * 1024;
+
+/** Byte offset that can be saved before a resume and used as an exact JSONL boundary. */
+export function getSessionBoundary(sessionFile: string): number {
+  const fd = openSync(sessionFile, "r");
+  try { return fstatSync(fd).size; } finally { closeSync(fd); }
+}
+
+/**
+ * Find the last assistant message after a byte boundary by scanning backwards.
+ * Only one bounded chunk and one JSONL record are materialized at a time.
+ */
+export function findLastAssistantMessageInSession(
+  sessionFile: string,
+  afterByte = 0,
+): string | null {
+  const fd = openSync(sessionFile, "r");
+  try {
+    const end = fstatSync(fd).size;
+    let position = end;
+    let suffix = Buffer.alloc(0);
+    const chunkSize = 64 * 1024;
+    while (position > afterByte) {
+      const size = Math.min(chunkSize, position - afterByte);
+      position -= size;
+      const chunk = Buffer.allocUnsafe(size);
+      readSync(fd, chunk, 0, size, position);
+      const combined = Buffer.concat([chunk, suffix]);
+      const parts: Buffer[] = [];
+      let lineEnd = combined.length;
+      for (let i = combined.length - 1; i >= 0; i--) {
+        if (combined[i] === 10) {
+          parts.push(combined.subarray(i + 1, lineEnd));
+          lineEnd = i;
+        }
+      }
+      suffix = combined.subarray(0, lineEnd);
+      for (const part of parts) {
+        const line = part.toString("utf8");
+        if (!line.trim()) continue;
+        try {
+          const result = findLastAssistantMessage([JSON.parse(line) as SessionEntry]);
+          if (result !== null) return result;
+        } catch { /* preserve malformed-line tolerance while scanning */ }
+      }
+    }
+    if (suffix.length > 0) {
+      try { return findLastAssistantMessage([JSON.parse(suffix.toString("utf8")) as SessionEntry]); } catch {}
+    }
+    return null;
+  } finally { closeSync(fd); }
+}
+
+export function capDeliveredResult(text: string, sessionFile: string): string {
+  const bytes = Buffer.byteLength(text, "utf8");
+  if (bytes <= MAX_DELIVERED_RESULT_BYTES) return text;
+  const notice = `\n\n[Result truncated from ${bytes} bytes to 64 KiB. Full session: ${sessionFile}]`;
+  const budget = MAX_DELIVERED_RESULT_BYTES - Buffer.byteLength(notice, "utf8");
+  const source = Buffer.from(text, "utf8");
+  let end = Math.max(0, budget);
+  let body = "";
+  while (end >= 0) {
+    try { body = new TextDecoder("utf-8", { fatal: true }).decode(source.subarray(0, end)); break; }
+    catch { end--; }
+  }
+  return body + notice;
+}
+
 export function findLastAssistantMessage(entries: SessionEntry[]): string | null {
   for (let i = entries.length - 1; i >= 0; i--) {
     const entry = entries[i];
