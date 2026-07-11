@@ -56,7 +56,7 @@ import {
   getSubagentActivityFile,
   readSubagentActivityFile,
 } from "../pi-extension/subagents/activity.ts";
-import {
+import subagentDoneExtension, {
   shouldMarkUserTookOver,
   shouldAutoExitOnAgentEnd,
   findLatestAssistantError,
@@ -1379,6 +1379,21 @@ describe("subagent discovery", () => {
   });
 });
 describe("subagent-done.ts", () => {
+  it("does not override Pi's built-in multiline-input shortcuts", () => {
+    const shortcuts: string[] = [];
+    const pi = {
+      on() {},
+      registerTool() {},
+      registerShortcut(key: string) {
+        shortcuts.push(key);
+      },
+    };
+
+    subagentDoneExtension(pi as any);
+
+    assert.deepEqual(shortcuts, []);
+  });
+
   describe("shouldMarkUserTookOver", () => {
     it("ignores the initial injected task before the first agent run", () => {
       assert.equal(shouldMarkUserTookOver(false), false);
