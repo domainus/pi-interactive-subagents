@@ -184,6 +184,7 @@ subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer"
 | `fork`                 | boolean | `false`        | Force the full-context fork mode for this spawn, overriding any agent `session-mode` frontmatter  |
 | `interactive`          | boolean | derived        | Mark this spawn as interactive (don't wake the parent on stall/recovery). Defaults to the agent's `interactive` frontmatter, otherwise the inverse of `auto-exit`. |
 | `model`                | string  | —              | Override agent's default model                                                                    |
+| `thinking`             | string  | —              | Per-invocation Pi reasoning effort: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. Overrides agent frontmatter for this spawn. |
 | `systemPrompt`         | string  | —              | Append to system prompt                                                                           |
 | `skills`               | string  | —              | Comma-separated skill names                                                                       |
 | `tools`                | string  | —              | Comma-separated tool names                                                                        |
@@ -221,6 +222,7 @@ The `caller_ping` tool lets a subagent request help from its parent agent. When 
 - `name` (optional): Display name for the resumed pane (defaults to `Resume`)
 - `message` (optional): Follow-up prompt to send after resuming
 - `autoExit` (optional): Whether the resumed session should auto-exit after its next response. Defaults to `true` for autonomous follow-up work; set `false` when resuming for an interactive handoff.
+- `thinking` (optional): Override reasoning effort for this resumed invocation. Omit it to preserve the level stored in the session.
 
 **Interaction flow:**
 1. Child calls `caller_ping({ message: "Not sure which schema to use" })`
@@ -307,7 +309,7 @@ You are a specialized agent that does X...
 | `name`        | string  | Agent name (used in `agent: "my-agent"`)                                                                                                                                                                                                                                    |
 | `description` | string  | Shown in `subagents_list` output                                                                                                                                                                                                                                            |
 | `model`       | string  | Default model (e.g. `openai-codex/gpt-5.6-sol`)                                                                                                                                                                                                                          |
-| `thinking`    | string  | Thinking level: `minimal`, `medium`, `high`                                                                                                                                                                                                                                 |
+| `thinking`    | string  | Thinking level: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`                                                                                                                                                                                               |
 | `tools`       | string  | Comma-separated **native pi tools only**: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`                                                                                                                                                                             |
 | `skills`      | string  | Comma-separated skill names to auto-load                                                                                                                                                                                                                                    |
 | `session-mode` | string | Default child-session mode: `standalone`, `lineage-only`, or `fork` |
@@ -319,6 +321,10 @@ You are a specialized agent that does X...
 | `disable-model-invocation` | boolean | Hide this agent from discovery surfaces like `subagents_list`. The agent still remains directly invokable by explicit name via `subagent({ agent: "name", ... })`. |
 
 ---
+
+### Reasoning effort precedence
+
+New Pi subagents use the tool-call `thinking` value first, then valid agent frontmatter, then Pi's inherited/configured default. Resumed sessions keep their persisted level unless `subagent_resume.thinking` is supplied. Pi may clamp higher levels to model capabilities. Pi thinking levels are not supported for Claude-backed custom agents.
 
 Discovery still resolves precedence before visibility filtering. If a project-local hidden agent has the same name as a visible global or bundled agent, the hidden project agent wins and the lower-precedence agent does not appear in `subagents_list`.
 
