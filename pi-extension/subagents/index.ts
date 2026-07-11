@@ -135,6 +135,28 @@ function abortPollAbortOwner(owner: symbol) {
   if (current?.owner === owner) current.controller.abort();
 }
 
+const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+type ThinkingLevel = (typeof THINKING_LEVELS)[number];
+const ThinkingLevelSchema = Type.Union(
+  [
+    Type.Literal("off"),
+    Type.Literal("minimal"),
+    Type.Literal("low"),
+    Type.Literal("medium"),
+    Type.Literal("high"),
+    Type.Literal("xhigh"),
+    Type.Literal("max"),
+  ],
+  {
+    description:
+      "Reasoning effort for this invocation. Overrides agent frontmatter: off, minimal, low, medium, high, xhigh, or max.",
+  },
+);
+
+function isThinkingLevel(value: string | undefined): value is ThinkingLevel {
+  return value != null && (THINKING_LEVELS as readonly string[]).includes(value);
+}
+
 const SubagentParams = Type.Object({
   name: Type.String({ description: "Display name for the subagent" }),
   task: Type.String({ description: "Task/prompt for the sub-agent" }),
@@ -148,6 +170,7 @@ const SubagentParams = Type.Object({
     Type.String({ description: "Appended to system prompt (role instructions)" }),
   ),
   model: Type.Optional(Type.String({ description: "Model override (overrides agent default)" })),
+  thinking: Type.Optional(ThinkingLevelSchema),
   skills: Type.Optional(
     Type.String({ description: "Comma-separated skills (overrides agent default)" }),
   ),
@@ -186,7 +209,8 @@ interface AgentDefaults {
   model?: string;
   tools?: string;
   skills?: string;
-  thinking?: string;
+  thinking?: ThinkingLevel;
+  invalidThinking?: string;
   denyTools?: string;
   spawning?: boolean;
   autoExit?: boolean;
@@ -278,6 +302,7 @@ function parseAgentDefinition(content: string, fallbackName: string): AgentDefin
   const frontmatter = match[1];
   const body = content.replace(/^---\n[\s\S]*?\n---\n*/, "").trim();
   const systemPromptMode = getFrontmatterValue(frontmatter, "system-prompt");
+  const rawThinking = getFrontmatterValue(frontmatter, "thinking");
 
   return {
     name: getFrontmatterValue(frontmatter, "name") ?? fallbackName,
@@ -291,7 +316,8 @@ function parseAgentDefinition(content: string, fallbackName: string): AgentDefin
           ? "append"
           : undefined,
     skills: getFrontmatterValue(frontmatter, "skill") ?? getFrontmatterValue(frontmatter, "skills"),
-    thinking: getFrontmatterValue(frontmatter, "thinking"),
+    thinking: isThinkingLevel(rawThinking) ? rawThinking : undefined,
+    invalidThinking: rawThinking && !isThinkingLevel(rawThinking) ? rawThinking : undefined,
     denyTools: getFrontmatterValue(frontmatter, "deny-tools"),
     spawning: parseOptionalBoolean(getFrontmatterValue(frontmatter, "spawning")),
     autoExit: parseOptionalBoolean(getFrontmatterValue(frontmatter, "auto-exit")),
@@ -405,6 +431,21 @@ function resolveEffectiveInteractive(
   if (params.interactive != null) return params.interactive;
   if (agentDefs?.interactive != null) return agentDefs.interactive;
   return !(agentDefs?.autoExit ?? false);
+}
+
+function resolveEffectiveThinking(
+  params: Static<typeof SubagentParams>,
+  agentDefs: AgentDefaults | null,
+): ThinkingLevel | undefined {
+  if (params.thinking) return params.thinking;
+  if (agentDefs?.invalidThinking) {
+    throw new Error(`Invalid thinking level in agent definition: ${agentDefs.invalidThinking}`);
+  }
+  return agentDefs?.thinking;
+}
+
+function buildThinkingArgs(level: ThinkingLevel | undefined): string[] {
+  return level ? ["--thinking", level] : [];
 }
 
 function loadAgentDefaults(agentName: string): AgentDefaults | null {
@@ -952,6 +993,9 @@ function resolveResumeLaunchBehavior(params: { autoExit?: boolean }): { autoExit
 
 export const __test__ = {
   borderLine,
+  THINKING_LEVELS,
+  resolveEffectiveThinking,
+  buildThinkingArgs,
   getShellReadyDelayMs,
   renderSubagentWidgetLines,
   loadAgentDefaults,

@@ -879,6 +879,35 @@ describe("status.ts", () => {
 
 describe("subagent discovery", () => {
   const testApi = (subagentsModule as any).__test__;
+  const expectedThinkingLevels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+  function schemaLiteralValues(schema: any): string[] {
+    return (schema.anyOf ?? []).map((entry: any) => entry.const);
+  }
+
+  it("exposes all Pi reasoning levels on subagent", () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const tool = registeredTools.find((entry) => entry.name === "subagent");
+    assert.deepEqual(schemaLiteralValues(tool.parameters.properties.thinking), expectedThinkingLevels);
+  });
+
+  it("resolves explicit thinking before frontmatter and emits dedicated CLI args", () => {
+    assert.equal(
+      testApi.resolveEffectiveThinking(
+        { name: "Worker", task: "T", thinking: "max" },
+        { thinking: "low" },
+      ),
+      "max",
+    );
+    assert.equal(
+      testApi.resolveEffectiveThinking({ name: "Worker", task: "T" }, { thinking: "low" }),
+      "low",
+    );
+    assert.equal(testApi.resolveEffectiveThinking({ name: "Worker", task: "T" }, null), undefined);
+    assert.deepEqual(testApi.buildThinkingArgs("xhigh"), ["--thinking", "xhigh"]);
+    assert.deepEqual(testApi.buildThinkingArgs(undefined), []);
+  });
 
   it("loads session-mode from frontmatter", async () => {
     await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
@@ -1067,6 +1096,33 @@ describe("subagent discovery", () => {
       const loaded = testApi.loadAgentDefaults("invalid-mode-test-agent");
       assert.ok(loaded, "expected agent to load");
       assert.equal(loaded.sessionMode, undefined);
+    });
+  });
+
+  it("rejects invalid thinking from frontmatter unless a valid tool value overrides it", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+      writeAgentFile(
+        projectAgentsDir,
+        "invalid-thinking-test-agent",
+        [
+          "name: invalid-thinking-test-agent",
+          "model: anthropic/test-invalid-thinking",
+          "thinking: sideways",
+        ].join("\n"),
+      );
+
+      const loaded = testApi.loadAgentDefaults("invalid-thinking-test-agent");
+      assert.ok(loaded, "expected agent to load");
+      assert.equal(loaded.thinking, undefined);
+      assert.equal(loaded.invalidThinking, "sideways");
+      assert.throws(
+        () => testApi.resolveEffectiveThinking({ name: "Worker", task: "T" }, loaded),
+        /Invalid thinking level in agent definition: sideways/,
+      );
+      assert.equal(
+        testApi.resolveEffectiveThinking({ name: "Worker", task: "T", thinking: "high" }, loaded),
+        "high",
+      );
     });
   });
 
