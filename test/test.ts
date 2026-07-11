@@ -909,6 +909,43 @@ describe("subagent discovery", () => {
     assert.deepEqual(testApi.buildThinkingArgs(undefined), []);
   });
 
+  it("builds spawn and resume reasoning args without changing omission behavior", () => {
+    assert.deepEqual(testApi.buildThinkingArgs("max"), ["--thinking", "max"]);
+    assert.deepEqual(testApi.buildThinkingArgs(undefined), []);
+  });
+
+  it("rejects explicit Pi thinking for Claude-backed agents", () => {
+    assert.throws(
+      () => testApi.assertThinkingSupportedForCli({ thinking: "high" }, { cli: "claude" }),
+      /Claude-backed.*thinking/i,
+    );
+    assert.doesNotThrow(() => testApi.assertThinkingSupportedForCli({}, { cli: "claude" }));
+    assert.doesNotThrow(() => testApi.assertThinkingSupportedForCli({ thinking: "high" }, null));
+  });
+
+  it("wires spawn and resume reasoning args into Pi commands only", () => {
+    const source = readFileSync(
+      fileURLToPath(new URL("../pi-extension/subagents/index.ts", import.meta.url)),
+      "utf8",
+    );
+    const claudeBlock = source.slice(
+      source.indexOf("// ── Claude Code CLI path ──"),
+      source.indexOf("// ── Pi CLI path ──"),
+    );
+    const spawnBlock = source.slice(source.indexOf("// ── Pi CLI path ──"));
+    const resumeBlock = source.slice(source.indexOf("// ── subagent_resume tool ──"));
+
+    assert.match(
+      spawnBlock,
+      /for \(const arg of buildThinkingArgs\(effectiveThinking\)\) \{\s+parts\.push\(shellEscape\(arg\)\);\s+\}/,
+    );
+    assert.match(
+      resumeBlock,
+      /for \(const arg of buildThinkingArgs\(params\.thinking\)\) \{\s+parts\.push\(shellEscape\(arg\)\);\s+\}/,
+    );
+    assert.doesNotMatch(claudeBlock, /buildThinkingArgs/);
+  });
+
   it("loads session-mode from frontmatter", async () => {
     await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
       writeAgentFile(
@@ -1527,7 +1564,7 @@ describe("tool registration", () => {
     assert.match(output, /\(unnamed\)/);
   });
 
-  it("registers subagent_resume with an autoExit override", () => {
+  it("registers subagent_resume thinking and autoExit overrides", () => {
     const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);
 
@@ -1537,6 +1574,12 @@ describe("tool registration", () => {
     const autoExitSchema = resumeTool.parameters.properties.autoExit;
     assert.equal(autoExitSchema.type, "boolean");
     assert.match(autoExitSchema.description, /Defaults to true/);
+    const thinkingSchema = resumeTool.parameters.properties.thinking;
+    assert.ok(thinkingSchema, "expected subagent_resume to expose a thinking override");
+    assert.deepEqual(
+      thinkingSchema.anyOf.map((entry: any) => entry.const),
+      ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+    );
   });
 });
 

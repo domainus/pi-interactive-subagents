@@ -448,6 +448,15 @@ function buildThinkingArgs(level: ThinkingLevel | undefined): string[] {
   return level ? ["--thinking", level] : [];
 }
 
+function assertThinkingSupportedForCli(
+  params: Pick<Static<typeof SubagentParams>, "thinking">,
+  agentDefs: AgentDefaults | null,
+): void {
+  if (params.thinking && agentDefs?.cli === "claude") {
+    throw new Error("Claude-backed subagents do not support Pi thinking levels");
+  }
+}
+
 function loadAgentDefaults(agentName: string): AgentDefaults | null {
   const configDir = getAgentConfigDir();
   const paths = [
@@ -996,6 +1005,7 @@ export const __test__ = {
   THINKING_LEVELS,
   resolveEffectiveThinking,
   buildThinkingArgs,
+  assertThinkingSupportedForCli,
   getShellReadyDelayMs,
   renderSubagentWidgetLines,
   loadAgentDefaults,
@@ -1054,10 +1064,11 @@ async function launchSubagent(
   const id = Math.random().toString(16).slice(2, 10);
 
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
+  assertThinkingSupportedForCli(params, agentDefs);
+  const effectiveThinking = resolveEffectiveThinking(params, agentDefs);
   const effectiveModel = params.model ?? agentDefs?.model;
   const effectiveTools = params.tools ?? agentDefs?.tools;
   const effectiveSkills = params.skills ?? agentDefs?.skills;
-  const effectiveThinking = agentDefs?.thinking;
   const effectiveInteractive = resolveEffectiveInteractive(params, agentDefs);
 
   const sessionFile = ctx.sessionManager.getSessionFile();
@@ -1205,8 +1216,10 @@ async function launchSubagent(
   parts.push("-e", shellEscape(subagentDonePath));
 
   if (effectiveModel) {
-    const model = effectiveThinking ? `${effectiveModel}:${effectiveThinking}` : effectiveModel;
-    parts.push("--model", shellEscape(model));
+    parts.push("--model", shellEscape(effectiveModel));
+  }
+  for (const arg of buildThinkingArgs(effectiveThinking)) {
+    parts.push(shellEscape(arg));
   }
 
   // Pass agent body as system prompt via file to avoid shell escaping issues
@@ -1864,6 +1877,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               "Whether the resumed session should automatically exit after completing its response. Defaults to true for autonomous follow-up work; set false for interactive resumed sessions.",
           }),
         ),
+        thinking: Type.Optional(
+          Type.Union([
+            Type.Literal("off"), Type.Literal("minimal"), Type.Literal("low"),
+            Type.Literal("medium"), Type.Literal("high"), Type.Literal("xhigh"), Type.Literal("max"),
+          ], {
+            description: "Reasoning effort for this resumed invocation. When omitted, preserves the session's persisted level.",
+          }),
+        ),
       }),
 
       renderCall(args, theme) {
@@ -1922,6 +1943,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         // Build pi resume command
         const parts = ["pi", "--session", shellEscape(params.sessionPath)];
+        for (const arg of buildThinkingArgs(params.thinking)) {
+          parts.push(shellEscape(arg));
+        }
 
         // Load subagent-done extension so the agent can self-terminate if needed
         const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
