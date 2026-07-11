@@ -439,7 +439,8 @@ function resolveEffectiveThinking(
 ): ThinkingLevel | undefined {
   if (params.thinking) return params.thinking;
   if (agentDefs?.invalidThinking) {
-    throw new Error(`Invalid thinking level in agent definition: ${agentDefs.invalidThinking}`);
+    const agentName = params.agent ?? "<unknown>";
+    throw new Error(`Invalid thinking level "${agentDefs.invalidThinking}" in agent definition "${agentName}"`);
   }
   return agentDefs?.thinking;
 }

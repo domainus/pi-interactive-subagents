@@ -932,8 +932,10 @@ describe("subagent discovery", () => {
       source.indexOf("// ── Claude Code CLI path ──"),
       source.indexOf("// ── Pi CLI path ──"),
     );
-    const spawnBlock = source.slice(source.indexOf("// ── Pi CLI path ──"));
-    const resumeBlock = source.slice(source.indexOf("// ── subagent_resume tool ──"));
+    const piSpawnStart = source.indexOf("// ── Pi CLI path ──");
+    const spawnBlock = source.slice(piSpawnStart, source.indexOf("\n  const piCommand =", piSpawnStart));
+    const resumeStart = source.indexOf("// ── subagent_resume tool ──");
+    const resumeBlock = source.slice(resumeStart, source.indexOf("\n        // Build env prefix", resumeStart));
 
     assert.match(
       spawnBlock,
@@ -943,7 +945,26 @@ describe("subagent discovery", () => {
       resumeBlock,
       /for \(const arg of buildThinkingArgs\(params\.thinking\)\) \{\s+parts\.push\(shellEscape\(arg\)\);\s+\}/,
     );
+    assert.doesNotMatch(spawnBlock, /\$\{effectiveModel\}:\$\{effectiveThinking\}/);
     assert.doesNotMatch(claudeBlock, /buildThinkingArgs/);
+  });
+
+  it("validates thinking before creating a launch surface", () => {
+    const source = readFileSync(
+      fileURLToPath(new URL("../pi-extension/subagents/index.ts", import.meta.url)),
+      "utf8",
+    );
+    const launchStart = source.indexOf("async function launchSubagent(");
+    const launchBlock = source.slice(launchStart, source.indexOf("\n/**\n * Watch a launched subagent", launchStart));
+    const thinkingSupportCheck = launchBlock.indexOf("assertThinkingSupportedForCli(params, agentDefs);");
+    const thinkingResolution = launchBlock.indexOf("const effectiveThinking = resolveEffectiveThinking(params, agentDefs);");
+    const surfaceCreation = launchBlock.indexOf("const surface = options?.surface ?? createSurface(params.name);");
+
+    assert.ok(thinkingSupportCheck >= 0, "expected Pi/Claude thinking support validation");
+    assert.ok(thinkingResolution >= 0, "expected effective thinking resolution");
+    assert.ok(surfaceCreation >= 0, "expected launch surface creation");
+    assert.ok(thinkingSupportCheck < surfaceCreation, "thinking support must be checked before surface creation");
+    assert.ok(thinkingResolution < surfaceCreation, "thinking must be resolved before surface creation");
   });
 
   it("loads session-mode from frontmatter", async () => {
@@ -1153,8 +1174,11 @@ describe("subagent discovery", () => {
       assert.equal(loaded.thinking, undefined);
       assert.equal(loaded.invalidThinking, "sideways");
       assert.throws(
-        () => testApi.resolveEffectiveThinking({ name: "Worker", task: "T" }, loaded),
-        /Invalid thinking level in agent definition: sideways/,
+        () => testApi.resolveEffectiveThinking(
+          { name: "Worker", task: "T", agent: "invalid-thinking-test-agent" },
+          loaded,
+        ),
+        { message: 'Invalid thinking level "sideways" in agent definition "invalid-thinking-test-agent"' },
       );
       assert.equal(
         testApi.resolveEffectiveThinking({ name: "Worker", task: "T", thinking: "high" }, loaded),
