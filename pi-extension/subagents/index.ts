@@ -538,6 +538,10 @@ const DISPLAY_FIELD_MAX_WIDTH = 120;
 const OSC_SEQUENCE = /(?:\x1B\]|\x9D)[\s\S]*?(?:\x07|\x1B\\|\x9C)/g;
 const ST_STRING_SEQUENCE = /(?:\x1B[P^_X]|[\x90\x98\x9E\x9F])[\s\S]*?(?:\x1B\\|\x9C)/g;
 const CSI_SEQUENCE = /(?:\x1B\[|\x9B)[\x30-\x3F]*[\x20-\x2F]*[\x40-\x7E]/g;
+// A control string without BEL/ST cannot safely be rendered. After complete
+// sequences are removed, treat its remaining content as control through EOF.
+const UNTERMINATED_STRING_SEQUENCE = /(?:\x1B\]|\x9D|\x1B[P^_X]|[\x90\x98\x9E\x9F])[\s\S]*$/g;
+const INCOMPLETE_CSI_SEQUENCE = /(?:\x1B\[|\x9B)[\s\S]*$/g;
 const ESCAPE_SEQUENCE = /\x1B(?:[\x20-\x2F]*[\x30-\x7E])?/g;
 const C0_C1_CONTROLS = /[\x00-\x1F\x7F-\x9F]/g;
 
@@ -546,6 +550,8 @@ function stripTerminalControls(value: string): string {
     .replace(OSC_SEQUENCE, "")
     .replace(ST_STRING_SEQUENCE, "")
     .replace(CSI_SEQUENCE, "")
+    .replace(UNTERMINATED_STRING_SEQUENCE, "")
+    .replace(INCOMPLETE_CSI_SEQUENCE, "")
     .replace(ESCAPE_SEQUENCE, "")
     .replace(C0_C1_CONTROLS, "");
 }

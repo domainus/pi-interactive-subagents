@@ -4850,6 +4850,23 @@ describe("configured launch model", () => {
     "\x9Ddisplay-secret-c1\x9C",
   ].join("");
   const wideHostileModelSuffix = "界🫠".repeat(80);
+  const unterminatedTerminalFixtures = [
+    ["esc-osc52", "\x1b]52;c;unterminated-secret-esc-osc52", "unterminated-secret-esc-osc52"],
+    ["c1-osc52", "\x9D52;c;unterminated-secret-c1-osc52", "unterminated-secret-c1-osc52"],
+    ["esc-osc8", "\x1b]8;;https://unterminated-secret-esc-osc8.example/", "unterminated-secret-esc-osc8"],
+    ["c1-osc8", "\x9D8;;https://unterminated-secret-c1-osc8.example/", "unterminated-secret-c1-osc8"],
+    ["esc-dcs", "\x1bPunterminated-secret-esc-dcs", "unterminated-secret-esc-dcs"],
+    ["c1-dcs", "\x90unterminated-secret-c1-dcs", "unterminated-secret-c1-dcs"],
+    ["esc-apc", "\x1b_unterminated-secret-esc-apc", "unterminated-secret-esc-apc"],
+    ["c1-apc", "\x9Funterminated-secret-c1-apc", "unterminated-secret-c1-apc"],
+    ["esc-pm", "\x1b^unterminated-secret-esc-pm", "unterminated-secret-esc-pm"],
+    ["c1-pm", "\x9Eunterminated-secret-c1-pm", "unterminated-secret-c1-pm"],
+    ["esc-sos", "\x1bXunterminated-secret-esc-sos", "unterminated-secret-esc-sos"],
+    ["c1-sos", "\x98unterminated-secret-c1-sos", "unterminated-secret-c1-sos"],
+    ["esc-csi", "\x1b[?31337;31337", "?31337;31337"],
+    ["c1-csi", "\x9B?42424;42424", "?42424;42424"],
+    ["esc", "\x1b(", "\x1b("],
+  ] as const;
 
   function assertSafeModelText(value: unknown, label: string) {
     assert.equal(typeof value, "string", `${label} must be a string`);
@@ -5030,6 +5047,65 @@ describe("configured launch model", () => {
         assert.equal(readFileSync(join(dir, ".herdr.log"), "utf8"), "");
         assert.equal(existsSync(join(dir, "artifacts")), false);
       });
+    });
+  });
+
+  it("removes unterminated terminal controls from successful registered launch details while preserving the raw internal command", async () => {
+    await withTempDirAsync(async (dir) => {
+      for (const [name, control, secret] of unterminatedTerminalFixtures) {
+        const rawId = `${control}${wideHostileModelSuffix}`;
+        const explicit = `oauth/${rawId}`;
+        await withRegisteredSpawn(dir, { name: `Unterminated ${name}`, task: "run", model: explicit }, registry([model("oauth", rawId)], [explicit]), (result) => {
+          for (const [label, value] of Object.entries(result.details.model)) {
+            if (typeof value !== "string") continue;
+            assertSafeBoundedModelDisplay(value, `${name} ${label}`);
+            assert.doesNotMatch(value, new RegExp(secret.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), `${name} ${label} leaked its payload`);
+          }
+          assert.match(readFileSync(result.details.launchScriptFile, "utf8"), new RegExp(secret.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+        });
+      }
+    });
+  });
+
+  it("removes unterminated terminal controls from fallback content and registered render output", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir, projectDir }) => {
+      for (const [name, control, secret] of unterminatedTerminalFixtures) {
+        const rawId = `${control}${wideHostileModelSuffix}`;
+        writeAgentFile(projectAgentsDir, `unterminated-fallback-${name}`, `name: unterminated-fallback-${name}\nmodel: absent/${control}${wideHostileModelSuffix}`);
+        await withRegisteredSpawn(projectDir, { name: `Fallback ${name}`, task: "run", agent: `unterminated-fallback-${name}` }, registry([model("oauth", rawId)], [`oauth/${rawId}`]), (result) => {
+          assertSafeModelText(result.content[0].text, `${name} fallback content`);
+          assert.doesNotMatch(result.content[0].text, new RegExp(secret.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+          for (const [index, line] of renderRegisteredSpawnResult(result, 120).split("\n").entries()) {
+            assertSafeBoundedModelDisplay(line, `${name} fallback render ${index}`);
+            assert.doesNotMatch(line, new RegExp(secret.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+          }
+          assert.match(readFileSync(result.details.launchScriptFile, "utf8"), new RegExp(secret.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+        });
+      }
+    });
+  });
+
+  it("removes unterminated terminal controls from explicit-unavailable alternatives and registered render output", async () => {
+    await withTempDirAsync(async (dir) => {
+      for (const [name, control, secret] of unterminatedTerminalFixtures) {
+        const rawId = `${control}${wideHostileModelSuffix}`;
+        await withRegisteredSpawn(dir, { name: `Unavailable ${name}`, task: "nope", model: "missing/model" }, registry([model("oauth", rawId)], [`oauth/${rawId}`]), (result, running) => {
+          assert.equal(result.details.error, "explicit-unknown");
+          for (const alternative of result.details.alternatives) {
+            assertSafeBoundedModelDisplay(alternative, `${name} alternative`);
+            assert.doesNotMatch(alternative, new RegExp(secret.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+          }
+          assertSafeModelText(result.content[0].text, `${name} unavailable content`);
+          assert.doesNotMatch(result.content[0].text, new RegExp(secret.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+          for (const [index, line] of renderRegisteredSpawnResult(result, 120).split("\n").entries()) {
+            assertSafeBoundedModelDisplay(line, `${name} unavailable render ${index}`);
+            assert.doesNotMatch(line, new RegExp(secret.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+          }
+          assert.equal(running.size, 0);
+          assert.equal(readFileSync(join(dir, ".herdr.log"), "utf8"), "");
+          assert.equal(existsSync(join(dir, "artifacts")), false);
+        });
+      }
     });
   });
 
