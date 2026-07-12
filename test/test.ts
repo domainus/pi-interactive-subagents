@@ -4460,7 +4460,21 @@ describe("configured model selection", () => {
     const registry = fakeRegistry([duplicate, canonical, other], ["openai/gpt-5", "custom/luna"]);
     const ranked = rankConfiguredModels({ models: [duplicate, other, canonical], registry, tier: "fast" });
     assert.equal(ranked.filter((candidate) => candidate.reference.toLowerCase() === "openai/gpt-5").length, 1);
-    assert.deepEqual(ranked.map((candidate) => candidate.reference), ["custom/luna", "OpenAI/GPT-5"]);
+    assert.deepEqual(ranked.map((candidate) => candidate.reference), ["custom/luna", "openai/gpt-5"]);
+  });
+
+  it("chooses duplicate canonical representatives deterministically across input order", () => {
+    const apiDuplicate = fakeModel("same", "model", { name: "API copy", cost: { input: 0.01, output: 0.01, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1_000, maxTokens: 100 });
+    const oauthDuplicate = fakeModel("same", "model", { name: "OAuth copy", reasoning: true, cost: { input: 100, output: 100, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100_000, maxTokens: 10_000 });
+    const other = fakeModel("zeta", "luna", { name: "Other", cost: { input: 0.1, output: 0.1, cacheRead: 0, cacheWrite: 0 } });
+    const registry = { isUsingOAuth: (model: Model<any>) => model === oauthDuplicate };
+    const summarize = (models: Model<any>[]) => rankConfiguredModels({ models, registry, tier: "fast" }).map((candidate) => ({ name: candidate.model.name, reference: candidate.reference, authType: candidate.authType }));
+
+    const forward = summarize([apiDuplicate, oauthDuplicate, other]);
+    const reversed = summarize([other, oauthDuplicate, apiDuplicate]);
+
+    assert.deepEqual(forward, [{ name: "OAuth copy", reference: "same/model", authType: "oauth" }, { name: "Other", reference: "zeta/luna", authType: "api-key" }]);
+    assert.deepEqual(reversed, forward);
   });
 
   it("parses public references and turns registry failures into bounded secret-safe errors", () => {

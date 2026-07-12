@@ -123,12 +123,48 @@ export function inferCandidateTier(model: Model<any>): ModelTier {
   return isReasoning(model) ? "balanced" : "fast";
 }
 
+function publicMetadataKey(model: Model<any>, tier: ModelTier): string {
+  const capacityFallback = tier === "fast" ? Number.POSITIVE_INFINITY : 0;
+  const costs = model.cost as Partial<Model<any>["cost"]> | undefined;
+  const input = Array.isArray(model.input)
+    ? model.input.filter((value): value is string => typeof value === "string").sort().join(",")
+    : "";
+  return [
+    typeof model.name === "string" ? model.name : "",
+    typeof model.api === "string" ? model.api : "",
+    typeof model.baseUrl === "string" ? model.baseUrl : "",
+    input,
+    finiteNonNegative(costs?.input, Number.POSITIVE_INFINITY),
+    finiteNonNegative(costs?.output, Number.POSITIVE_INFINITY),
+    finiteNonNegative(costs?.cacheRead, Number.POSITIVE_INFINITY),
+    finiteNonNegative(costs?.cacheWrite, Number.POSITIVE_INFINITY),
+    finiteNonNegative(model.maxTokens, capacityFallback),
+    finiteNonNegative(model.contextWindow, capacityFallback),
+  ].join("\u0000");
+}
+
+function compareRankedCandidates(left: RankedCandidate, right: RankedCandidate, tier: ModelTier, preferredProvider?: string): number {
+  const leftAuth = left.authType === "oauth" ? 0 : 1;
+  const rightAuth = right.authType === "oauth" ? 0 : 1;
+  const leftReference = canonical(left.reference);
+  const rightReference = canonical(right.reference);
+  return compareNumbers(leftAuth, rightAuth)
+    || compareNumbers(tierDistance(tier, inferCandidateTier(left.model)), tierDistance(tier, inferCandidateTier(right.model)))
+    || compareNumbers(preferencePenalty(left.model, tier), preferencePenalty(right.model, tier))
+    || compareNumbers(canonical(left.model.provider) === preferredProvider ? 0 : 1, canonical(right.model.provider) === preferredProvider ? 0 : 1)
+    || metadataComparison(left.model, right.model, tier)
+    || compareStrings(leftReference, rightReference)
+    || compareStrings(left.reference, right.reference)
+    || compareStrings(publicMetadataKey(left.model, tier), publicMetadataKey(right.model, tier));
+}
+
 export function rankConfiguredModels(params: {
   models: Array<Model<any>>;
   registry: Pick<ModelRegistryLike, "isUsingOAuth">;
   tier: ModelTier;
   preferredProvider?: string;
 }): RankedCandidate[] {
+  const preferredProvider = params.preferredProvider ? canonical(params.preferredProvider) : undefined;
   const candidates = new Map<string, RankedCandidate>();
   for (const model of params.models) {
     const reference = referenceFor(model);
@@ -140,22 +176,9 @@ export function rankConfiguredModels(params: {
       authType: params.registry.isUsingOAuth(model) ? "oauth" : "api-key",
     };
     const existing = candidates.get(key);
-    if (!existing || compareStrings(reference, existing.reference) < 0) candidates.set(key, candidate);
+    if (!existing || compareRankedCandidates(candidate, existing, params.tier, preferredProvider) < 0) candidates.set(key, candidate);
   }
-  const preferredProvider = params.preferredProvider ? canonical(params.preferredProvider) : undefined;
-  return [...candidates.values()].sort((left, right) => {
-    const leftAuth = left.authType === "oauth" ? 0 : 1;
-    const rightAuth = right.authType === "oauth" ? 0 : 1;
-    const leftReference = canonicalReference(left.model)!;
-    const rightReference = canonicalReference(right.model)!;
-    return compareNumbers(leftAuth, rightAuth)
-      || compareNumbers(tierDistance(params.tier, inferCandidateTier(left.model)), tierDistance(params.tier, inferCandidateTier(right.model)))
-      || compareNumbers(preferencePenalty(left.model, params.tier), preferencePenalty(right.model, params.tier))
-      || compareNumbers(canonical(left.model.provider) === preferredProvider ? 0 : 1, canonical(right.model.provider) === preferredProvider ? 0 : 1)
-      || metadataComparison(left.model, right.model, params.tier)
-      || compareStrings(leftReference, rightReference)
-      || compareStrings(left.reference, right.reference);
-  });
+  return [...candidates.values()].sort((left, right) => compareRankedCandidates(left, right, params.tier, preferredProvider));
 }
 
 function error(code: Extract<ModelResolution, { ok: false }> ["code"], message: string, alternatives: string[] = []): ModelResolution {
