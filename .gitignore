@@ -4,3 +4,5 @@ config.json
 !.pi/skills/
 !.pi/settings.json
 *.bak.*
+
+.worktrees/
