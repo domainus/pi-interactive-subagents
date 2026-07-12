@@ -7,6 +7,14 @@ import { fileURLToPath } from "node:url";
 import { visibleWidth } from "@mariozechner/pi-tui";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
 import * as cmuxModule from "../pi-extension/subagents/cmux.ts";
+import {
+  inferCandidateTier,
+  parseModelReference,
+  rankConfiguredModels,
+  resolveConfiguredModel,
+  type ModelRegistryLike,
+} from "../pi-extension/subagents/model-selection.ts";
+import type { Model } from "@mariozechner/pi-ai";
 
 import {
   getLeafId,
@@ -4320,5 +4328,147 @@ describe("cmux.ts", () => {
       const result = isWezTermAvailable();
       assert.equal(typeof result, "boolean");
     });
+  });
+});
+
+describe("configured model selection", () => {
+  const fakeSecrets = ["fake-api-key-123", "fake-oauth-token-456", "fake-header-789", "/private/auth.json"];
+
+  function fakeModel(provider: string, id: string, overrides: Record<string, unknown> = {}): Model<any> {
+    return {
+      provider, id, name: id, api: "openai-completions", baseUrl: "https://models.example.test", reasoning: false,
+      input: ["text"], cost: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 }, contextWindow: 32_000,
+      maxTokens: 4_000, headers: { authorization: "Bearer fake-header-789" }, ...overrides,
+    } as Model<any>;
+  }
+
+  function fakeRegistry(models: Model<any>[], configured: string[], oauth: string[] = [], options: { throwGetAvailable?: boolean } = {}): ModelRegistryLike & { calls: number; internals: Record<string, string> } {
+    const canonical = (provider: string, id: string) => `${provider.trim().toLowerCase()}/${id.trim().toLowerCase()}`;
+    const configuredSet = new Set(configured.map((reference) => reference.toLowerCase()));
+    const oauthSet = new Set(oauth.map((reference) => reference.toLowerCase()));
+    const registry = {
+      calls: 0,
+      internals: { apiKey: "fake-api-key-123", token: "fake-oauth-token-456", authPath: "/private/auth.json" },
+      getAvailable() { registry.calls++; if (options.throwGetAvailable) throw new Error("fake-api-key-123"); return models.filter((model) => configuredSet.has(canonical(model.provider, model.id))); },
+      find(provider: string, modelId: string) { return models.find((model) => canonical(model.provider, model.id) === canonical(provider, modelId)); },
+      hasConfiguredAuth(model: Model<any>) { return configuredSet.has(canonical(model.provider, model.id)); },
+      isUsingOAuth(model: Model<any>) { return oauthSet.has(canonical(model.provider, model.id)); },
+    };
+    return registry;
+  }
+
+  function assertSecretSafe(value: unknown) {
+    const rendered = JSON.stringify(value);
+    for (const secret of fakeSecrets) assert.doesNotMatch(rendered, new RegExp(secret.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  }
+
+  it("keeps an authenticated explicit model unchanged and reuses supplied snapshots", () => {
+    const target = fakeModel("OpenAI", "gpt-5");
+    const registry = fakeRegistry([target], ["openai/gpt-5"], ["openai/gpt-5"]);
+    const result = resolveConfiguredModel({ registry, tier: "balanced", explicitModel: " OpenAI / gpt-5 ", availableModels: [target] });
+    assert.deepEqual(result, { ok: true, value: { requestedModel: " OpenAI / gpt-5 ", effectiveModel: "OpenAI/gpt-5", authType: "oauth", tier: "balanced", source: "explicit" } });
+    assert.equal(registry.calls, 0);
+  });
+
+  it("rejects invalid and unknown explicit references without fallback", () => {
+    const available = fakeModel("openai", "gpt-5");
+    const registry = fakeRegistry([available], ["openai/gpt-5"]);
+    const invalid = resolveConfiguredModel({ registry, tier: "fast", explicitModel: "missing-slash" });
+    const unknown = resolveConfiguredModel({ registry, tier: "fast", explicitModel: "openai/unknown" });
+    assert.equal(!invalid.ok && invalid.code, "explicit-invalid");
+    assert.equal(!unknown.ok && unknown.code, "explicit-unknown");
+    assert.equal(unknown.ok, false);
+    if (!unknown.ok) assert.deepEqual(unknown.alternatives, ["openai/gpt-5"]);
+    assertSecretSafe([invalid, unknown]);
+  });
+
+  it("rejects known unconfigured explicit models with three public alternatives", () => {
+    const models = [fakeModel("anthropic", "claude-opus"), fakeModel("openai", "gpt-5"), fakeModel("google", "gemini-flash"), fakeModel("custom", "luna")];
+    const registry = fakeRegistry(models, ["openai/gpt-5", "google/gemini-flash", "custom/luna"]);
+    const result = resolveConfiguredModel({ registry, tier: "balanced", explicitModel: "anthropic/claude-opus" });
+    assert.equal(result.ok, false);
+    if (!result.ok) { assert.equal(result.code, "explicit-unconfigured"); assert.equal(result.alternatives.length, 3); }
+    assertSecretSafe(result);
+  });
+
+  it("keeps an authenticated preferred model unchanged", () => {
+    const preferred = fakeModel("anthropic", "claude-sonnet", { reasoning: true });
+    const registry = fakeRegistry([preferred], ["anthropic/claude-sonnet"]);
+    const result = resolveConfiguredModel({ registry, tier: "balanced", preferredModel: "anthropic/claude-sonnet" });
+    assert.deepEqual(result, { ok: true, value: { preferredModel: "anthropic/claude-sonnet", effectiveModel: "anthropic/claude-sonnet", authType: "api-key", tier: "balanced", source: "preferred" } });
+  });
+
+  it("falls back for unknown and unconfigured preferred models", () => {
+    const fallback = fakeModel("custom-provider", "terra", { reasoning: true });
+    const unavailable = fakeModel("anthropic", "claude-opus");
+    const registry = fakeRegistry([fallback, unavailable], ["custom-provider/terra"]);
+    const unknown = resolveConfiguredModel({ registry, tier: "balanced", preferredModel: "anthropic/nope" });
+    const unconfigured = resolveConfiguredModel({ registry, tier: "balanced", preferredModel: "anthropic/claude-opus" });
+    assert.equal(unknown.ok && unknown.value.fallbackReason, "preferred-unknown");
+    assert.equal(unconfigured.ok && unconfigured.value.fallbackReason, "preferred-unconfigured");
+    for (const result of [unknown, unconfigured]) { assert.equal(result.ok, true); if (result.ok) { assert.equal(result.value.effectiveModel, "custom-provider/terra"); assert.equal(result.value.source, "fallback"); } }
+  });
+
+  it("selects an authenticated dynamic provider automatically and gives safe no-model guidance", () => {
+    const automatic = fakeModel("dynamic", "luna-fast");
+    const registry = fakeRegistry([automatic], ["dynamic/luna-fast"], ["dynamic/luna-fast"]);
+    const result = resolveConfiguredModel({ registry, tier: "fast" });
+    assert.equal(result.ok && result.value.effectiveModel, "dynamic/luna-fast");
+    assert.equal(result.ok && result.value.source, "automatic");
+    assert.equal(registry.calls, 1);
+    const none = resolveConfiguredModel({ registry: fakeRegistry([], []), tier: "fast" });
+    assert.equal(none.ok, false);
+    if (!none.ok) { assert.equal(none.code, "no-configured-models"); assert.match(none.message, /\/login|API key/i); assert.deepEqual(none.alternatives, []); }
+    assertSecretSafe([result, none]);
+  });
+
+  it("uses OAuth before closer API-key tier candidates", () => {
+    const apiFast = fakeModel("api", "luna-fast");
+    const oauthDeep = fakeModel("oauth", "sol-reasoning", { reasoning: true });
+    const registry = fakeRegistry([apiFast, oauthDeep], ["api/luna-fast", "oauth/sol-reasoning"], ["oauth/sol-reasoning"]);
+    assert.deepEqual(rankConfiguredModels({ models: [apiFast, oauthDeep], registry, tier: "fast" }).map((candidate) => candidate.reference), ["oauth/sol-reasoning", "api/luna-fast"]);
+  });
+
+  it("infers documented tiers and safe unknown defaults", () => {
+    for (const hint of ["luna", "haiku", "flash", "mini", "nano", "small"]) assert.equal(inferCandidateTier(fakeModel("p", hint)), "fast");
+    for (const hint of ["terra", "sonnet", "medium", "balanced"]) assert.equal(inferCandidateTier(fakeModel("p", hint)), "balanced");
+    for (const hint of ["sol", "opus", "pro", "reasoning", "o1", "o3", "r1"]) assert.equal(inferCandidateTier(fakeModel("p", hint)), "deep");
+    assert.equal(inferCandidateTier(fakeModel("p", "mystery", { reasoning: true })), "balanced");
+    assert.equal(inferCandidateTier(fakeModel("p", "mystery")), "fast");
+  });
+
+  it("orders fast balanced and deep roles deterministically", () => {
+    const fast = fakeModel("p", "luna", { cost: { input: 0.1, output: 0.1, cacheRead: 0, cacheWrite: 0 } });
+    const balanced = fakeModel("p", "terra", { reasoning: true, maxTokens: 8_000, contextWindow: 64_000 });
+    const deep = fakeModel("p", "sol", { reasoning: true, maxTokens: 16_000, contextWindow: 128_000 });
+    const registry = fakeRegistry([fast, balanced, deep], ["p/luna", "p/terra", "p/sol"]);
+    assert.equal(rankConfiguredModels({ models: [deep, balanced, fast], registry, tier: "fast" })[0].reference, "p/luna");
+    assert.equal(rankConfiguredModels({ models: [fast, deep, balanced], registry, tier: "balanced" })[0].reference, "p/terra");
+    assert.equal(rankConfiguredModels({ models: [balanced, fast, deep], registry, tier: "deep" })[0].reference, "p/sol");
+  });
+
+  it("uses preferred provider then lexical ordering independently of input order", () => {
+    const alpha = fakeModel("alpha", "luna"); const beta = fakeModel("beta", "luna");
+    const registry = fakeRegistry([alpha, beta], ["alpha/luna", "beta/luna"]);
+    assert.equal(rankConfiguredModels({ models: [beta, alpha], registry, tier: "fast", preferredProvider: "beta" })[0].reference, "beta/luna");
+    assert.deepEqual(rankConfiguredModels({ models: [beta, alpha], registry, tier: "fast" }).map((candidate) => candidate.reference), rankConfiguredModels({ models: [alpha, beta], registry, tier: "fast" }).map((candidate) => candidate.reference));
+  });
+
+  it("deduplicates canonical models and safely ranks malformed metadata", () => {
+    const duplicate = fakeModel("OpenAI", "GPT-5", { cost: { input: Number.NaN, output: Infinity, cacheRead: 0, cacheWrite: 0 }, contextWindow: Number.NaN, maxTokens: Infinity });
+    const canonical = fakeModel("openai", "gpt-5"); const other = fakeModel("custom", "luna");
+    const registry = fakeRegistry([duplicate, canonical, other], ["openai/gpt-5", "custom/luna"]);
+    const ranked = rankConfiguredModels({ models: [duplicate, other, canonical], registry, tier: "fast" });
+    assert.equal(ranked.filter((candidate) => candidate.reference.toLowerCase() === "openai/gpt-5").length, 1);
+    assert.deepEqual(ranked.map((candidate) => candidate.reference), ["custom/luna", "OpenAI/GPT-5"]);
+  });
+
+  it("parses public references and turns registry failures into bounded secret-safe errors", () => {
+    assert.deepEqual(parseModelReference(" Provider / model/with/slash "), { ok: true, provider: "Provider", modelId: "model/with/slash", reference: "Provider/model/with/slash" });
+    assert.deepEqual(parseModelReference("/missing"), { ok: false });
+    const result = resolveConfiguredModel({ registry: fakeRegistry([], [], [], { throwGetAvailable: true }), tier: "balanced" });
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.code, "registry-error");
+    assertSecretSafe(result);
   });
 });
