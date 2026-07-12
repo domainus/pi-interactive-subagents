@@ -1193,6 +1193,20 @@ describe("subagent discovery", () => {
     });
   });
 
+  it("documents the bundled literary workflow and permissions", () => {
+    const readme = readFileSync(
+      join(fileURLToPath(new URL("..", import.meta.url)), "README.md"),
+      "utf8",
+    );
+
+    assert.match(readme, /translator.*GPT-5\.6 Sol.*high thinking/is);
+    assert.match(readme, /translator-reviewer.*read-only/is);
+    assert.match(readme, /editor.*publication-quality/is);
+    assert.match(readme, /translator\s*(?:→|->).*translator-reviewer\s*(?:→|->).*editor/is);
+    assert.match(readme, /independently invokable/i);
+    assert.match(readme, /literary.*deep/i);
+  });
+
   it("keeps literary role instructions separated by responsibility", () => {
     const agentsDir = join(fileURLToPath(new URL("..", import.meta.url)), "agents");
     const translator = readFileSync(join(agentsDir, "translator.md"), "utf8");

@@ -95,8 +95,21 @@ Herdr support uses its documented JSON CLI (`pane split/run/read/close`). It has
 | **reviewer**      | GPT-5.6 Sol (medium thinking)   | Reviews code for bugs, security issues, correctness                                      |
 | **visual-tester** | GPT-5.6 Terra                   | Visual QA via Chrome CDP — screenshots, responsive testing, interaction testing          |
 | **chatgpt-code**  | GPT-5.6 Sol                     | Self-driving ChatGPT/OpenAI Codex coding session for deep investigation                  |
+| **translator** | GPT-5.6 Sol (high thinking) | Translates source-language literary work into faithful, polished English |
+| **translator-reviewer** | GPT-5.6 Sol (high thinking) | Read-only fidelity review comparing source work with its English translation |
+| **editor** | GPT-5.6 Sol (high thinking) | Brings English manuscripts and translations to professional publication quality |
 
 Agent discovery follows priority: **project-local** (`.pi/agents/`) > **global** (`~/.pi/agent/agents/`) > **package-bundled**. Override any bundled agent by placing your own version in the higher-priority location.
+
+#### Literary workflow
+
+The literary roles are independently invokable and default to GPT-5.6 Sol with high thinking. A typical sequence is **translator → translator-reviewer → editor**:
+
+1. `translator` reads the source and writes the English translation.
+2. `translator-reviewer` is read-only and reports fidelity defects without modifying files.
+3. `editor` applies professional English grammar, semantics, consistency, typography, and formatting after translation choices are accepted.
+
+The editor's final pass aims for publication-quality English. All three literary roles declare the `deep` configured-model tier. If their preferred Sol model is unavailable, the configured-model resolver applies the same authenticated OAuth-first fallback policy documented below. The sequence is caller-controlled; the package does not chain the roles automatically.
 
 > **Migration:** `chatgpt-code` replaces `claude-code` as the visible bundled agent. Existing explicit `agent: "claude-code"` configurations remain supported through a deprecated hidden alias, but now run the same OpenAI Codex-backed Pi flow rather than the external Claude CLI. Update saved configurations to `agent: "chatgpt-code"`.
 
@@ -338,7 +351,7 @@ Pi-backed subagents resolve models from Pi's configured model registry immediate
 
 - A tool-call `model: "provider/model"` is an explicit override. It is strict: the model must be known to Pi **and** have configured authenticated access, or the launch returns an actionable error with up to three configured alternatives. It never silently substitutes an explicit model.
 - An agent's frontmatter `model` is a preferred default. If it is unavailable, Pi selects a configured fallback for the agent's `model-tier`; `fast`, `balanced`, and `deep` are the supported tiers, and custom agents without a tier use `balanced`.
-- Fallback selection is deterministic and role-aware, preferring configured OAuth/subscription access before API-key access, then the closest tier. Bundled defaults are: `scout` and `visual-tester` `fast`; `planner` and `worker` `balanced`; `reviewer`, `chatgpt-code`, and the hidden `claude-code` alias `deep`.
+- Fallback selection is deterministic and role-aware, preferring configured OAuth/subscription access before API-key access, then the closest tier. Bundled defaults are: `scout` and `visual-tester` `fast`; `planner` and `worker` `balanced`; `reviewer`, `chatgpt-code`, the hidden `claude-code` alias, `translator`, `translator-reviewer`, and `editor` `deep`.
 - A Pi-backed launch with no configured model returns the `/login` or provider-API-key guidance **before** it creates a pane, artifact, or running-agent entry.
 - `subagents_list` takes one registry snapshot per listing and annotates each visible Pi-backed agent with its configured model, fallback, or safe unavailable status. Results label OAuth, API-key, and `external auth` separately; annotations use only bounded public model references and alternatives.
 
