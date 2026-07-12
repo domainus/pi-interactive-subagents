@@ -29,6 +29,7 @@ export interface SubagentActivityState {
   runningChildId: string;
   createdAt: number;
   updatedAt: number;
+  heartbeatAt?: number;
   sequence: number;
   latestEvent: SubagentActivityEvent;
   phase: SubagentActivityPhase;
@@ -54,6 +55,7 @@ export type ActivityReadResult =
 export type SubagentShutdownReason = "quit" | "reload" | "new" | "resume" | "fork";
 
 export interface SubagentActivityRecorder {
+  heartbeat(): void;
   sessionStart(): void;
   input(): void;
   beforeAgentStart(): void;
@@ -166,6 +168,7 @@ function validateActivity(value: unknown, expectedRunningChildId: string): Activ
   const validationError = [
     validateFiniteNumber(object, "createdAt"),
     validateFiniteNumber(object, "updatedAt"),
+    validateOptionalFiniteNumber(object, "heartbeatAt"),
     validateInteger(object, "sequence"),
     validateBoolean(object, "agentActive"),
     validateBoolean(object, "turnActive"),
@@ -223,6 +226,7 @@ export function writeSubagentActivityFile(activityFile: string, activity: Subage
 
 function createNoopRecorder(): SubagentActivityRecorder {
   return {
+    heartbeat() {},
     sessionStart() {},
     input() {},
     beforeAgentStart() {},
@@ -307,6 +311,7 @@ export function createSubagentActivityRecorder(params: {
     runningChildId,
     createdAt,
     updatedAt: createdAt,
+    heartbeatAt: createdAt,
     sequence: 0,
     latestEvent: "session_start",
     phase: "starting",
@@ -387,6 +392,11 @@ export function createSubagentActivityRecorder(params: {
   }
 
   return {
+    heartbeat() {
+      if (disabled) return;
+      activity.heartbeatAt = now();
+      flushNow();
+    },
     sessionStart() {
       record("session_start", (current) => {
         current.phase = "starting";

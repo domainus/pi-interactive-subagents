@@ -1640,6 +1640,56 @@ describe("subagent activity snapshots", () => {
     };
   }
 
+  it("accepts legacy snapshots without heartbeatAt", () => {
+    withTempDir((dir) => {
+      const activityFile = getSubagentActivityFile(dir, "legacy-child");
+      mkdirSync(join(dir, "subagent-activity"), { recursive: true });
+      writeFileSync(activityFile, `${JSON.stringify(validActivity({ runningChildId: "legacy-child" }))}\n`);
+      assert.equal(readSubagentActivityFile(activityFile, "legacy-child").ok, true);
+    });
+  });
+
+  it("updates heartbeat without changing semantic activity or sequence", () => {
+    withTempDir((dir) => {
+      let now = 1_000;
+      const activityFile = getSubagentActivityFile(dir, "heartbeat-child");
+      const recorder = createSubagentActivityRecorder({
+        runningChildId: "heartbeat-child",
+        activityFile,
+        now: () => now,
+      });
+      recorder.sessionStart();
+      recorder.toolExecutionStart("tool-1", "bash");
+      const before = readSubagentActivityFile(activityFile, "heartbeat-child");
+      assert.ok(before.ok);
+
+      now = 6_000;
+      recorder.heartbeat();
+      const after = readSubagentActivityFile(activityFile, "heartbeat-child");
+      assert.ok(after.ok);
+      assert.equal(after.activity.heartbeatAt, 6_000);
+      assert.equal(after.activity.sequence, before.activity.sequence);
+      assert.equal(after.activity.latestEvent, before.activity.latestEvent);
+      assert.equal(after.activity.phase, "active");
+      assert.equal(after.activity.toolName, "bash");
+      assert.equal(after.activity.updatedAt, before.activity.updatedAt);
+    });
+  });
+
+  it("rejects a non-finite heartbeatAt", () => {
+    withTempDir((dir) => {
+      const activityFile = getSubagentActivityFile(dir, "bad-heartbeat");
+      mkdirSync(join(dir, "subagent-activity"), { recursive: true });
+      writeFileSync(activityFile, `${JSON.stringify(validActivity({
+        runningChildId: "bad-heartbeat",
+        heartbeatAt: "bad",
+      }))}\n`);
+      const read = readSubagentActivityFile(activityFile, "bad-heartbeat");
+      assert.equal(read.ok, false);
+      assert.equal((read as { ok: false; reason: string }).reason, "invalid");
+    });
+  });
+
   it("writes and validates activity files by running child id", () => {
     withTempDir((dir) => {
       const activityFile = getSubagentActivityFile(dir, "child-1");
