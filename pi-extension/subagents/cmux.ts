@@ -1357,14 +1357,39 @@ function interpretExitSidecar(data: any): PollResult {
   return { reason: "done", exitCode: 0 };
 }
 
-export const __pollForExitTest__ = { interpretExitSidecar };
+export type PaneProbeObservation =
+  | { readable: true }
+  | { readable: false; error?: string };
 
 /**
- * Poll until the subagent exits. Checks for a `.exit` sidecar file first
- * (written by subagent_done / caller_ping), falling back to the terminal
- * sentinel for crash detection.
+ * Read an authoritative subagent completion sidecar. Callers that only need
+ * to inspect it can leave it in place; the completion watcher consumes it
+ * exactly once.
  */
-export async function pollForExit(
+export function readExitSidecar(
+  sessionFile: string,
+  options: { consume: boolean },
+): PollResult | null {
+  try {
+    const exitFile = `${sessionFile}.exit`;
+    if (!existsSync(exitFile)) return null;
+    const data = JSON.parse(readFileSync(exitFile, "utf8"));
+    if (options.consume) rmSync(exitFile, { force: true });
+    return interpretExitSidecar(data);
+  } catch {
+    return null;
+  }
+}
+
+function boundedError(error: unknown): string | undefined {
+  const message = error instanceof Error ? error.message : String(error);
+  const bounded = message.replace(/\s+/g, " ").trim().slice(0, 200);
+  return bounded || undefined;
+}
+
+type ReadScreenAsync = (surface: string, lines?: number) => Promise<string>;
+
+async function pollForExitWithReadScreen(
   surface: string,
   signal: AbortSignal,
   options: {
@@ -1372,7 +1397,9 @@ export async function pollForExit(
     sessionFile?: string;
     sentinelFile?: string;
     onTick?: (elapsed: number) => void;
+    onPaneProbe?: (observation: PaneProbeObservation) => void;
   },
+  readScreen: ReadScreenAsync = readScreenAsync,
 ): Promise<PollResult> {
   const start = Date.now();
 
@@ -1383,14 +1410,8 @@ export async function pollForExit(
 
     // Fast path: check for .exit sidecar file (written by subagent_done / caller_ping)
     if (options.sessionFile) {
-      try {
-        const exitFile = `${options.sessionFile}.exit`;
-        if (existsSync(exitFile)) {
-          const data = JSON.parse(readFileSync(exitFile, "utf8"));
-          rmSync(exitFile, { force: true });
-          return interpretExitSidecar(data);
-        }
-      } catch {}
+      const sidecar = readExitSidecar(options.sessionFile, { consume: true });
+      if (sidecar) return sidecar;
     }
 
     // Check Claude sentinel file (written by plugin Stop hook)
@@ -1404,22 +1425,18 @@ export async function pollForExit(
 
     // Slow path: read terminal screen for sentinel (crash detection)
     try {
-      const screen = await readScreenAsync(surface, 5);
+      const screen = await readScreen(surface, 5);
+      options.onPaneProbe?.({ readable: true });
       const match = screen.match(/__SUBAGENT_DONE_(\d+)__/);
       if (match) {
         return { reason: "sentinel", exitCode: parseInt(match[1], 10) };
       }
-    } catch {
+    } catch (error) {
+      options.onPaneProbe?.({ readable: false, error: boundedError(error) });
       // Surface may have been destroyed — check if .exit file appeared in the meantime
       if (options.sessionFile) {
-        try {
-          const exitFile = `${options.sessionFile}.exit`;
-          if (existsSync(exitFile)) {
-            const data = JSON.parse(readFileSync(exitFile, "utf8"));
-            rmSync(exitFile, { force: true });
-            return interpretExitSidecar(data);
-          }
-        } catch {}
+        const sidecar = readExitSidecar(options.sessionFile, { consume: true });
+        if (sidecar) return sidecar;
       }
     }
 
@@ -1439,4 +1456,25 @@ export async function pollForExit(
       signal.addEventListener("abort", onAbort, { once: true });
     });
   }
+}
+
+export const __pollForExitTest__ = { interpretExitSidecar, pollForExitWithReadScreen };
+
+/**
+ * Poll until the subagent exits. Checks for a `.exit` sidecar file first
+ * (written by subagent_done / caller_ping), falling back to the terminal
+ * sentinel for crash detection.
+ */
+export async function pollForExit(
+  surface: string,
+  signal: AbortSignal,
+  options: {
+    interval: number;
+    sessionFile?: string;
+    sentinelFile?: string;
+    onTick?: (elapsed: number) => void;
+    onPaneProbe?: (observation: PaneProbeObservation) => void;
+  },
+): Promise<PollResult> {
+  return pollForExitWithReadScreen(surface, signal, options);
 }

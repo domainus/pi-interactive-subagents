@@ -44,6 +44,7 @@ import {
   createStatusState,
   forceStatusAfterInterrupt,
   formatStatusAggregate,
+  observePaneProbe,
   formatTransitionLine,
   observeStatus,
   loadStatusConfig,
@@ -531,6 +532,10 @@ function formatWidgetRightLabel(snapshot: StatusSnapshot): string {
     const duration = snapshot.waitingDurationText ? ` ${snapshot.waitingDurationText}` : "";
     const detail = snapshot.statusLabel ? ` · ${snapshot.statusLabel}` : "";
     return ` waiting${duration}${detail} `;
+  }
+  if (snapshot.kind === "broken") {
+    const detail = snapshot.statusLabel ? ` · ${snapshot.statusLabel}` : "";
+    return ` broken${detail} `;
   }
 
   const detail = snapshot.statusLabel ? ` · ${snapshot.statusLabel}` : "";
@@ -1388,6 +1393,9 @@ async function watchSubagent(
       sentinelFile: running.sentinelFile,
       onTick() {
         observeRunningSubagent(running);
+      },
+      onPaneProbe(observation) {
+        running.statusState = observePaneProbe(running.statusState, observation);
       },
     });
 

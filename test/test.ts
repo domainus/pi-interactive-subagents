@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { visibleWidth } from "@mariozechner/pi-tui";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
+import * as cmuxModule from "../pi-extension/subagents/cmux.ts";
 
 import {
   getLeafId,
@@ -1764,6 +1765,78 @@ describe("cmux.ts interpretExitSidecar", () => {
     assert.deepEqual(interpretExitSidecar(null), { reason: "done", exitCode: 0 });
   });
 });
+describe("cmux.ts pane probe and exit sidecar handling", () => {
+  it("reports unreadable then readable pane probes from completion polling", async () => {
+    const pollForExitWithReadScreen = (cmuxModule as any).__pollForExitTest__
+      .pollForExitWithReadScreen;
+    assert.equal(typeof pollForExitWithReadScreen, "function");
+
+    const probes: Array<{ readable: boolean; error?: string }> = [];
+    const reads = [
+      async () => { throw new Error("pane missing"); },
+      async () => "output\n__SUBAGENT_DONE_0__\n",
+    ];
+    const result = await pollForExitWithReadScreen(
+      "pane-1",
+      new AbortController().signal,
+      {
+        interval: 0,
+        onPaneProbe(observation: { readable: boolean; error?: string }) {
+          probes.push(observation);
+        },
+      },
+      async () => reads.shift()!(),
+    );
+
+    assert.deepEqual(probes, [
+      { readable: false, error: "pane missing" },
+      { readable: true },
+    ]);
+    assert.deepEqual(result, { reason: "sentinel", exitCode: 0 });
+  });
+
+  it("peeks without removing and consumes a valid exit sidecar exactly once", () => {
+    const readExitSidecar = (cmuxModule as any).readExitSidecar;
+    assert.equal(typeof readExitSidecar, "function");
+
+    withTempDir((dir) => {
+      const session = join(dir, "child.jsonl");
+      writeFileSync(`${session}.exit`, JSON.stringify({ type: "done" }));
+      assert.deepEqual(readExitSidecar(session, { consume: false }), { reason: "done", exitCode: 0 });
+      assert.deepEqual(readExitSidecar(session, { consume: true }), { reason: "done", exitCode: 0 });
+      assert.equal(readExitSidecar(session, { consume: true }), null);
+    });
+  });
+});
+
+describe("subagent health completion wiring", () => {
+  it("forwards poll pane probes into the running status state", () => {
+    const source = readFileSync(
+      fileURLToPath(new URL("../pi-extension/subagents/index.ts", import.meta.url)),
+      "utf8",
+    );
+    const watchStart = source.indexOf("async function watchSubagent(");
+    const watchBlock = source.slice(watchStart, source.indexOf("\n    const elapsed", watchStart));
+
+    assert.match(
+      watchBlock,
+      /onPaneProbe\(observation\)[\s\S]*running\.statusState = observePaneProbe\(running\.statusState, observation\)/,
+    );
+  });
+
+  it("renders broken widget health without falling through to stalled", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const snapshot = {
+      kind: "broken",
+      statusLabel: "pane unavailable",
+    } as any;
+
+    const label = testApi.formatWidgetRightLabel(snapshot);
+    assert.equal(label, " broken · pane unavailable ");
+    assert.doesNotMatch(label, /stalled/);
+  });
+});
+
 describe("commands", () => {
   it("/iterate always emits a full-context fork tool call", () => {
     const { api, registeredCommands, sentUserMessages } = createMockExtensionApi();
