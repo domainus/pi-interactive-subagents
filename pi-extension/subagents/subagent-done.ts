@@ -7,7 +7,7 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Box, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { writeFileSync } from "node:fs";
-import { createSubagentActivityRecorder } from "./activity.ts";
+import { createSubagentActivityRecorder, type SubagentActivityRecorder } from "./activity.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
   return agentStarted;
@@ -88,6 +88,25 @@ export function parseDeniedTools(rawValue: string | undefined): string[] {
     .filter(Boolean);
 }
 
+export const HEARTBEAT_INTERVAL_MS = 5_000;
+
+export function createHeartbeatTimer(
+  recorder: Pick<SubagentActivityRecorder, "heartbeat">,
+  setTimer = setInterval,
+  clearTimer = clearInterval,
+) {
+  const timer = setTimer(() => recorder.heartbeat(), HEARTBEAT_INTERVAL_MS);
+  let stopped = false;
+
+  return {
+    stop() {
+      if (stopped) return;
+      stopped = true;
+      clearTimer(timer);
+    },
+  };
+}
+
 export default function (pi: ExtensionAPI) {
   let toolNames: string[] = [];
   let denied: string[] = [];
@@ -153,10 +172,18 @@ export default function (pi: ExtensionAPI) {
 
   let userTookOver = false;
   let agentStarted = false;
+  let heartbeatTimer: ReturnType<typeof createHeartbeatTimer> | null = null;
+
+  function stopHeartbeatTimer(): void {
+    heartbeatTimer?.stop();
+    heartbeatTimer = null;
+  }
 
   // Show widget + status bar on session start
   pi.on("session_start", (_event, ctx) => {
+    stopHeartbeatTimer();
     recorder.sessionStart();
+    heartbeatTimer = createHeartbeatTimer(recorder);
     const tools = pi.getAllTools();
     toolNames = tools.map((t) => t.name).sort();
     denied = parseDeniedTools(deniedToolsValue);
@@ -199,6 +226,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       recorder.agentEndDone();
+      stopHeartbeatTimer();
       ctx.shutdown();
       return;
     }
@@ -252,6 +280,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", (event) => {
+    stopHeartbeatTimer();
     recorder.sessionShutdown((event as any).reason);
   });
 
@@ -282,6 +311,7 @@ export default function (pi: ExtensionAPI) {
       };
       writeFileSync(`${sessionFile}.exit`, JSON.stringify(exitData));
 
+      stopHeartbeatTimer();
       ctx.shutdown();
       return {
         content: [{ type: "text", text: "Ping sent. Session will exit and parent will be notified." }],
@@ -304,6 +334,7 @@ export default function (pi: ExtensionAPI) {
       if (sessionFile) {
         writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "done" }));
       }
+      stopHeartbeatTimer();
       ctx.shutdown();
       return {
         content: [{ type: "text", text: "Shutting down subagent session." }],

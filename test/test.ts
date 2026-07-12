@@ -61,6 +61,7 @@ import subagentDoneExtension, {
   shouldAutoExitOnAgentEnd,
   findLatestAssistantError,
   buildAutoExitSidecar,
+  createHeartbeatTimer,
 } from "../pi-extension/subagents/subagent-done.ts";
 import { __pollForExitTest__ } from "../pi-extension/subagents/cmux.ts";
 
@@ -1392,6 +1393,112 @@ describe("subagent-done.ts", () => {
     subagentDoneExtension(pi as any);
 
     assert.deepEqual(shortcuts, []);
+  });
+
+  it("heartbeat timer starts, ticks, and stops idempotently", () => {
+    const calls: string[] = [];
+    let tick: (() => void) | undefined;
+    const owner = createHeartbeatTimer(
+      { heartbeat() { calls.push("heartbeat"); } },
+      (callback, ms) => {
+        assert.equal(ms, 5_000);
+        tick = callback;
+        return 41 as any;
+      },
+      (timer) => calls.push(`clear:${timer}`),
+    );
+
+    tick!();
+    owner.stop();
+    owner.stop();
+
+    assert.deepEqual(calls, ["heartbeat", "clear:41"]);
+  });
+
+  it("heartbeat timer replaces the prior session owner and clears the current owner on shutdown", () => {
+    const { api, eventHandlers } = createMockExtensionApi();
+    const calls: string[] = [];
+    const originalSetInterval = globalThis.setInterval;
+    const originalClearInterval = globalThis.clearInterval;
+    let nextTimer = 0;
+
+    (globalThis as any).setInterval = (callback: () => void, ms: number) => {
+      assert.equal(ms, 5_000);
+      const timer = ++nextTimer;
+      calls.push(`set:${timer}`);
+      return timer;
+    };
+    (globalThis as any).clearInterval = (timer: number) => calls.push(`clear:${timer}`);
+
+    try {
+      subagentDoneExtension(api);
+      const sessionStart = eventHandlers.get("session_start")![0];
+      const sessionShutdown = eventHandlers.get("session_shutdown")![0];
+      const ctx = { ui: { setWidget() {} } };
+
+      sessionStart({}, ctx);
+      sessionStart({}, ctx);
+      sessionShutdown({ reason: "quit" });
+
+      assert.deepEqual(calls, ["set:1", "clear:1", "set:2", "clear:2"]);
+    } finally {
+      globalThis.setInterval = originalSetInterval;
+      globalThis.clearInterval = originalClearInterval;
+    }
+  });
+
+  it("heartbeat timer stops before every terminal shutdown", async () => {
+    const originalSetInterval = globalThis.setInterval;
+    const originalClearInterval = globalThis.clearInterval;
+    const originalAutoExit = process.env.PI_SUBAGENT_AUTO_EXIT;
+    const originalSession = process.env.PI_SUBAGENT_SESSION;
+    const tempDir = createTestDir();
+
+    try {
+      for (const terminalPath of ["auto-exit", "caller_ping", "subagent_done"] as const) {
+        const { api, eventHandlers, registeredTools } = createMockExtensionApi();
+        const calls: string[] = [];
+        (globalThis as any).setInterval = (_callback: () => void, ms: number) => {
+          assert.equal(ms, 5_000);
+          calls.push("set");
+          return 41;
+        };
+        (globalThis as any).clearInterval = (timer: number) => calls.push(`clear:${timer}`);
+
+        if (terminalPath === "auto-exit") {
+          process.env.PI_SUBAGENT_AUTO_EXIT = "1";
+          delete process.env.PI_SUBAGENT_SESSION;
+        } else {
+          delete process.env.PI_SUBAGENT_AUTO_EXIT;
+          process.env.PI_SUBAGENT_SESSION = join(tempDir, `${terminalPath}.jsonl`);
+        }
+
+        subagentDoneExtension(api);
+        const ctx = {
+          ui: { setWidget() {} },
+          shutdown() { calls.push("shutdown"); },
+        };
+        eventHandlers.get("session_start")![0]({}, ctx);
+
+        if (terminalPath === "auto-exit") {
+          eventHandlers.get("agent_end")![0]({
+            messages: [{ role: "assistant", stopReason: "stop" }],
+          }, ctx);
+        } else {
+          const tool = registeredTools.find((entry) => entry.name === terminalPath);
+          assert.ok(tool, `expected ${terminalPath} to be registered`);
+          await tool.execute("call-1", terminalPath === "caller_ping" ? { message: "need help" } : {}, undefined, undefined, ctx);
+        }
+
+        assert.deepEqual(calls, ["set", "clear:41", "shutdown"], terminalPath);
+      }
+    } finally {
+      globalThis.setInterval = originalSetInterval;
+      globalThis.clearInterval = originalClearInterval;
+      restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", originalAutoExit);
+      restoreEnvVar("PI_SUBAGENT_SESSION", originalSession);
+      rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 
   describe("shouldMarkUserTookOver", () => {
