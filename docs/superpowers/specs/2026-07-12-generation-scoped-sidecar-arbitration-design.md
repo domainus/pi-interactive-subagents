@@ -1,181 +1,170 @@
-# Generation-scoped sidecar arbitration design
+# Generation-scoped exclusive sidecar ownership design
 
 ## Status
 
-This document amends `2026-07-12-subagent-health-remediation-design.md`. It supersedes any interpretation that completion sidecars or remediation ownership are shared only by session path. Health classification from Tasks 1–4 remains unchanged.
+This document amends `2026-07-12-subagent-health-remediation-design.md` and supersedes earlier lease-directory proposals. Health classification from Tasks 1–4 remains unchanged.
 
 ## Problem
 
-A subagent resume reuses the session JSONL path but starts a new child process. Session-scoped exit and lease paths therefore force unrelated child generations to transfer ownership. Attempts to patch that transfer introduce gaps where an old child can publish, stale leases can block new children forever, or a live publisher can rename after remediation believes it reclaimed ownership.
+Completion and remediation execute in separate processes. Portable filesystem APIs cannot atomically compare lease metadata and then rename another file. Any protocol built from “read token, then rename” permits process preemption between those operations.
 
-The unit of terminal ownership must be one launched child generation, not one resumable transcript.
+Terminal ownership therefore needs one filesystem operation that is itself authoritative.
 
-## Artifact identity
+## Generation identity
 
-Every Pi-backed launch already has a random `runningChildId`. Terminal artifacts derive from both the preserved session path and this child ID:
+Every Pi-backed launch has a unique eight-hex-character `runningChildId`. Its terminal record is:
 
 ```text
 <session-file>.subagent-<running-child-id>.exit
-<session-file>.subagent-<running-child-id>.lease/
 ```
 
-The child ID is normalized to the existing generated hexadecimal identifier format before path construction. Callers never accept arbitrary path fragments.
+A resumed transcript receives a new child ID and a different terminal path. Previous runs cannot block or overwrite the resumed generation. Claude sentinel behavior remains unchanged.
 
-A resumed session receives a new child ID and therefore fresh terminal artifacts. Previous remediation markers remain scoped to the dead generation and cannot block the resumed child.
+## Exclusive ownership primitive
 
-Claude-backed sentinel behavior remains unchanged.
+The generation exit path is both the ownership record and terminal payload. Child publication and parent remediation compete using exclusive creation (`openSync(path, "wx")`). Exactly one process can create the path.
 
-## Shared path helpers
+There is no separate lease directory, token transfer, resume reservation, or check-then-rename ownership claim.
 
-A focused `sidecar-arbitration.ts` module owns:
+## Record types
 
-- generation-specific exit and lease path construction;
-- child publication leases;
-- parent remediation acquisition;
-- stale publisher fencing;
-- bounded filesystem error conversion;
-- lease metadata validation.
-
-`cmux.ts`, `subagent-done.ts`, and `index.ts` consume these helpers rather than constructing terminal paths independently.
-
-## Lease metadata
-
-Each lease directory contains atomically published metadata:
+A complete child terminal record uses the existing payload meanings with a version and child ID:
 
 ```ts
-interface SidecarLeaseMetadata {
+type ChildTerminalRecord =
+  | { version: 1; runningChildId: string; type: "done" }
+  | { version: 1; runningChildId: string; type: "ping"; name: string; message: string }
+  | { version: 1; runningChildId: string; type: "error"; errorMessage: string; stopReason?: string };
+```
+
+A parent remediation owner writes:
+
+```ts
+interface RemediationTerminalRecord {
   version: 1;
-  kind: "publisher" | "remediation";
   runningChildId: string;
-  token: string;
-  acquiredAt: number;
+  type: "remediation";
+  claimedAt: number;
+  reason: "heartbeat-stale" | "pane-unavailable";
 }
 ```
 
-Metadata is written to a same-directory temporary file and renamed into place. Invalid or partially readable metadata is treated as an arbitration problem, never as permission to publish or remediate immediately.
+An empty, partial, malformed, wrong-version, or wrong-child file is an incomplete/invalid owner record rather than absence.
 
-The random token fences stale owners. Child ID identifies the generation; token identifies one lease acquisition attempt within that generation.
+## Child publication
 
-## Child publication protocol
+The child:
 
-To publish a terminal payload, the child:
+1. Exclusively creates the generation exit path.
+2. If creation reports `EEXIST`, reads the existing record:
+   - completed child record: return `existing` without overwrite;
+   - remediation record: return `blocked`;
+   - incomplete record: return `blocked` while it remains fresh.
+3. If creation succeeds, write the complete JSON payload through the held file descriptor.
+4. Call `fsyncSync()` and close the descriptor.
+5. Re-read/stat the canonical path:
+   - if it still contains the intended complete child record, return `published`;
+   - if remediation fenced it to another inode/path, return `lost`.
 
-1. Atomically creates its generation lease directory.
-2. Atomically writes publisher metadata with a fresh token.
-3. Writes the exit payload to a same-directory temporary file.
-4. Re-reads lease metadata immediately before final rename.
-5. Renames the payload only when metadata still matches `kind`, child ID, and token.
-6. Removes the temporary payload on lost ownership or error.
-7. Removes its lease directory only when it still owns the same publisher token.
+The child never overwrites an existing terminal record. A second terminal callback cannot replace `done`, `ping`, or `error`.
 
-Outcomes are discriminated:
+If writing fails, the publisher closes the descriptor and returns the original bounded error. It does not perform a check-then-unlink cleanup that could remove a replacement owner. The incomplete file becomes eligible for parent stale recovery after the broken-health gate.
 
-- `published`: final sidecar is authoritative.
-- `blocked`: remediation already owns this generation.
-- `lost`: publisher was fenced before rename.
-- `error`: bounded filesystem detail accompanies the original failure.
+Explicit `caller_ping` and `subagent_done` tool executions throw publication errors. Auto-exit success/provider-error handlers record a bounded publication diagnostic, request shutdown, and retain shell-sentinel/session extraction as the fallback completion path; provider error detail remains in the child session.
 
-All four Pi child terminal paths use this protocol: normal auto-exit, provider/agent error, `caller_ping`, and `subagent_done`.
+## Parent remediation
 
-## Parent remediation protocol
+Remediation runs only for an autonomous child already classified `broken`.
 
-Remediation begins only after the existing health state classifies the same child generation `broken`.
+1. Try exclusive creation of the generation exit path.
+2. If creation succeeds, write/fsync/close a remediation record, then claim in-memory ownership without an asynchronous boundary.
+3. If `EEXIST`, inspect the existing record:
+   - valid child terminal record: defer to watcher completion;
+   - remediation record for this child: treat remediation ownership as already established;
+   - incomplete/invalid fresh record: defer;
+   - incomplete/invalid record older than 30 seconds: attempt stale fencing.
+4. Stale fencing atomically renames the canonical exit path to a unique tombstone.
+5. Immediately retry exclusive creation of the canonical path and write a remediation record.
+6. If rename or exclusive recreation loses a race, inspect/defer rather than deleting a replacement.
+7. Remove only the uniquely named tombstone best-effort after remediation ownership is established.
 
-The parent:
+A child still writing through an open descriptor after stale fencing writes to the renamed tombstone inode, not the new canonical remediation record. Its post-close canonical verification returns `lost`.
 
-1. Reads the generation-specific final sidecar without consuming it. A valid sidecar defers to normal watcher completion.
-2. Attempts to create the generation lease directory.
-3. If it creates the directory, it atomically writes remediation metadata, rechecks the sidecar while holding ownership, then claims the in-memory terminal path.
-4. If a publisher lease exists and is fresh, remediation defers.
-5. If a publisher lease is stale and the child is still `broken`, the parent atomically renames the entire old lease directory to a unique fenced/tombstone path.
-6. The parent creates a new lease directory and remediation marker with its own token.
-7. It rechecks the final sidecar before claiming the in-memory terminal path.
-8. It removes the fenced old directory best-effort after installing the remediation lease.
+On platforms where renaming an open file fails, remediation returns a bounded defer/error outcome. It remains safe, although cleanup waits for a later retry.
 
-A publisher whose directory was renamed fails its mandatory metadata revalidation and cannot rename its temporary payload afterward.
+## Why stale fencing cannot steal a fresh replacement
 
-The parent retains the remediation marker for that dead generation. No normal release or resume transfer is needed because no future child reuses that generation path.
+Publishers never remove or replace the canonical terminal path. Once a child exclusively creates it, that inode remains canonical until either:
 
-## Stale recovery
+- the watcher consumes a valid complete record; or
+- the parent atomically renames an incomplete stale record.
 
-A publisher lease may be reclaimed only when all conditions hold:
+There is no gap where the stale owner removes its path and another same-generation publisher recreates it. A second publisher sees `EEXIST` and never overwrites. Therefore the inode the parent stats is stable until the parent rename or watcher consumption; a failed rename causes reinspection.
 
-- metadata identifies the same child generation;
-- lease age exceeds 30 seconds;
-- the parent health snapshot for that exact child is currently `broken`;
-- no valid final sidecar exists;
-- atomic directory rename succeeds.
+## Watcher behavior
 
-A missing or invalid metadata file is recoverable only after the lease directory itself is older than 30 seconds and the same child is `broken`. Fresh unreadable metadata always defers.
+`pollForExit()` receives `runningChildId` and reads only that generation path.
 
-The 30-second lease threshold does not determine child health. It applies only after the independent 120-second heartbeat or three-probe broken gate has already fired.
+- Valid `done`, `ping`, or `error`: consume and return existing `PollResult` semantics.
+- `remediation`: ignore; remediation owns parent notification.
+- Partial/invalid record: leave untouched and retry.
+- No path: continue sentinel/pane polling.
 
-## Watcher integration
-
-`pollForExit()` receives `runningChildId` for Pi-backed runs and consumes only that generation’s sidecar. It never consumes another generation’s artifact or a generic session-level sidecar.
-
-Normal completion removes the final generation sidecar after decoding, as today. Publisher leases should already be gone. Remediation markers may remain as small diagnostic artifacts beside the session.
-
-## Resume behavior
-
-`subagent_resume` creates a new child ID before command construction. It does not inspect, clear, replace, or reserve any prior generation’s lease. Command-delivery rollback therefore has no sidecar reservation to unwind.
-
-The preserved JSONL session remains the transcript source; terminal ownership is independent.
+A watcher never consumes another generation’s record.
 
 ## Filesystem errors
 
-Arbitration helpers return discriminated error results rather than throwing into status intervals. Error messages collapse whitespace and are capped at 200 characters.
+Shared helpers return discriminated outcomes and bounded messages (collapsed whitespace, maximum 200 characters). Parent arbitration errors never escape the status interval.
 
-On parent arbitration error:
+On parent error:
 
-- no terminal claim occurs;
-- the watcher, pane, map entry, and session remain intact;
-- the error is recorded on the running state;
-- at most one bounded status diagnostic is delivered for an unchanged error;
-- later status ticks may retry.
+- no in-memory terminal claim occurs;
+- watcher/pane/map/session remain intact;
+- one bounded diagnostic is emitted per unchanged error;
+- later ticks retry.
 
-Child publication preserves the original filesystem exception after cleaning only artifacts it owns. It never removes another token’s lease.
+Child explicit tool paths preserve errors by throwing. Auto-exit paths preserve provider/session detail and emit the publication error to bounded stderr before shell-sentinel fallback.
 
-## Exactly-once ownership
+## Exactly-once parent ownership
 
-Filesystem arbitration decides whether completion publication or remediation may proceed across processes. The existing in-memory terminal claim then decides which parent path may close, remove, and notify.
+Exclusive sidecar creation arbitrates child versus parent across processes. Existing in-memory terminal claims arbitrate watcher, remediation, and shutdown inside the parent process.
 
-Both gates are required:
+Only the in-memory claim winner may abort, close, remove, or notify. Done-phase and interactive runs remain silent and unremediated.
 
-- filesystem token: child process versus parent remediation;
-- in-memory claim: watcher versus remediation versus shutdown.
+## Launch and resume
 
-No asynchronous boundary occurs between a successful parent remediation lease, final sidecar recheck, and in-memory terminal claim.
+Spawn/resume create no terminal artifact before the child process attempts publication. Command-delivery failure cannot strand an ownership record. Resume simply uses a new child ID and path; it never reads or modifies prior generation files.
+
+General pane rollback remains Task 6.
 
 ## Testing
 
-Implementation follows strict test-first development from the approved Task 4 baseline.
+Strict test-first coverage must include:
 
-Tests must cover:
-
-1. Generation-specific paths differ for two child IDs sharing one session.
-2. A resumed generation is unaffected by an old remediation marker.
-3. Child-first lease publishes and parent remediation defers.
-4. Parent-first remediation blocks that same generation’s publisher.
-5. A fenced publisher cannot rename after stale lease takeover.
-6. Fresh publisher leases are never reclaimed.
-7. Stale publisher and stale unmarked leases recover only when the same child is broken.
-8. Publisher metadata and remediation markers use atomic rename.
-9. Publisher token revalidation occurs immediately before payload rename.
-10. Publication error/lost ownership cleans only owned temporary artifacts.
-11. Parent filesystem errors remain bounded and do not escape the status timer.
-12. `pollForExit()` consumes only its supplied child generation.
-13. All four child terminal paths publish through the shared helper.
-14. Spawn and resume command-delivery failures do not strand generation reservations.
-15. Existing exactly-once, done-silence, interactive-preservation, shutdown, widget-failure, bounded-result, and identity-safe deletion tests remain green.
+1. Different child IDs sharing a session produce different exit paths.
+2. Child-first exclusive creation makes parent defer.
+3. Parent-first remediation makes child return blocked.
+4. Second child publication never overwrites an existing complete payload.
+5. Watcher consumes only its generation.
+6. Partial fresh record defers remediation.
+7. Partial stale record plus broken health is atomically renamed and fenced.
+8. A child paused after open, then fenced, writes only the tombstone inode and returns lost.
+9. Parent rename/recreate race failures re-inspect/defer safely.
+10. Child write failure preserves the original error and leaves recoverable partial ownership.
+11. Remediation record write/fsync errors are bounded and contained.
+12. All four child terminal paths use exclusive publication.
+13. Auto-exit publication errors retain session/sentinel fallback; explicit tools throw.
+14. Existing exactly-once, shutdown, widget-failure, identity-safe deletion, done silence, interactive preservation, bounded result, and real spawn/resume delivery tests remain green.
+15. No source-string-only test substitutes for production-path behavior.
 
 ## Acceptance criteria
 
-- Resumed children never transfer or clear prior terminal ownership.
-- Old children cannot publish into a new generation’s completion path.
-- A live publisher that loses a stale lease is fenced before final rename.
-- A stale crashed publisher cannot block remediation indefinitely.
-- A valid generation sidecar always wins before parent in-memory claim.
-- Arbitration filesystem errors never escape the timer.
-- Each autonomous broken run produces at most one terminal failure and never retries automatically.
-- All unit and relevant integration tests pass.
+- One exclusive creation decides cross-process ownership.
+- No check-token-then-rename correctness assumption remains.
+- A fenced writer cannot write to the canonical remediation record.
+- Fresh partial records are never reclaimed.
+- Stale partial records cannot block a broken generation forever where atomic rename is supported.
+- Resumed children are isolated by generation.
+- A valid child terminal record wins whenever published before parent exclusive ownership.
+- Arbitration errors never escape status supervision.
+- Autonomous remediation emits at most one failure and never retries work automatically.

@@ -1,29 +1,28 @@
-# Generation-Scoped Sidecar Arbitration Implementation Plan
+# Generation-Scoped Exclusive Sidecar Ownership Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Replace Task 5’s session-scoped terminal arbitration with generation-scoped sidecars and token-fenced leases so completion/remediation remains race-safe across child processes and resumed sessions.
+**Goal:** Build exactly-once child completion versus parent remediation around exclusive creation of one generation-specific terminal path, eliminating non-atomic lease token protocols.
 
-**Architecture:** Derive exit and lease artifacts from session path plus `runningChildId`. A shared arbitration module atomically publishes metadata, fences stale publishers through directory rename plus token revalidation, and returns bounded discriminated errors. Filesystem arbitration gates cross-process ownership; existing in-memory claims gate watcher/remediation/shutdown cleanup.
+**Architecture:** Child and parent compete with `openSync(path, "wx")`. The winning inode is authoritative. Fresh partial files defer remediation; stale partial files for already-broken children are atomically renamed so an open writer is fenced onto a tombstone inode. Existing in-memory claims govern parent cleanup and notification.
 
-**Tech Stack:** TypeScript ESM, Node.js filesystem primitives, Node `node:test`, Pi extension lifecycle APIs.
+**Tech Stack:** TypeScript ESM, Node filesystem descriptors, Node `node:test`, Pi extension lifecycle APIs.
 
 ## Global Constraints
 
-- Start from approved Task 4 commit `3704f5e`.
-- Exit and lease artifacts are scoped by `runningChildId`; resume never transfers old ownership.
-- Stale publisher recovery threshold is exactly 30 seconds and applies only after the same child is already `broken`.
-- Publisher must revalidate child ID and random token immediately before final sidecar rename.
-- Valid final sidecar recheck occurs while parent holds remediation ownership and before in-memory claim.
-- No `await` occurs inside filesystem arbitration critical sections.
-- Arbitration filesystem errors are bounded to 200 collapsed characters and never escape the status interval.
-- Autonomous remediation never retries/resumes/relaunches work.
-- Interactive and done-phase runs remain untouched and silent.
-- Follow strict RED-before-GREEN TDD and preserve exact evidence.
+- Start from approved Tasks 1–4 and the exclusive-sidecar design commit; no prior Task 5 code is retained.
+- Terminal paths include the exact eight-hex `runningChildId`.
+- Ownership is decided by exclusive final-path creation, not metadata check followed by rename.
+- Fresh incomplete records defer; stale fencing threshold is exactly 30 seconds and only applies to an already-broken child.
+- Child writes use held file descriptors plus `fsyncSync()`; no overwrite of existing records.
+- Parent filesystem errors are bounded to 200 collapsed characters and never escape status supervision.
+- Resume uses a fresh generation path and performs no ownership transfer/reservation.
+- Only the in-memory claim winner cleans up or notifies.
+- Strict complete RED-before-GREEN TDD evidence is mandatory.
 
 ---
 
-### Task 1: Generation-Scoped Terminal Ownership and Remediation (Task 5R)
+### Task 1: Exclusive Generation Sidecar and Safe Remediation (Task 5X)
 
 **Files:**
 - Create: `pi-extension/subagents/sidecar-arbitration.ts`
@@ -33,178 +32,145 @@
 - Test: `test/test.ts`
 
 **Interfaces:**
-- Produces `getGenerationExitFile(sessionFile, runningChildId)` and `getGenerationLeaseDir(...)`.
-- Produces `publishGenerationSidecar(...)` with `published | blocked | lost | error` outcomes.
-- Produces `tryClaimGenerationRemediation(...)` with `acquired | defer | error` outcomes and a token-fenced retained marker.
-- Extends `pollForExit()` options with `runningChildId` for Pi-backed sidecar consumption.
-- Preserves existing `TerminalClaim`, identity-safe deletion, shared spawn/resume delivery, and bounded result interfaces described in the original Task 5 brief.
+- `getGenerationExitFile(sessionFile, runningChildId): string`
+- `publishGenerationTerminal(params): PublishOutcome`
+- `tryClaimGenerationRemediation(params): RemediationOutcome`
+- `readGenerationTerminal(sessionFile, runningChildId): ReadOutcome`
+- `pollForExit()` consumes `runningChildId` for Pi sidecars.
+- Parent retains the original Task 5 `TerminalClaim` and identity-safe cleanup concepts.
 
-- [ ] **Step 1: Write every arbitration and remediation test before production edits**
+- [ ] **Step 1: Write all exclusive-ownership tests before production code**
 
-Add tests for generation path isolation:
+Add generation-path tests and reject invalid IDs.
 
-```ts
-it("isolates terminal artifacts by running child generation", () => {
-  assert.notEqual(
-    getGenerationExitFile("/tmp/session.jsonl", "child-a"),
-    getGenerationExitFile("/tmp/session.jsonl", "child-b"),
-  );
-  assert.notEqual(
-    getGenerationLeaseDir("/tmp/session.jsonl", "child-a"),
-    getGenerationLeaseDir("/tmp/session.jsonl", "child-b"),
-  );
-});
-```
+Add deterministic publisher tests using injected filesystem operations/hooks:
 
-Add deterministic injected hooks/ops to prove:
+- successful exclusive create/write/fsync/close/readback returns `published`;
+- existing valid child record returns `existing` without opening for write;
+- existing remediation record returns `blocked`;
+- second `done`/`error`/`ping` cannot overwrite first payload;
+- write or fsync failure returns the original error and leaves an incomplete recoverable record;
+- child paused after exclusive open, parent stale-fences the path, child resumes writing through the held descriptor, canonical remediation remains unchanged, and child returns `lost`;
+- no cleanup operation can unlink a replacement canonical owner.
 
-- child publisher owns lease first, publishes, releases, and parent defers;
-- parent owns first and same-generation publisher returns `blocked`;
-- an old generation remediation marker does not affect a new generation publisher;
-- publisher paused before final rename loses after parent atomically fences its stale lease;
-- lost publisher removes its temp payload and never creates final sidecar;
-- fresh publisher lease defers even when caller asks for stale recovery;
-- stale lease recovers only with `{ childBroken: true }`;
-- stale lease does not recover for another child ID or a healthy child;
-- fresh invalid/unmarked metadata defers; stale invalid/unmarked metadata recovers only for the broken same-generation path;
-- metadata/marker publication uses temp plus rename and preserves the previous valid marker on failure;
-- mkdir/stat/read/write/rename/rm errors return bounded `error` outcomes;
-- child publication failure preserves the original exception and cleans only matching-token artifacts.
+Add deterministic parent tests:
 
-Add parent lifecycle tests before production edits for:
+- parent exclusive create wins and blocks child publication;
+- existing complete child record defers remediation and remains watcher-consumable;
+- fresh empty/partial/malformed/wrong-child record defers;
+- stale incomplete record with healthy child defers;
+- stale incomplete record with broken child is renamed to a unique tombstone, canonical remediation is exclusively created, and tombstone cleanup targets only the renamed path;
+- failed rename/recreate due to a competitor re-inspects and defers;
+- remediation write/fsync/stat/rename/open errors return bounded error outcomes, not throws.
 
-- all existing Task 5 claim/remediation races;
-- shutdown winner/loser cleanup;
-- widget throw still followed by one result;
-- done-phase and interactive zero-message preservation;
-- identity-safe map deletion;
-- spawn and resume production delivery helpers suppress lost claims;
-- broken-generation arbitration error leaves run registered and sends one diagnostic per unchanged error;
-- a later successful retry remediates normally;
-- valid generation sidecar defers remediation and remains consumable;
-- `pollForExit()` consumes child A’s sidecar and leaves child B’s untouched;
-- resume uses a new child ID without reading or changing old lease directories;
-- command delivery failure creates no generation lease/marker.
+Add watcher and parent lifecycle tests before production edits:
 
-Add child extension tests proving normal success, provider error, `caller_ping`, and `subagent_done` pass both session file and child ID to the shared publisher.
+- poller A consumes only A’s generation and leaves B untouched;
+- remediation errors do not escape refresh interval and notify once per unchanged diagnostic;
+- valid sidecar precedence;
+- exactly one in-memory terminal owner;
+- shutdown winner/loser;
+- widget failure cannot skip terminal failure delivery;
+- actual watcher abort catch suppression;
+- real spawn and resume delivery paths suppress lost claims;
+- interactive and done-phase zero-message preservation;
+- close failure and identity-safe replacement-map behavior;
+- command delivery failure creates no terminal artifact.
 
-- [ ] **Step 2: Run the complete focused selection and verify genuine RED**
+Add child extension tests proving all four terminal paths call exclusive publication with session and child ID. Explicit tools throw publication errors; auto-exit paths retain bounded fallback behavior.
 
-Run:
+- [ ] **Step 2: Run focused tests and capture genuine RED**
 
 ```bash
-node --test --test-name-pattern='generation|arbitrat|terminal owner|remediat|interactive broken|done-phase|watcher abort|sidecar|shutdown claim|widget refresh|identity-safe|spawn delivery|resume delivery' test/test.ts
+node --test --test-name-pattern='exclusive|generation|partial|fenc|terminal owner|remediat|watcher abort|sidecar|shutdown claim|widget refresh|identity-safe|spawn delivery|resume delivery|done-phase|interactive broken' test/test.ts
 ```
 
-Expected: failure because generation path helpers, fenced publisher/remediation functions, and Task 5 parent ownership behavior do not exist. Preserve exact exit status and key failure lines before any production edit.
+Expected: failures for absent sidecar module, generation polling, and parent ownership/remediation APIs. Record exact exit status and key failure lines before production edits.
 
-- [ ] **Step 3: Implement the focused generation arbitration module**
+- [ ] **Step 3: Implement record validation and bounded outcomes**
 
-Use strict child-ID validation:
+Validate eight-hex child IDs. Implement versioned child and remediation records from the spec. Reading distinguishes:
 
 ```ts
-function requireRunningChildId(value: string): string {
-  if (!/^[a-f0-9]{8}$/i.test(value)) throw new Error("invalid running child id");
-  return value.toLowerCase();
-}
+type ReadOutcome =
+  | { kind: "missing" }
+  | { kind: "child"; result: PollResult }
+  | { kind: "remediation"; record: RemediationTerminalRecord }
+  | { kind: "incomplete"; ageMs: number; error?: string }
+  | { kind: "error"; error: string };
 ```
 
-Paths append `.subagent-${id}.exit` and `.subagent-${id}.lease` to the session path.
+Bound all surfaced errors to 200 collapsed characters.
 
-Metadata is versioned and validated:
+- [ ] **Step 4: Implement child exclusive publication through a held descriptor**
 
-```ts
-export interface SidecarLeaseMetadata {
-  version: 1;
-  kind: "publisher" | "remediation";
-  runningChildId: string;
-  token: string;
-  acquiredAt: number;
-}
-```
+Use `openSync(exitPath, "wx", 0o600)`. On success, write the complete payload to that descriptor, `fsyncSync`, and close.
 
-Use same-directory temp files and `renameSync()` for metadata and payload. Generate tokens with `randomUUID()` or cryptographically random bytes. Normalize errors with:
+After close, read canonical record. Matching intended record means `published`; remediation/missing/different inode/content means `lost`.
 
-```ts
-export function boundArbitrationError(error: unknown): string {
-  const text = error instanceof Error ? error.message : String(error);
-  return text.replace(/\s+/g, " ").trim().slice(0, 200) || "unknown filesystem error";
-}
-```
+On `EEXIST`, inspect without modifying. Never call `writeFileSync` on an existing final path and never unlink after check-token logic.
 
-Publisher re-reads metadata and compares all identity fields immediately before payload rename. Cleanup verifies token ownership before removing a lease directory.
+Expose test hooks around post-open/pre-write and post-write/pre-readback so the test can interleave parent fencing while the descriptor remains open.
 
-- [ ] **Step 4: Implement stale fencing through atomic directory rename**
+- [ ] **Step 5: Implement parent exclusive claim and stale partial fencing**
 
-When a publisher lease is older than 30,000 ms and `childBroken` is true:
+First try `openSync(exitPath, "wx", 0o600)` and write/fsync/close remediation JSON. If it succeeds, return acquired.
 
-1. rename the existing lease directory to a unique tombstone path;
-2. create the canonical lease directory;
-3. atomically publish remediation metadata with a new token;
-4. recheck the final sidecar;
-5. return an acquired lease only when no sidecar exists;
-6. remove tombstone best-effort.
+On `EEXIST`, inspect:
 
-If any competing operation recreates the canonical path first, return `defer`. A publisher tied to the renamed directory must fail canonical metadata token revalidation before payload rename.
+- complete child: defer;
+- remediation: already-owned/defer;
+- incomplete younger than 30,000 ms: defer;
+- incomplete older than 30,000 ms with `childBroken: false`: defer;
+- stale incomplete with broken child: rename canonical path to unique tombstone, then retry exclusive create.
 
-- [ ] **Step 5: Migrate child and watcher sidecar paths**
+A failed rename or recreate returns defer/error after reinspection. Remove only the unique tombstone path best-effort after canonical remediation creation. A writer with the original open descriptor can no longer affect canonical path.
 
-`subagent-done.ts` reads both `PI_SUBAGENT_SESSION` and `PI_SUBAGENT_ID` and calls `publishGenerationSidecar()` on all four terminal paths.
+- [ ] **Step 6: Migrate polling and all child terminal paths**
 
-`pollForExit()` accepts `runningChildId?: string`. For Pi runs it reads and consumes only `getGenerationExitFile(sessionFile, runningChildId)`. Claude sentinel behavior is unchanged. Remove duplicate generic `.exit` construction from new Pi launch paths.
+`pollForExit()` accepts `runningChildId`; it consumes only complete child records. It ignores remediation and leaves incomplete records for retry. Claude behavior remains unchanged.
 
-- [ ] **Step 6: Implement exactly-once parent remediation on top of arbitration**
+`subagent-done.ts` uses the publisher for auto-exit done/error, `caller_ping`, and `subagent_done`. Explicit tool publication errors throw. Auto-exit publication error is bounded to stderr, then shutdown/sentinel/session extraction remains the fallback.
 
-Reintroduce the original Task 5 in-memory ownership helpers and tests from the approved plan. `remediateBrokenSubagent()` calls `tryClaimGenerationRemediation()` with `running.id`, current time, and `childBroken: true`.
+- [ ] **Step 7: Implement parent exactly-once remediation**
 
-Only `acquired` may proceed to `claimTerminal("remediation")`. If the in-memory claim loses, retain safe ownership without cleanup/notification and let the winner finish. `defer` leaves the watcher intact. `error` records a bounded diagnostic and leaves the run intact.
+Reintroduce the original Task 5 in-memory claims, shared production delivery helper, identity-safe delete, bounded health result, and tests.
 
-After claim:
+Only an acquired remediation record may attempt `claimTerminal("remediation")`. The winner aborts watcher, closes best-effort, identity-safe removes, refreshes widget best-effort, and sends exactly one failure containing session path and `subagent_resume` guidance. No retry occurs.
 
-1. capture bounded diagnostics;
-2. abort watcher;
-3. close pane best-effort;
-4. identity-safe remove;
-5. refresh widget best-effort;
-6. send exactly one terminal failure with session path and `subagent_resume` guidance.
+Status refresh collects remediation candidates after iteration and suppresses interactive/done transitions.
 
-Status refresh excludes done/interactive transitions and remediates collected candidates after map iteration.
+- [ ] **Step 8: Verify resume and delivery failure behavior**
 
-- [ ] **Step 7: Keep resume generation-independent and launch transactional**
+Resume constructs a new ID/path and does not inspect old paths. No ownership file exists before child publication, so `sendLongCommand()` failure cannot strand terminal ownership. Preserve existing pane behavior for Task 6 rollback.
 
-`subagent_resume` creates its new random ID and directly constructs the command with that ID. It does not reserve, inspect, replace, or remove any old generation lease. No sidecar artifact exists before the child starts publishing.
-
-Task 6 will provide general pane rollback; for this task, ensure no new arbitration artifact can be stranded when `sendLongCommand()` throws.
-
-- [ ] **Step 8: Run focused GREEN and full verification**
-
-Run:
+- [ ] **Step 9: Run GREEN and full verification**
 
 ```bash
-node --test --test-name-pattern='generation|arbitrat|terminal owner|remediat|interactive broken|done-phase|watcher abort|sidecar|shutdown claim|widget refresh|identity-safe|spawn delivery|resume delivery' test/test.ts
+node --test --test-name-pattern='exclusive|generation|partial|fenc|terminal owner|remediat|watcher abort|sidecar|shutdown claim|widget refresh|identity-safe|spawn delivery|resume delivery|done-phase|interactive broken' test/test.ts
 npm test
 git diff --check
 ```
 
 Expected: all pass.
 
-- [ ] **Step 9: Self-review process boundaries**
+- [ ] **Step 10: Self-review protocol assumptions**
 
-Inspect the diff and explicitly verify:
+Verify:
 
-- no generic Pi `.exit` path remains in launch/watch paths;
-- no resume ownership transfer exists;
-- every child rename is preceded by token revalidation;
-- stale recovery requires both 30 seconds and broken health;
-- filesystem errors cannot escape `refreshSubagentStatuses()`;
-- only terminal-claim winner closes/removes/notifies;
-- tests invoke real production delivery helpers, not a parallel test-only abstraction.
+- no separate lease directory or token check remains;
+- no publisher overwrites or unlinks existing canonical path;
+- parent rename acts on the stable incomplete inode publishers never replace;
+- open-descriptor fencing test pauses after open and before completion;
+- second terminal callbacks cannot overwrite;
+- all parent errors are contained;
+- tests exercise production delivery paths rather than source strings.
 
-- [ ] **Step 10: Commit and report**
+- [ ] **Step 11: Commit and report**
 
 ```bash
 git add pi-extension/subagents/sidecar-arbitration.ts pi-extension/subagents/cmux.ts pi-extension/subagents/subagent-done.ts pi-extension/subagents/index.ts test/test.ts
-git commit -m "feat(subagents): arbitrate generation-scoped terminal ownership"
+git commit -m "feat(subagents): claim generation terminal paths exclusively"
 ```
 
-Write `.superpowers/sdd/task-5r-report.md` with exact RED/GREEN/full output, commit SHA, files, self-review, and concerns.
+Write `.superpowers/sdd/task-5x-report.md` with exact RED/GREEN/full evidence, commit, files, self-review, and concerns.
