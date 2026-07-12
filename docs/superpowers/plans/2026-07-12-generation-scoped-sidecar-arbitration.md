@@ -23,7 +23,7 @@
 
 ---
 
-### Task 5R: Generation-Scoped Terminal Ownership and Remediation
+### Task 1: Generation-Scoped Terminal Ownership and Remediation (Task 5R)
 
 **Files:**
 - Create: `pi-extension/subagents/sidecar-arbitration.ts`
