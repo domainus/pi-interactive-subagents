@@ -27,6 +27,7 @@ import {
   renameCurrentTab,
   renameWorkspace,
   readScreen,
+  type PaneProbeObservation,
 } from "./cmux.ts";
 
 import {
@@ -1036,6 +1037,7 @@ export const __test__ = {
   startWidgetRefresh,
   startStatusRefresh,
   refreshSubagentStatuses,
+  createCompletionPollOptions,
   runningSubagents,
   formatElapsed,
 };
@@ -1379,6 +1381,20 @@ function copyClaudeSession(sentinelFile: string): string | null {
   }
 }
 
+function createCompletionPollOptions(running: RunningSubagent) {
+  return {
+    interval: 1000,
+    sessionFile: running.sessionFile,
+    sentinelFile: running.sentinelFile,
+    onTick() {
+      observeRunningSubagent(running);
+    },
+    onPaneProbe(observation: PaneProbeObservation) {
+      running.statusState = observePaneProbe(running.statusState, observation, Date.now());
+    },
+  };
+}
+
 async function watchSubagent(
   running: RunningSubagent,
   signal: AbortSignal,
@@ -1387,17 +1403,11 @@ async function watchSubagent(
   const { name, task, surface, startTime, sessionFile } = running;
 
   try {
-    const result = await pollForExit(surface, AbortSignal.any([signal, moduleSignal]), {
-      interval: 1000,
-      sessionFile,
-      sentinelFile: running.sentinelFile,
-      onTick() {
-        observeRunningSubagent(running);
-      },
-      onPaneProbe(observation) {
-        running.statusState = observePaneProbe(running.statusState, observation);
-      },
-    });
+    const result = await pollForExit(
+      surface,
+      AbortSignal.any([signal, moduleSignal]),
+      createCompletionPollOptions(running),
+    );
 
     const elapsed = Math.floor((Date.now() - startTime) / 1000);
 

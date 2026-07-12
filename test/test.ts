@@ -1807,21 +1807,61 @@ describe("cmux.ts pane probe and exit sidecar handling", () => {
       assert.equal(readExitSidecar(session, { consume: true }), null);
     });
   });
+
+  it("leaves malformed exit sidecars unconsumed", () => {
+    const readExitSidecar = (cmuxModule as any).readExitSidecar;
+
+    withTempDir((dir) => {
+      const session = join(dir, "child.jsonl");
+      const exitFile = `${session}.exit`;
+      writeFileSync(exitFile, "{ malformed");
+
+      assert.equal(readExitSidecar(session, { consume: true }), null);
+      assert.equal(readFileSync(exitFile, "utf8"), "{ malformed");
+    });
+  });
+
+  it("normalizes and bounds failed pane probe errors", async () => {
+    const pollForExitWithReadScreen = (cmuxModule as any).__pollForExitTest__
+      .pollForExitWithReadScreen;
+    const rawError = `  pane\n\t${"x".repeat(250)}  `;
+    const expectedError = `pane ${"x".repeat(250)}`.slice(0, 200);
+    const probes: Array<{ readable: boolean; error?: string }> = [];
+    const reads = [
+      async () => { throw new Error(rawError); },
+      async () => "__SUBAGENT_DONE_0__",
+    ];
+
+    await pollForExitWithReadScreen(
+      "pane-1",
+      new AbortController().signal,
+      { interval: 0, onPaneProbe(observation: { readable: boolean; error?: string }) { probes.push(observation); } },
+      async () => reads.shift()!(),
+    );
+
+    assert.deepEqual(probes, [
+      { readable: false, error: expectedError },
+      { readable: true },
+    ]);
+  });
 });
 
 describe("subagent health completion wiring", () => {
-  it("forwards poll pane probes into the running status state", () => {
-    const source = readFileSync(
-      fileURLToPath(new URL("../pi-extension/subagents/index.ts", import.meta.url)),
-      "utf8",
-    );
-    const watchStart = source.indexOf("async function watchSubagent(");
-    const watchBlock = source.slice(watchStart, source.indexOf("\n    const elapsed", watchStart));
+  it("records a numeric failure timestamp through completion poll options", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const running = {
+      cli: "pi",
+      statusState: createStatusState({ source: "pi", startTimeMs: 0 }),
+    };
 
-    assert.match(
-      watchBlock,
-      /onPaneProbe\(observation\)[\s\S]*running\.statusState = observePaneProbe\(running\.statusState, observation\)/,
-    );
+    withMockedNow(4_200, () => {
+      testApi.createCompletionPollOptions?.(running)?.onPaneProbe({
+        readable: false,
+        error: "pane missing",
+      });
+    });
+
+    assert.equal(running.statusState.paneProblemSinceMs, 4_200);
   });
 
   it("renders broken widget health without falling through to stalled", () => {
