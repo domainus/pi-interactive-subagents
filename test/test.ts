@@ -4949,6 +4949,20 @@ describe("configured launch model", () => {
     });
   });
 
+  it("bounds public model identifiers in launch result details without changing the executed model", async () => {
+    await withTempDirAsync(async (dir) => {
+      const id = `${"model".repeat(40)}-unbounded-suffix`;
+      const explicit = `oauth/${id}`;
+      const selected = model("oauth", id);
+      await withRegisteredSpawn(dir, { name: "Bounded", task: "run", model: explicit }, registry([selected], [explicit]), (result) => {
+        assert.ok(result.details.model.requested.length <= 120);
+        assert.ok(result.details.model.effective.length <= 120);
+        assert.doesNotMatch(JSON.stringify(result.details.model), /unbounded-suffix/);
+        assert.match(readFileSync(result.details.launchScriptFile, "utf8"), new RegExp(`--model 'oauth/${id}'`));
+      });
+    });
+  });
+
   it("configured launch model preserves preferred defaults and uses fallbacks in the Pi command", async () => {
     await withIsolatedAgentEnv(async ({ projectAgentsDir, projectDir }) => {
       writeAgentFile(projectAgentsDir, "preferred-agent", "name: preferred-agent\nmodel: anthropic/preferred\nmodel-tier: balanced");

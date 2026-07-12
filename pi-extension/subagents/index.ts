@@ -547,9 +547,9 @@ function configuredModelErrorResult(resolution: Exclude<ReturnType<typeof resolv
 
 function launchModelDetails(model: ResolvedLaunchModel) {
   return {
-    ...(model.requestedModel === undefined ? {} : { requested: model.requestedModel }),
-    ...(model.preferredModel === undefined ? {} : { preferred: model.preferredModel }),
-    effective: model.effectiveModel,
+    ...(model.requestedModel === undefined ? {} : { requested: modelReferenceForDisplay(model.requestedModel) }),
+    ...(model.preferredModel === undefined ? {} : { preferred: modelReferenceForDisplay(model.preferredModel) }),
+    effective: modelReferenceForDisplay(model.effectiveModel),
     authType: model.authType,
     tier: model.tier,
     source: model.source,
