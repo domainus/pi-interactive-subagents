@@ -1222,24 +1222,6 @@ describe("subagent discovery", () => {
     assert.doesNotMatch(claudeBlock, /buildThinkingArgs/);
   });
 
-  it("validates thinking before requesting a launch surface", () => {
-    const source = readFileSync(
-      fileURLToPath(new URL("../pi-extension/subagents/index.ts", import.meta.url)),
-      "utf8",
-    );
-    const executeStart = source.indexOf("async execute(_toolCallId, params, _signal, _onUpdate, ctx)");
-    const executeBlock = source.slice(executeStart, source.indexOf("\n      renderCall", executeStart));
-    const thinkingSupportCheck = executeBlock.indexOf("assertThinkingSupportedForCli(params, agentDefs);");
-    const thinkingResolution = executeBlock.indexOf("effectiveThinking = resolveEffectiveThinking(params, agentDefs);");
-    const launchInvocation = executeBlock.indexOf("const running = await launchSubagent(params, ctx, extensionOwner, {");
-
-    assert.ok(thinkingSupportCheck >= 0, "expected Pi/Claude thinking support validation");
-    assert.ok(thinkingResolution >= 0, "expected effective thinking resolution");
-    assert.ok(launchInvocation >= 0, "expected deferred launch invocation");
-    assert.ok(thinkingSupportCheck < launchInvocation, "thinking support must be checked before launch");
-    assert.ok(thinkingResolution < launchInvocation, "thinking must be resolved before launch");
-  });
-
   it("closes a locally owned pane when launch setup fails", async () => {
     const closed: string[] = [];
     await assert.rejects(
@@ -4586,6 +4568,20 @@ describe("configured launch model", () => {
       writeAgentFile(projectAgentsDir, "invalid-tier-agent", "name: invalid-tier-agent\nmodel-tier: sideways");
       await withRegisteredSpawn(projectDir, { name: "Invalid", task: "never launch", agent: "invalid-tier-agent" }, registry([], []), async (result, running) => {
         assert.match(result.content[0].text, /Invalid model tier "sideways"/);
+        assert.equal(running.size, 0);
+        assert.equal(readFileSync(join(projectDir, ".herdr.log"), "utf8"), "");
+        assert.equal(existsSync(join(projectDir, "artifacts")), false);
+      });
+    });
+  });
+
+  it("invalid thinking rejects through the registered tool before pane, artifact, or map mutation", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir, projectDir }) => {
+      writeAgentFile(projectAgentsDir, "invalid-thinking-launch-agent", "name: invalid-thinking-launch-agent\nthinking: sideways");
+      const available = model("oauth", "luna");
+      await withRegisteredSpawn(projectDir, { name: "Invalid thinking", task: "never launch", agent: "invalid-thinking-launch-agent" }, registry([available], ["oauth/luna"]), (result, running) => {
+        assert.match(result.content[0].text, /Invalid thinking level "sideways"/);
+        assert.equal(result.details.error, "invalid agent definition");
         assert.equal(running.size, 0);
         assert.equal(readFileSync(join(projectDir, ".herdr.log"), "utf8"), "");
         assert.equal(existsSync(join(projectDir, "artifacts")), false);
