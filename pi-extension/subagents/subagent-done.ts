@@ -6,8 +6,8 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Box, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
-import { writeFileSync } from "node:fs";
 import { createSubagentActivityRecorder, type SubagentActivityRecorder } from "./activity.ts";
+import { publishGenerationTerminal, type ChildTerminalInput } from "./sidecar-arbitration.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
   return agentStarted;
@@ -79,6 +79,35 @@ export function buildAutoExitSidecar(
   if (!shouldAutoExitOnAgentEnd(userTookOver, messages)) return null;
   const errorInfo = findLatestAssistantError(messages);
   return errorInfo ? { type: "error", ...errorInfo } : { type: "done" };
+}
+
+function boundedPublicationError(error: string): string {
+  return error.replace(/\s+/g, " ").trim().slice(0, 200) || "unknown terminal publication error";
+}
+
+/**
+ * Publish one child-owned terminal record. Explicit control tools surface an
+ * error to their caller; auto-exit logs and still shuts down for sentinel
+ * fallback when publication cannot be completed.
+ */
+export function publishSubagentTerminal(
+  sessionFile: string | undefined,
+  runningChildId: string | undefined,
+  terminal: ChildTerminalInput,
+): { ok: true } | { ok: false; error: string } {
+  if (!sessionFile) return { ok: false, error: "PI_SUBAGENT_SESSION is not set" };
+  if (!runningChildId) return { ok: false, error: "PI_SUBAGENT_ID is not set" };
+
+  const outcome = publishGenerationTerminal({ sessionFile, runningChildId, terminal });
+  if (outcome.kind === "published" || outcome.kind === "existing") return { ok: true };
+  if (outcome.kind === "blocked") {
+    return { ok: false, error: "terminal publication was blocked by parent remediation" };
+  }
+  return { ok: false, error: boundedPublicationError(outcome.error) };
+}
+
+function throwPublicationError(result: ReturnType<typeof publishSubagentTerminal>): void {
+  if (!result.ok) throw new Error(`Failed to publish subagent terminal record: ${result.error}`);
 }
 
 export function parseDeniedTools(rawValue: string | undefined): string[] {
@@ -213,16 +242,16 @@ export default function (pi: ExtensionAPI) {
     const exitSidecar = autoExit ? buildAutoExitSidecar(userTookOver, messages) : null;
 
     if (exitSidecar) {
-      // Persist completion before shutdown so the parent watcher does not depend
-      // on a multiplexer pane retaining the same identifier long enough to read
-      // the shell sentinel. Error payloads preserve their provider detail.
-      const sessionFile = process.env.PI_SUBAGENT_SESSION;
-      if (sessionFile) {
-        try {
-          writeFileSync(`${sessionFile}.exit`, JSON.stringify(exitSidecar));
-        } catch {
-          // Best effort — terminal sentinel polling remains the crash fallback.
-        }
+      // The final record is atomically linked only after its complete payload is
+      // fsynced. A failed auto-exit publication must not strand the child: the
+      // shell sentinel and session transcript remain fallback completion evidence.
+      const publication = publishSubagentTerminal(
+        process.env.PI_SUBAGENT_SESSION,
+        process.env.PI_SUBAGENT_ID,
+        exitSidecar,
+      );
+      if (!publication.ok) {
+        console.warn(`Subagent terminal record publication failed: ${boundedPublicationError(publication.error)}`);
       }
 
       recorder.agentEndDone();
@@ -309,7 +338,7 @@ export default function (pi: ExtensionAPI) {
         name: process.env.PI_SUBAGENT_NAME ?? "subagent",
         message: params.message,
       };
-      writeFileSync(`${sessionFile}.exit`, JSON.stringify(exitData));
+      throwPublicationError(publishSubagentTerminal(sessionFile, process.env.PI_SUBAGENT_ID, exitData));
 
       stopHeartbeatTimer();
       ctx.shutdown();
@@ -331,9 +360,7 @@ export default function (pi: ExtensionAPI) {
     async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
       const sessionFile = process.env.PI_SUBAGENT_SESSION;
       recorder.subagentDone();
-      if (sessionFile) {
-        writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "done" }));
-      }
+      throwPublicationError(publishSubagentTerminal(sessionFile, process.env.PI_SUBAGENT_ID, { type: "done" }));
       stopHeartbeatTimer();
       ctx.shutdown();
       return {

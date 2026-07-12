@@ -3,6 +3,7 @@ import { keyHint } from "@mariozechner/pi-coding-agent";
 import { Type, type Static } from "@sinclair/typebox";
 import { Box, Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 import { dirname, join } from "node:path";
+import { randomBytes } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import {
   readdirSync,
@@ -56,6 +57,7 @@ import {
   type ActivityReadResult,
   type SubagentActivityState,
 } from "./activity.ts";
+import { tryPublishRemediation } from "./sidecar-arbitration.ts";
 
 /** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
 const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
@@ -477,6 +479,10 @@ function loadAgentDefaults(agentName: string): AgentDefaults | null {
   return null;
 }
 
+function newRunningChildId(): string {
+  return randomBytes(4).toString("hex");
+}
+
 function formatElapsed(seconds: number): string {
   if (seconds < 60) return `${seconds}s`;
   const m = Math.floor(seconds / 60);
@@ -594,6 +600,8 @@ interface SubagentResult {
 /**
  * State for a launched (but not yet completed) subagent.
  */
+type TerminalClaim = "watcher" | "remediation" | "shutdown";
+
 interface RunningSubagent {
   id: string;
   /** Extension/session generation that launched and owns this watcher. */
@@ -623,10 +631,233 @@ interface RunningSubagent {
    * subagent's pane (e.g. planner).
    */
   interactive: boolean;
+  /** One local path may close/remove/deliver a terminal result. */
+  terminalClaim?: TerminalClaim;
+  /** Last bounded arbitration error reported during status supervision. */
+  lastArbitrationError?: string;
+  /** Last bounded permanent-record read diagnostic from the watcher. */
+  terminalRecordError?: string;
 }
 
 /** All currently running subagents, keyed by id. */
 const runningSubagents = new Map<string, RunningSubagent>();
+
+type WatchOutcome =
+  | { kind: "delivered"; result: SubagentResult }
+  | { kind: "suppressed" };
+
+function claimTerminal(running: RunningSubagent, owner: TerminalClaim): boolean {
+  if (running.terminalClaim) return false;
+  running.terminalClaim = owner;
+  return true;
+}
+
+function deleteRunningIdentitySafe(running: RunningSubagent): void {
+  if (runningSubagents.get(running.id) === running) runningSubagents.delete(running.id);
+}
+
+function boundDiagnostic(value: unknown): string {
+  const raw = value instanceof Error ? value.message : String(value);
+  return raw.replace(/\s+/g, " ").trim().slice(0, 200) || "unknown diagnostic";
+}
+
+function buildBrokenSubagentResult(running: RunningSubagent, snapshot: StatusSnapshot): SubagentResult {
+  const reason = snapshot.statusLabel === "pane unavailable"
+    ? "multiplexer pane became unavailable"
+    : `child heartbeat stopped (${snapshot.heartbeatAgeText ?? "unknown age"})`;
+  const diagnostics = [
+    `Health: ${reason}`,
+    running.statusState.latestEvent ? `Last activity: ${boundDiagnostic(running.statusState.latestEvent)}` : null,
+    running.activityRead?.error ? `Activity error: ${boundDiagnostic(running.activityRead.error)}` : null,
+    running.statusState.paneError ? `Pane error: ${boundDiagnostic(running.statusState.paneError)}` : null,
+  ].filter((line): line is string => !!line).join("\n");
+
+  return {
+    name: running.name,
+    task: running.task,
+    summary: diagnostics,
+    sessionFile: running.sessionFile,
+    exitCode: 1,
+    elapsed: Math.floor((Date.now() - running.startTime) / 1000),
+    error: "subagent health check confirmed broken runtime",
+  };
+}
+
+function safeUpdateWidget(update: () => void = updateWidget): void {
+  try {
+    update();
+  } catch {
+    // Rendering is cosmetic and must never suppress a terminal result.
+  }
+}
+
+function sendSubagentResult(
+  pi: Pick<ExtensionAPI, "sendMessage">,
+  running: RunningSubagent,
+  result: SubagentResult,
+): void {
+  const presentation = capDeliveredResult(
+    resolveResultPresentation(result, running.name),
+    result.sessionFile ?? running.sessionFile,
+  );
+  try {
+    pi.sendMessage(
+      {
+        customType: "subagent_result",
+        content: presentation,
+        display: true,
+        details: {
+          name: running.name,
+          task: running.task,
+          agent: running.agent,
+          exitCode: result.exitCode,
+          elapsed: result.elapsed,
+          sessionFile: result.sessionFile,
+          ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+          ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
+        },
+      },
+      { triggerTurn: true, deliverAs: "steer" },
+    );
+  } catch {
+    // Delivery has a single attempt. A throw must not generate a second steer.
+  }
+}
+
+function sendSubagentPing(
+  pi: Pick<ExtensionAPI, "sendMessage">,
+  running: RunningSubagent,
+  result: SubagentResult,
+): void {
+  if (!result.ping) return;
+  const sessionRef = `\n\nSession: ${result.sessionFile}\nResume: pi --session ${result.sessionFile}`;
+  try {
+    pi.sendMessage(
+      {
+        customType: "subagent_ping",
+        content: `Sub-agent "${result.ping.name}" needs help (${formatElapsed(result.elapsed)}):\n\n${result.ping.message}${sessionRef}`,
+        display: true,
+        details: {
+          name: result.ping.name,
+          message: result.ping.message,
+          agent: running.agent,
+          sessionFile: result.sessionFile,
+        },
+      },
+      { triggerTurn: true, deliverAs: "steer" },
+    );
+  } catch {
+    // A terminal ping also has a single delivery attempt.
+  }
+}
+
+function deliverSpawnWatchOutcome(
+  pi: Pick<ExtensionAPI, "sendMessage">,
+  running: RunningSubagent,
+  outcome: WatchOutcome,
+): void {
+  safeUpdateWidget();
+  if (outcome.kind === "suppressed") return;
+  if (outcome.result.ping) {
+    sendSubagentPing(pi, running, outcome.result);
+    return;
+  }
+  sendSubagentResult(pi, running, outcome.result);
+}
+
+function deliverResumeWatchOutcome(
+  pi: Pick<ExtensionAPI, "sendMessage">,
+  running: RunningSubagent,
+  outcome: WatchOutcome,
+  sessionBoundaryBefore: number,
+): void {
+  safeUpdateWidget();
+  if (outcome.kind === "suppressed") return;
+  if (outcome.result.ping) {
+    sendSubagentPing(pi, running, outcome.result);
+    return;
+  }
+  const result = outcome.result;
+  const summary = findLastAssistantMessageInSession(running.sessionFile, sessionBoundaryBefore) ??
+    (result.errorMessage
+      ? `Subagent error: ${result.errorMessage}`
+      : result.exitCode !== 0
+        ? `Resumed session exited with code ${result.exitCode}`
+        : "Resumed session exited without new output");
+  sendSubagentResult(pi, running, { ...result, summary, sessionFile: running.sessionFile });
+}
+
+type RemediationDependencies = {
+  publishRemediation?: (params: {
+    sessionFile: string;
+    runningChildId: string;
+    reason: "heartbeat-stale" | "pane-unavailable";
+    claimedAt: number;
+  }) => { kind: string; error?: string };
+  close?: (surface: string) => void;
+  updateWidget?: () => void;
+  send?: (result: SubagentResult) => void;
+  report?: (error: string) => void;
+};
+
+function remediateBrokenSubagent(
+  running: RunningSubagent,
+  snapshot: StatusSnapshot,
+  dependencies: RemediationDependencies = {},
+): { kind: "remediated" | "skipped" | "defer" | "error" } {
+  if (running.interactive || running.statusState.phase === "done" || running.terminalClaim) {
+    return { kind: "skipped" };
+  }
+
+  const reason: "heartbeat-stale" | "pane-unavailable" = snapshot.statusLabel === "pane unavailable"
+    ? "pane-unavailable"
+    : "heartbeat-stale";
+  let arbitration: { kind: string; error?: string };
+  try {
+    arbitration = (dependencies.publishRemediation ?? tryPublishRemediation)({
+      sessionFile: running.sessionFile,
+      runningChildId: running.id,
+      reason,
+      claimedAt: Date.now(),
+    });
+  } catch (error) {
+    arbitration = { kind: "error", error: boundDiagnostic(error) };
+  }
+
+  if (arbitration.kind === "defer") return { kind: "defer" };
+  if (arbitration.kind === "error") {
+    const diagnostic = boundDiagnostic(arbitration.error);
+    if (running.lastArbitrationError !== diagnostic) {
+      running.lastArbitrationError = diagnostic;
+      try {
+        (dependencies.report ?? ((message) => console.warn(`Subagent remediation arbitration failed: ${message}`)))(diagnostic);
+      } catch {
+        // Supervision must keep running even if diagnostics cannot be written.
+      }
+    }
+    return { kind: "error" };
+  }
+  if (arbitration.kind !== "acquired" && arbitration.kind !== "acquired-existing") {
+    return { kind: "error" };
+  }
+  if (!claimTerminal(running, "remediation")) return { kind: "skipped" };
+
+  const result = buildBrokenSubagentResult(running, snapshot);
+  try {
+    running.abortController?.abort();
+  } catch {}
+  try {
+    (dependencies.close ?? closeSurface)(running.surface);
+  } catch {}
+  deleteRunningIdentitySafe(running);
+  safeUpdateWidget(dependencies.updateWidget);
+  try {
+    dependencies.send?.(result);
+  } catch {
+    // A failed send remains one failed attempt; never issue a fallback steer.
+  }
+  return { kind: "remediated" };
+}
 
 // ── Widget management ──
 
@@ -946,6 +1177,7 @@ function handleSubagentInterrupt(
 
 function refreshSubagentStatuses(pi: Pick<ExtensionAPI, "sendMessage">, now = Date.now()) {
   const transitionLines: string[] = [];
+  const remediationCandidates: Array<{ running: RunningSubagent; snapshot: StatusSnapshot }> = [];
   let shouldRefreshWidget = false;
 
   for (const running of runningSubagents.values()) {
@@ -956,27 +1188,51 @@ function refreshSubagentStatuses(pi: Pick<ExtensionAPI, "sendMessage">, now = Da
     }
     running.statusState = nextState;
 
-    // Status observation never owns pane cleanup. Even a final `done` snapshot
-    // can arrive before the completion watcher consumes the exit sidecar and
-    // extracts the result. Only watchSubagent closes completed surfaces.
+    // A terminal child activity is waiting for its completion watcher. Keep it
+    // registered but never emit a status steer or remediation from this path.
+    if (nextState.phase === "done") continue;
+
+    // Broken autonomous children are handled only after iteration. This avoids
+    // mutating the Map while observing it and keeps interactive/done runs open.
+    if (snapshot.kind === "broken" && !running.interactive) {
+      remediationCandidates.push({ running, snapshot });
+      continue;
+    }
+
     if (transition && !running.interactive) {
       transitionLines.push(formatTransitionLine(running.name, snapshot, transition));
     }
   }
 
-  if (shouldRefreshWidget) updateWidget();
+  if (shouldRefreshWidget) safeUpdateWidget();
 
   if (transitionLines.length > 0) {
     const capped = capStatusLines(transitionLines, statusConfig.lineLimit);
-    pi.sendMessage(
-      {
-        customType: "subagent_status",
-        content: formatStatusAggregate(transitionLines, statusConfig.lineLimit),
-        display: true,
-        details: { lines: capped.visibleLines, overflow: capped.overflow },
-      },
-      { triggerTurn: true, deliverAs: "steer" },
-    );
+    try {
+      pi.sendMessage(
+        {
+          customType: "subagent_status",
+          content: formatStatusAggregate(transitionLines, statusConfig.lineLimit),
+          display: true,
+          details: { lines: capped.visibleLines, overflow: capped.overflow },
+        },
+        { triggerTurn: true, deliverAs: "steer" },
+      );
+    } catch {
+      // Status transitions are advisory; keep the supervision interval alive.
+    }
+  }
+
+  for (const { running, snapshot } of remediationCandidates) {
+    try {
+      remediateBrokenSubagent(running, snapshot, {
+        send(result) {
+          sendSubagentResult(pi, running, result);
+        },
+      });
+    } catch {
+      // Every remediation helper path is contained; never let an interval die.
+    }
   }
 }
 
@@ -1038,6 +1294,11 @@ export const __test__ = {
   startStatusRefresh,
   refreshSubagentStatuses,
   createCompletionPollOptions,
+  claimTerminal,
+  deleteRunningIdentitySafe,
+  buildBrokenSubagentResult,
+  remediateBrokenSubagent,
+  deliverSpawnWatchOutcome,
   runningSubagents,
   formatElapsed,
 };
@@ -1069,7 +1330,7 @@ async function launchSubagent(
   options?: { surface?: string },
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
-  const id = Math.random().toString(16).slice(2, 10);
+  const id = newRunningChildId();
 
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
   assertThinkingSupportedForCli(params, agentDefs);
@@ -1385,12 +1646,16 @@ function createCompletionPollOptions(running: RunningSubagent) {
   return {
     interval: 1000,
     sessionFile: running.sessionFile,
+    runningChildId: running.id,
     sentinelFile: running.sentinelFile,
     onTick() {
       observeRunningSubagent(running);
     },
     onPaneProbe(observation: PaneProbeObservation) {
       running.statusState = observePaneProbe(running.statusState, observation, Date.now());
+    },
+    onTerminalRecordProblem(error: string) {
+      running.terminalRecordError = boundDiagnostic(error);
     },
   };
 }
@@ -1399,7 +1664,7 @@ async function watchSubagent(
   running: RunningSubagent,
   signal: AbortSignal,
   moduleSignal: AbortSignal,
-): Promise<SubagentResult> {
+): Promise<WatchOutcome> {
   const { name, task, surface, startTime, sessionFile } = running;
 
   try {
@@ -1408,100 +1673,82 @@ async function watchSubagent(
       AbortSignal.any([signal, moduleSignal]),
       createCompletionPollOptions(running),
     );
+    if (!claimTerminal(running, "watcher")) return { kind: "suppressed" };
 
     const elapsed = Math.floor((Date.now() - startTime) / 1000);
-
     if (running.cli === "claude") {
-      // Claude Code result extraction
       let summary = "";
-
       if (running.sentinelFile) {
-        try {
-          summary = readFileSync(running.sentinelFile, "utf-8").trim();
-        } catch {}
+        try { summary = readFileSync(running.sentinelFile, "utf-8").trim(); } catch {}
       }
-
       if (!summary) {
-        summary = readScreen(surface, 200)
-          .replace(/__SUBAGENT_DONE_\d+__/, "")
-          .trimEnd();
+        try { summary = readScreen(surface, 200).replace(/__SUBAGENT_DONE_\d+__/, "").trimEnd(); } catch {}
       }
-
       if (!summary) {
         summary = result.exitCode !== 0
           ? `Claude Code exited with code ${result.exitCode}`
           : "Claude Code exited without output";
       }
 
-      // Copy Claude session transcript
       let sessionId: string | null = null;
       if (running.sentinelFile) {
         sessionId = copyClaudeSession(running.sentinelFile);
         try { unlinkSync(running.sentinelFile); } catch {}
         try { unlinkSync(running.sentinelFile + ".transcript"); } catch {}
       }
-
-      closeSurface(surface);
-      runningSubagents.delete(running.id);
-
-      return { name, task, summary, exitCode: result.exitCode, elapsed, ...(sessionId ? { claudeSessionId: sessionId } : {}) };
-    }
-
-    // Pi subagent result extraction
-    let summary: string;
-    if (existsSync(sessionFile)) {
-      summary =
-        findLastAssistantMessageInSession(sessionFile) ??
-        (result.errorMessage
-          ? `Subagent error: ${result.errorMessage}`
-          : result.exitCode !== 0
-            ? `Sub-agent exited with code ${result.exitCode}`
-            : "Sub-agent exited without output");
-    } else {
-      summary = result.errorMessage
-        ? `Subagent error: ${result.errorMessage}`
-        : result.exitCode !== 0
-          ? `Sub-agent exited with code ${result.exitCode}`
-          : "Sub-agent exited without output";
-    }
-
-    closeSurface(surface);
-    runningSubagents.delete(running.id);
-
-    return {
-      name,
-      task,
-      summary,
-      sessionFile,
-      exitCode: result.exitCode,
-      elapsed,
-      ping: result.ping,
-      ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
-    };
-  } catch (err: any) {
-    try {
-      closeSurface(surface);
-    } catch {}
-    runningSubagents.delete(running.id);
-
-    if (signal.aborted) {
+      try { closeSurface(surface); } catch {}
+      deleteRunningIdentitySafe(running);
       return {
-        name,
-        task,
-        summary: "Subagent cancelled.",
-        exitCode: 1,
-        elapsed: Math.floor((Date.now() - startTime) / 1000),
-        error: "cancelled",
-        sessionFile,
+        kind: "delivered",
+        result: { name, task, summary, exitCode: result.exitCode, elapsed, ...(sessionId ? { claudeSessionId: sessionId } : {}) },
       };
     }
+
+    const fallback = result.errorMessage
+      ? `Subagent error: ${result.errorMessage}`
+      : result.exitCode !== 0
+        ? `Sub-agent exited with code ${result.exitCode}`
+        : "Sub-agent exited without output";
+    const summary = existsSync(sessionFile)
+      ? findLastAssistantMessageInSession(sessionFile) ?? fallback
+      : fallback;
+
+    try { closeSurface(surface); } catch {}
+    deleteRunningIdentitySafe(running);
     return {
-      name,
-      task,
-      summary: `Subagent error: ${err?.message ?? String(err)}`,
-      exitCode: 1,
-      elapsed: Math.floor((Date.now() - startTime) / 1000),
-      error: err?.message ?? String(err),
+      kind: "delivered",
+      result: {
+        name,
+        task,
+        summary,
+        sessionFile,
+        exitCode: result.exitCode,
+        elapsed,
+        ping: result.ping,
+        ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+      },
+    };
+  } catch (error) {
+    // Remediation or shutdown already won the local terminal claim. Its owner
+    // performs cleanup and delivery; this watcher must stay completely silent.
+    if (running.terminalClaim && running.terminalClaim !== "watcher") {
+      return { kind: "suppressed" };
+    }
+    if (!claimTerminal(running, "watcher")) return { kind: "suppressed" };
+
+    try { closeSurface(surface); } catch {}
+    deleteRunningIdentitySafe(running);
+    const elapsed = Math.floor((Date.now() - startTime) / 1000);
+    if (signal.aborted || moduleSignal.aborted) {
+      return {
+        kind: "delivered",
+        result: { name, task, summary: "Subagent cancelled.", exitCode: 1, elapsed, error: "cancelled", sessionFile },
+      };
+    }
+    const diagnostic = boundDiagnostic(error);
+    return {
+      kind: "delivered",
+      result: { name, task, summary: `Subagent error: ${diagnostic}`, exitCode: 1, elapsed, error: diagnostic, sessionFile },
     };
   }
 }
@@ -1532,10 +1779,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       retireGlobalInterval(STATUS_INTERVAL_KEY, interval);
     }
     abortPollAbortOwner(extensionOwner);
-    for (const [id, agent] of runningSubagents) {
+    for (const agent of runningSubagents.values()) {
       if (agent.owner !== extensionOwner) continue;
-      agent.abortController?.abort();
-      runningSubagents.delete(id);
+      if (!claimTerminal(agent, "shutdown")) continue;
+      try { agent.abortController?.abort(); } catch {}
+      deleteRunningIdentitySafe(agent);
     }
   });
 
@@ -1614,64 +1862,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         startWidgetRefresh(extensionOwner);
         startStatusRefresh(pi, extensionOwner);
 
-        // Fire-and-forget: start watching in background
+        // Fire-and-forget: a suppressed outcome means remediation or shutdown
+        // already owns cleanup/delivery. Contain any unexpected callback error
+        // rather than emitting a second terminal steer.
         watchSubagent(running, watcherAbort.signal, moduleAbortSignal)
-          .then((result) => {
-            updateWidget(); // reflect removal from Map immediately
-
-            if (result.ping) {
-              // Subagent is requesting help — steer a ping message with session path for resume
-              const sessionRef = `\n\nSession: ${result.sessionFile}\nResume: pi --session ${result.sessionFile}`;
-              pi.sendMessage(
-                {
-                  customType: "subagent_ping",
-                  content: `Sub-agent "${result.ping.name}" needs help (${formatElapsed(result.elapsed)}):\n\n${result.ping.message}${sessionRef}`,
-                  display: true,
-                  details: {
-                    name: result.ping.name,
-                    message: result.ping.message,
-                    agent: running.agent,
-                    sessionFile: result.sessionFile,
-                  },
-                },
-                { triggerTurn: true, deliverAs: "steer" },
-              );
-              return;
-            }
-
-            const presentation = capDeliveredResult(resolveResultPresentation(result, running.name), result.sessionFile ?? running.sessionFile);
-
-            pi.sendMessage(
-              {
-                customType: "subagent_result",
-                content: presentation,
-                display: true,
-                details: {
-                  name: running.name,
-                  task: running.task,
-                  agent: running.agent,
-                  exitCode: result.exitCode,
-                  elapsed: result.elapsed,
-                  sessionFile: result.sessionFile,
-                  ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
-                  ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
-                },
-              },
-              { triggerTurn: true, deliverAs: "steer" },
-            );
-          })
-          .catch((err) => {
-            updateWidget();
-            pi.sendMessage(
-              {
-                customType: "subagent_result",
-                content: `Sub-agent "${running.name}" error: ${err?.message ?? String(err)}`,
-                display: true,
-                details: { name: running.name, task: running.task, error: err?.message },
-              },
-              { triggerTurn: true, deliverAs: "steer" },
-            );
-          });
+          .then((outcome) => deliverSpawnWatchOutcome(pi, running, outcome))
+          .catch(() => safeUpdateWidget());
 
         // Return immediately
         return {
@@ -1939,7 +2135,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const name = params.name ?? "Resume";
         const { autoExit, interactive } = resolveResumeLaunchBehavior(params);
         const startTime = Date.now();
-        const id = Math.random().toString(16).slice(2, 10);
+        const id = newRunningChildId();
 
         if (!isMuxAvailable()) {
           return muxUnavailableResult();
@@ -2055,67 +2251,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         running.abortController = watcherAbort;
 
         watchSubagent(running, watcherAbort.signal, moduleAbortSignal)
-          .then((result) => {
-            updateWidget();
-
-            if (result.ping) {
-              const sessionRef = `\n\nSession: ${params.sessionPath}\nResume: pi --session ${params.sessionPath}`;
-              pi.sendMessage(
-                {
-                  customType: "subagent_ping",
-                  content: `Sub-agent "${result.ping.name}" needs help (${formatElapsed(result.elapsed)}):\n\n${result.ping.message}${sessionRef}`,
-                  display: true,
-                  details: {
-                    name: result.ping.name,
-                    message: result.ping.message,
-                    sessionFile: params.sessionPath,
-                  },
-                },
-                { triggerTurn: true, deliverAs: "steer" },
-              );
-              return;
-            }
-
-            const summary = findLastAssistantMessageInSession(params.sessionPath, sessionBoundaryBefore) ??
-              (result.errorMessage
-                ? `Subagent error: ${result.errorMessage}`
-                : result.exitCode !== 0
-                  ? `Resumed session exited with code ${result.exitCode}`
-                  : "Resumed session exited without new output");
-            const presentation = capDeliveredResult(resolveResultPresentation(
-              { ...result, summary, sessionFile: params.sessionPath },
-              name,
-            ), params.sessionPath);
-
-            pi.sendMessage(
-              {
-                customType: "subagent_result",
-                content: presentation,
-                display: true,
-                details: {
-                  name,
-                  task: params.message ?? "resumed session",
-                  exitCode: result.exitCode,
-                  elapsed: result.elapsed,
-                  sessionFile: params.sessionPath,
-                  ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
-                },
-              },
-              { triggerTurn: true, deliverAs: "steer" },
-            );
-          })
-          .catch((err) => {
-            updateWidget();
-            pi.sendMessage(
-              {
-                customType: "subagent_result",
-                content: `Resume error: ${err?.message ?? String(err)}`,
-                display: true,
-                details: { name, error: err?.message },
-              },
-              { triggerTurn: true, deliverAs: "steer" },
-            );
-          });
+          .then((outcome) => deliverResumeWatchOutcome(pi, running, outcome, sessionBoundaryBefore))
+          .catch(() => safeUpdateWidget());
 
         return {
           content: [{ type: "text", text: `Session "${name}" resumed.` }],

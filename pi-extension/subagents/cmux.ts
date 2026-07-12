@@ -3,6 +3,7 @@ import { promisify } from "node:util";
 import { existsSync, readFileSync, rmSync, writeFileSync, mkdirSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
+import { readGenerationTerminal } from "./sidecar-arbitration.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -1361,26 +1362,6 @@ export type PaneProbeObservation =
   | { readable: true }
   | { readable: false; error?: string };
 
-/**
- * Read an authoritative subagent completion sidecar. Callers that only need
- * to inspect it can leave it in place; the completion watcher consumes it
- * exactly once.
- */
-export function readExitSidecar(
-  sessionFile: string,
-  options: { consume: boolean },
-): PollResult | null {
-  try {
-    const exitFile = `${sessionFile}.exit`;
-    if (!existsSync(exitFile)) return null;
-    const data = JSON.parse(readFileSync(exitFile, "utf8"));
-    if (options.consume) rmSync(exitFile, { force: true });
-    return interpretExitSidecar(data);
-  } catch {
-    return null;
-  }
-}
-
 function boundedError(error: unknown): string | undefined {
   const message = error instanceof Error ? error.message : String(error);
   const bounded = message.replace(/\s+/g, " ").trim().slice(0, 200);
@@ -1395,9 +1376,12 @@ async function pollForExitWithReadScreen(
   options: {
     interval: number;
     sessionFile?: string;
+    /** Exact generation owned by this watcher; never read another child's record. */
+    runningChildId?: string;
     sentinelFile?: string;
     onTick?: (elapsed: number) => void;
     onPaneProbe?: (observation: PaneProbeObservation) => void;
+    onTerminalRecordProblem?: (error: string) => void;
   },
   readScreen: ReadScreenAsync = readScreenAsync,
 ): Promise<PollResult> {
@@ -1408,35 +1392,51 @@ async function pollForExitWithReadScreen(
       throw new Error("Aborted while waiting for subagent to finish");
     }
 
-    // Fast path: check for .exit sidecar file (written by subagent_done / caller_ping)
-    if (options.sessionFile) {
-      const sidecar = readExitSidecar(options.sessionFile, { consume: true });
-      if (sidecar) return sidecar;
-    }
-
-    // Check Claude sentinel file (written by plugin Stop hook)
-    if (options.sentinelFile) {
-      try {
-        if (existsSync(options.sentinelFile)) {
-          return { reason: "sentinel", exitCode: 0 };
-        }
-      } catch {}
-    }
-
-    // Slow path: read terminal screen for sentinel (crash detection)
-    try {
-      const screen = await readScreen(surface, 5);
-      options.onPaneProbe?.({ readable: true });
-      const match = screen.match(/__SUBAGENT_DONE_(\d+)__/);
-      if (match) {
-        return { reason: "sentinel", exitCode: parseInt(match[1], 10) };
+    // Fast path: read this generation's permanent terminal record. Records are
+    // intentionally never consumed: duplicate/late watchers must observe the
+    // same winner and a remediation record belongs exclusively to parent cleanup.
+    let remediationOwnsTerminal = false;
+    if (options.sessionFile && options.runningChildId) {
+      const terminal = readGenerationTerminal(options.sessionFile, options.runningChildId);
+      if (terminal.kind === "child") return terminal.result;
+      if (terminal.kind === "remediation") remediationOwnsTerminal = true;
+      if (terminal.kind === "invalid" || terminal.kind === "error") {
+        options.onTerminalRecordProblem?.(terminal.error);
       }
-    } catch (error) {
-      options.onPaneProbe?.({ readable: false, error: boundedError(error) });
-      // Surface may have been destroyed — check if .exit file appeared in the meantime
-      if (options.sessionFile) {
-        const sidecar = readExitSidecar(options.sessionFile, { consume: true });
-        if (sidecar) return sidecar;
+    }
+
+    // Do not fall through to a shell or pane sentinel after remediation has
+    // won the permanent record. The status loop will recover/acquire its local
+    // claim and abort this watcher; returning a sentinel here could double-send.
+    if (!remediationOwnsTerminal) {
+      // Check Claude sentinel file (written by plugin Stop hook)
+      if (options.sentinelFile) {
+        try {
+          if (existsSync(options.sentinelFile)) {
+            return { reason: "sentinel", exitCode: 0 };
+          }
+        } catch {}
+      }
+
+      // Slow path: read terminal screen for sentinel (crash detection)
+      try {
+        const screen = await readScreen(surface, 5);
+        options.onPaneProbe?.({ readable: true });
+        const match = screen.match(/__SUBAGENT_DONE_(\d+)__/);
+        if (match) {
+          return { reason: "sentinel", exitCode: parseInt(match[1], 10) };
+        }
+      } catch (error) {
+        options.onPaneProbe?.({ readable: false, error: boundedError(error) });
+        // Surface may have been destroyed — a child can still have published its
+        // complete generation record immediately before shutdown. Do not consume it.
+        if (options.sessionFile && options.runningChildId) {
+          const terminal = readGenerationTerminal(options.sessionFile, options.runningChildId);
+          if (terminal.kind === "child") return terminal.result;
+          if (terminal.kind === "invalid" || terminal.kind === "error") {
+            options.onTerminalRecordProblem?.(terminal.error);
+          }
+        }
       }
     }
 
@@ -1461,9 +1461,8 @@ async function pollForExitWithReadScreen(
 export const __pollForExitTest__ = { interpretExitSidecar, pollForExitWithReadScreen };
 
 /**
- * Poll until the subagent exits. Checks for a `.exit` sidecar file first
- * (written by subagent_done / caller_ping), falling back to the terminal
- * sentinel for crash detection.
+ * Poll until the subagent exits. Pi generations first read their permanent
+ * atomic terminal record; shell sentinels remain a crash fallback.
  */
 export async function pollForExit(
   surface: string,
@@ -1471,9 +1470,11 @@ export async function pollForExit(
   options: {
     interval: number;
     sessionFile?: string;
+    runningChildId?: string;
     sentinelFile?: string;
     onTick?: (elapsed: number) => void;
     onPaneProbe?: (observation: PaneProbeObservation) => void;
+    onTerminalRecordProblem?: (error: string) => void;
   },
 ): Promise<PollResult> {
   return pollForExitWithReadScreen(surface, signal, options);

@@ -1,6 +1,6 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readdirSync, writeFileSync, readFileSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -89,6 +89,15 @@ function withTempDir(run: (dir: string) => void) {
   }
 }
 
+async function withTempDirAsync(run: (dir: string) => Promise<void>) {
+  const dir = createTestDir();
+  try {
+    await run(dir);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 function createMockExtensionApi() {
   const registeredTools: Array<any> = [];
   const registeredCommands: Array<any> = [];
@@ -147,6 +156,131 @@ function withMockedNow<T>(now: number, fn: () => T): T {
     return fn();
   } finally {
     Date.now = originalNow;
+  }
+}
+
+function errno(message: string, code: string) {
+  return Object.assign(new Error(message), { code });
+}
+
+/**
+ * Deterministic filesystem boundary for atomic terminal-record tests. It keeps
+ * open descriptors private until close so linkSync can prove publication only
+ * happens after the full write/fsync/close sequence.
+ */
+function createTerminalFilesystem() {
+  const files = new Map<string, string>();
+  const descriptors = new Map<number, { path: string; content: string; synced: boolean }>();
+  const calls: string[] = [];
+  let nextFd = 10;
+  let writeFailure: Error | undefined;
+  let fsyncFailure: Error | undefined;
+  let linkFailure: Error | undefined;
+  let readFailure: Error | undefined;
+
+  const fs = {
+    openSync(path: string, flags: string, mode: number) {
+      calls.push(`open:${path}:${flags}:${mode.toString(8)}`);
+      if (files.has(path)) throw errno("temporary exists", "EEXIST");
+      const fd = nextFd++;
+      descriptors.set(fd, { path, content: "", synced: false });
+      return fd;
+    },
+    writeFileSync(fd: number, content: string) {
+      calls.push(`write:${fd}`);
+      if (writeFailure) throw writeFailure;
+      const descriptor = descriptors.get(fd);
+      if (!descriptor) throw new Error("write to closed descriptor");
+      descriptor.content = content;
+    },
+    fsyncSync(fd: number) {
+      calls.push(`fsync:${fd}`);
+      if (fsyncFailure) throw fsyncFailure;
+      const descriptor = descriptors.get(fd);
+      if (!descriptor) throw new Error("fsync closed descriptor");
+      descriptor.synced = true;
+    },
+    closeSync(fd: number) {
+      calls.push(`close:${fd}`);
+      const descriptor = descriptors.get(fd);
+      if (!descriptor) throw new Error("close unknown descriptor");
+      if (!descriptor.synced) throw new Error("closed before fsync");
+      files.set(descriptor.path, descriptor.content);
+      descriptors.delete(fd);
+    },
+    linkSync(source: string, destination: string) {
+      calls.push(`link:${source}:${destination}`);
+      if (linkFailure) throw linkFailure;
+      if (files.has(destination)) throw errno("winner exists", "EEXIST");
+      const content = files.get(source);
+      if (content === undefined) throw errno("source missing", "ENOENT");
+      files.set(destination, content);
+    },
+    unlinkSync(path: string) {
+      calls.push(`unlink:${path}`);
+      files.delete(path);
+    },
+    readFileSync(path: string) {
+      calls.push(`read:${path}`);
+      if (readFailure) throw readFailure;
+      const content = files.get(path);
+      if (content === undefined) throw errno("record missing", "ENOENT");
+      return content;
+    },
+  };
+
+  return {
+    fs,
+    files,
+    calls,
+    failWrite(error = new Error("write failed")) { writeFailure = error; },
+    failFsync(error = new Error("fsync failed")) { fsyncFailure = error; },
+    failLink(error = new Error("link failed")) { linkFailure = error; },
+    failRead(error = new Error("read failed")) { readFailure = error; },
+  };
+}
+
+async function loadSidecarArbitration(): Promise<any> {
+  return import("../pi-extension/subagents/sidecar-arbitration.ts");
+}
+
+async function withFakeHerdr(
+  run: () => Promise<void>,
+): Promise<void> {
+  const root = createTestDir();
+  const binDir = join(root, "bin");
+  const herdr = join(binDir, "herdr");
+  const oldPath = process.env.PATH;
+  const oldMux = process.env.PI_SUBAGENT_MUX;
+  const oldHerdrEnv = process.env.HERDR_ENV;
+  const oldHerdrPane = process.env.HERDR_PANE_ID;
+  const oldDelay = process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
+
+  mkdirSync(binDir, { recursive: true });
+  writeFileSync(herdr, `#!/bin/sh
+if [ "$1" = "pane" ] && [ "$2" = "split" ]; then
+  echo '{"id":"cli:pane:split","result":{"type":"pane_info","pane":{"pane_id":"w1:p2"}}}'
+elif [ "$1" = "pane" ] && [ "$2" = "read" ]; then
+  sleep 0.05
+  echo '__SUBAGENT_DONE_0__'
+fi
+`);
+  chmodSync(herdr, 0o755);
+  process.env.PATH = `${binDir}:${oldPath ?? ""}`;
+  process.env.PI_SUBAGENT_MUX = "herdr";
+  process.env.HERDR_ENV = "1";
+  process.env.HERDR_PANE_ID = "w1:p1";
+  process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "0";
+
+  try {
+    await run();
+  } finally {
+    restoreEnvVar("PATH", oldPath);
+    restoreEnvVar("PI_SUBAGENT_MUX", oldMux);
+    restoreEnvVar("HERDR_ENV", oldHerdrEnv);
+    restoreEnvVar("HERDR_PANE_ID", oldHerdrPane);
+    restoreEnvVar("PI_SUBAGENT_SHELL_READY_DELAY_MS", oldDelay);
+    rmSync(root, { recursive: true, force: true });
   }
 }
 
@@ -1568,6 +1702,7 @@ describe("subagent-done.ts", () => {
     const originalClearInterval = globalThis.clearInterval;
     const originalAutoExit = process.env.PI_SUBAGENT_AUTO_EXIT;
     const originalSession = process.env.PI_SUBAGENT_SESSION;
+    const originalId = process.env.PI_SUBAGENT_ID;
     const tempDir = createTestDir();
 
     try {
@@ -1581,9 +1716,10 @@ describe("subagent-done.ts", () => {
         };
         (globalThis as any).clearInterval = (timer: number) => calls.push(`clear:${timer}`);
 
+        process.env.PI_SUBAGENT_ID = "a1b2c3d4";
         if (terminalPath === "auto-exit") {
           process.env.PI_SUBAGENT_AUTO_EXIT = "1";
-          delete process.env.PI_SUBAGENT_SESSION;
+          process.env.PI_SUBAGENT_SESSION = join(tempDir, `${terminalPath}.jsonl`);
         } else {
           delete process.env.PI_SUBAGENT_AUTO_EXIT;
           process.env.PI_SUBAGENT_SESSION = join(tempDir, `${terminalPath}.jsonl`);
@@ -1613,6 +1749,7 @@ describe("subagent-done.ts", () => {
       globalThis.clearInterval = originalClearInterval;
       restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", originalAutoExit);
       restoreEnvVar("PI_SUBAGENT_SESSION", originalSession);
+      restoreEnvVar("PI_SUBAGENT_ID", originalId);
       rmSync(tempDir, { recursive: true, force: true });
     }
   });
@@ -1795,32 +1932,6 @@ describe("cmux.ts pane probe and exit sidecar handling", () => {
     assert.deepEqual(result, { reason: "sentinel", exitCode: 0 });
   });
 
-  it("peeks without removing and consumes a valid exit sidecar exactly once", () => {
-    const readExitSidecar = (cmuxModule as any).readExitSidecar;
-    assert.equal(typeof readExitSidecar, "function");
-
-    withTempDir((dir) => {
-      const session = join(dir, "child.jsonl");
-      writeFileSync(`${session}.exit`, JSON.stringify({ type: "done" }));
-      assert.deepEqual(readExitSidecar(session, { consume: false }), { reason: "done", exitCode: 0 });
-      assert.deepEqual(readExitSidecar(session, { consume: true }), { reason: "done", exitCode: 0 });
-      assert.equal(readExitSidecar(session, { consume: true }), null);
-    });
-  });
-
-  it("leaves malformed exit sidecars unconsumed", () => {
-    const readExitSidecar = (cmuxModule as any).readExitSidecar;
-
-    withTempDir((dir) => {
-      const session = join(dir, "child.jsonl");
-      const exitFile = `${session}.exit`;
-      writeFileSync(exitFile, "{ malformed");
-
-      assert.equal(readExitSidecar(session, { consume: true }), null);
-      assert.equal(readFileSync(exitFile, "utf8"), "{ malformed");
-    });
-  });
-
   it("normalizes and bounds failed pane probe errors", async () => {
     const pollForExitWithReadScreen = (cmuxModule as any).__pollForExitTest__
       .pollForExitWithReadScreen;
@@ -1843,6 +1954,793 @@ describe("cmux.ts pane probe and exit sidecar handling", () => {
       { readable: false, error: expectedError },
       { readable: true },
     ]);
+  });
+});
+
+describe("generation-scoped atomic terminal records", () => {
+  const session = "/sessions/worker.jsonl";
+  const childId = "a1b2c3d4";
+  const otherChildId = "0badc0de";
+
+  function childDone() {
+    return { type: "done" as const };
+  }
+
+  it("isolates generation exit paths and rejects invalid eight-hex IDs", async () => {
+    const arbitration = await loadSidecarArbitration();
+    assert.equal(
+      arbitration.getGenerationExitFile(session, childId),
+      `${session}.subagent-${childId}.exit`,
+    );
+    assert.equal(
+      arbitration.getGenerationExitFile(session, otherChildId),
+      `${session}.subagent-${otherChildId}.exit`,
+    );
+    assert.notEqual(
+      arbitration.getGenerationExitFile(session, childId),
+      arbitration.getGenerationExitFile(session, otherChildId),
+    );
+    for (const invalid of ["", "a1b2", "a1b2c3d4e5", "not-hex!", "../../dead"]) {
+      assert.throws(() => arbitration.getGenerationExitFile(session, invalid), /runningChildId/i);
+    }
+  });
+
+  it("writes, fsyncs, and closes the temp record before hard-linking it", async () => {
+    const arbitration = await loadSidecarArbitration();
+    const boundary = createTerminalFilesystem();
+    const finalFile = arbitration.getGenerationExitFile(session, childId);
+
+    const outcome = arbitration.publishGenerationTerminal({
+      sessionFile: session,
+      runningChildId: childId,
+      terminal: childDone(),
+      fs: boundary.fs,
+      random: () => "feedface",
+    });
+
+    assert.equal(outcome.kind, "published");
+    const linkIndex = boundary.calls.findIndex((call) => call.startsWith("link:"));
+    assert.ok(linkIndex > 0);
+    assert.match(boundary.calls[0], /^open:\/sessions\/\.subagent-terminal-a1b2c3d4-/);
+    assert.match(boundary.calls[0], /:wx:600$/);
+    assert.ok(boundary.calls.findIndex((call) => call.startsWith("write:")) < linkIndex);
+    assert.ok(boundary.calls.findIndex((call) => call.startsWith("fsync:")) < linkIndex);
+    assert.ok(boundary.calls.findIndex((call) => call.startsWith("close:")) < linkIndex);
+    assert.equal(JSON.parse(boundary.files.get(finalFile)!).type, "done");
+    assert.equal(
+      boundary.calls.some((call) => call === `unlink:${finalFile}`),
+      false,
+      "caller cleanup must never target the permanent record",
+    );
+  });
+
+  it("never cleans a foreign temporary pathname when exclusive open did not acquire it", async () => {
+    const arbitration = await loadSidecarArbitration();
+    const boundary = createTerminalFilesystem();
+    const foreignTemp = `/sessions/.subagent-terminal-${childId}-${process.pid}-foreign.tmp`;
+    boundary.files.set(foreignTemp, "another publisher's temp");
+
+    const outcome = arbitration.publishGenerationTerminal({
+      sessionFile: session,
+      runningChildId: childId,
+      terminal: childDone(),
+      fs: boundary.fs,
+      random: () => "foreign",
+    });
+
+    assert.equal(outcome.kind, "error");
+    assert.equal(boundary.files.get(foreignTemp), "another publisher's temp");
+    assert.equal(boundary.calls.includes(`unlink:${foreignTemp}`), false);
+  });
+
+  it("makes a child-first hard link defer parent remediation", async () => {
+    const arbitration = await loadSidecarArbitration();
+    const boundary = createTerminalFilesystem();
+    assert.equal(arbitration.publishGenerationTerminal({
+      sessionFile: session,
+      runningChildId: childId,
+      terminal: childDone(),
+      fs: boundary.fs,
+    }).kind, "published");
+
+    assert.deepEqual(arbitration.tryPublishRemediation({
+      sessionFile: session,
+      runningChildId: childId,
+      reason: "heartbeat-stale",
+      claimedAt: 1,
+      fs: boundary.fs,
+    }), { kind: "defer" });
+  });
+
+  it("makes a parent-first hard link block later child publication", async () => {
+    const arbitration = await loadSidecarArbitration();
+    const boundary = createTerminalFilesystem();
+    assert.equal(arbitration.tryPublishRemediation({
+      sessionFile: session,
+      runningChildId: childId,
+      reason: "pane-unavailable",
+      claimedAt: 1,
+      fs: boundary.fs,
+    }).kind, "acquired");
+
+    assert.deepEqual(arbitration.publishGenerationTerminal({
+      sessionFile: session,
+      runningChildId: childId,
+      terminal: childDone(),
+      fs: boundary.fs,
+    }), { kind: "blocked" });
+  });
+
+  it("arbitrates a simultaneous child-parent hard-link race without exposing a partial final", async () => {
+    const arbitration = await loadSidecarArbitration();
+    const boundary = createTerminalFilesystem();
+    const finalFile = arbitration.getGenerationExitFile(session, childId);
+    const originalLink = boundary.fs.linkSync.bind(boundary.fs);
+    let parentWon = false;
+    boundary.fs.linkSync = (source: string, destination: string) => {
+      if (!parentWon) {
+        parentWon = true;
+        boundary.files.set(destination, JSON.stringify({
+          version: 1,
+          runningChildId: childId,
+          type: "remediation",
+          claimedAt: 1,
+          reason: "pane-unavailable",
+        }));
+        throw errno("simultaneous parent winner", "EEXIST");
+      }
+      originalLink(source, destination);
+    };
+
+    const child = arbitration.publishGenerationTerminal({
+      sessionFile: session,
+      runningChildId: childId,
+      terminal: childDone(),
+      fs: boundary.fs,
+    });
+
+    assert.equal(child.kind, "blocked");
+    assert.deepEqual(JSON.parse(boundary.files.get(finalFile)!), {
+      version: 1,
+      runningChildId: childId,
+      type: "remediation",
+      claimedAt: 1,
+      reason: "pane-unavailable",
+    });
+  });
+
+  it("preserves the first child payload across serial or simultaneous publications", async () => {
+    const arbitration = await loadSidecarArbitration();
+    const boundary = createTerminalFilesystem();
+    const finalFile = arbitration.getGenerationExitFile(session, childId);
+    const first = arbitration.publishGenerationTerminal({
+      sessionFile: session,
+      runningChildId: childId,
+      terminal: { type: "ping", name: "First", message: "keep this" },
+      fs: boundary.fs,
+    });
+    const second = arbitration.publishGenerationTerminal({
+      sessionFile: session,
+      runningChildId: childId,
+      terminal: { type: "error", errorMessage: "must not replace" },
+      fs: boundary.fs,
+    });
+
+    assert.equal(first.kind, "published");
+    assert.equal(second.kind, "existing");
+    assert.deepEqual(JSON.parse(boundary.files.get(finalFile)!), {
+      version: 1,
+      runningChildId: childId,
+      type: "ping",
+      name: "First",
+      message: "keep this",
+    });
+  });
+
+  it("leaves the permanent path absent after write or fsync failure and preserves the cause", async () => {
+    const arbitration = await loadSidecarArbitration();
+    for (const failure of ["write", "fsync"] as const) {
+      const boundary = createTerminalFilesystem();
+      const expected = new Error(`${failure} failure`);
+      if (failure === "write") boundary.failWrite(expected);
+      else boundary.failFsync(expected);
+      const finalFile = arbitration.getGenerationExitFile(session, childId);
+
+      const outcome = arbitration.publishGenerationTerminal({
+        sessionFile: session,
+        runningChildId: childId,
+        terminal: childDone(),
+        fs: boundary.fs,
+      });
+
+      assert.equal(outcome.kind, "error");
+      assert.match(outcome.error, new RegExp(`${failure} failure`));
+      assert.equal(boundary.files.has(finalFile), false, failure);
+      assert.equal(boundary.calls.some((call) => call === `unlink:${finalFile}`), false, failure);
+    }
+  });
+
+  it("reads the immutable winner after EEXIST without modifying it", async () => {
+    const arbitration = await loadSidecarArbitration();
+    const boundary = createTerminalFilesystem();
+    const finalFile = arbitration.getGenerationExitFile(session, childId);
+    boundary.files.set(finalFile, JSON.stringify({
+      version: 1,
+      runningChildId: childId,
+      type: "done",
+    }));
+
+    const outcome = arbitration.publishGenerationTerminal({
+      sessionFile: session,
+      runningChildId: childId,
+      terminal: { type: "ping", name: "late", message: "late" },
+      fs: boundary.fs,
+    });
+
+    assert.equal(outcome.kind, "existing");
+    assert.deepEqual(JSON.parse(boundary.files.get(finalFile)!), {
+      version: 1,
+      runningChildId: childId,
+      type: "done",
+    });
+    assert.equal(boundary.calls.some((call) => call === `unlink:${finalFile}`), false);
+  });
+
+  it("returns bounded outcomes for link, read, and record-validation failures", async () => {
+    const arbitration = await loadSidecarArbitration();
+    const boundary = createTerminalFilesystem();
+    boundary.failLink(new Error(`link\n${"x".repeat(300)}`));
+    const linkOutcome = arbitration.publishGenerationTerminal({
+      sessionFile: session,
+      runningChildId: childId,
+      terminal: childDone(),
+      fs: boundary.fs,
+    });
+    assert.equal(linkOutcome.kind, "error");
+    assert.ok(linkOutcome.error.length <= 200);
+    assert.doesNotMatch(linkOutcome.error, /\n/);
+
+    const invalidBoundary = createTerminalFilesystem();
+    const finalFile = arbitration.getGenerationExitFile(session, childId);
+    invalidBoundary.files.set(finalFile, "{ bad json");
+    const invalid = arbitration.readGenerationTerminal(session, childId, invalidBoundary.fs);
+    assert.equal(invalid.kind, "invalid");
+    assert.ok(invalid.error.length <= 200);
+
+    invalidBoundary.files.set(finalFile, JSON.stringify({
+      version: 1,
+      runningChildId: childId,
+      type: "done",
+      unboundedUnexpectedText: "z".repeat(1_000),
+    }));
+    const unknownField = arbitration.readGenerationTerminal(session, childId, invalidBoundary.fs);
+    assert.equal(unknownField.kind, "invalid");
+    assert.ok(unknownField.error.length <= 200);
+
+    const readBoundary = createTerminalFilesystem();
+    readBoundary.files.set(finalFile, JSON.stringify({ version: 1, runningChildId: childId, type: "done" }));
+    readBoundary.failRead(new Error(`read\n${"y".repeat(300)}`));
+    const unreadable = arbitration.readGenerationTerminal(session, childId, readBoundary.fs);
+    assert.equal(unreadable.kind, "error");
+    assert.ok(unreadable.error.length <= 200);
+  });
+
+  it("keeps permanent records for duplicate watcher reads and isolates poller generations", async () => {
+    const arbitration = await loadSidecarArbitration();
+    await withTempDirAsync(async (dir) => {
+      const childSession = join(dir, "child.jsonl");
+      const childFinal = arbitration.getGenerationExitFile(childSession, childId);
+      const otherFinal = arbitration.getGenerationExitFile(childSession, otherChildId);
+      writeFileSync(childFinal, JSON.stringify({
+        version: 1,
+        runningChildId: childId,
+        type: "ping",
+        name: "Worker",
+        message: "need help",
+      }));
+      writeFileSync(otherFinal, JSON.stringify({
+        version: 1,
+        runningChildId: otherChildId,
+        type: "error",
+        errorMessage: "other generation",
+      }));
+
+      const poll = (cmuxModule as any).__pollForExitTest__.pollForExitWithReadScreen;
+      const first = await poll(
+        "pane-1",
+        new AbortController().signal,
+        { interval: 0, sessionFile: childSession, runningChildId: childId },
+        async () => "__SUBAGENT_DONE_7__",
+      );
+      const second = await poll(
+        "pane-2",
+        new AbortController().signal,
+        { interval: 0, sessionFile: childSession, runningChildId: childId },
+        async () => "__SUBAGENT_DONE_7__",
+      );
+      const other = await poll(
+        "pane-3",
+        new AbortController().signal,
+        { interval: 0, sessionFile: childSession, runningChildId: otherChildId },
+        async () => "__SUBAGENT_DONE_7__",
+      );
+
+      assert.deepEqual(first, { reason: "ping", exitCode: 0, ping: { name: "Worker", message: "need help" } });
+      assert.deepEqual(second, first, "duplicate watchers must see the same permanent child record");
+      assert.deepEqual(other, { reason: "error", exitCode: 1, errorMessage: "other generation" });
+      assert.equal(existsSync(childFinal), true);
+      assert.equal(existsSync(otherFinal), true);
+
+      const remediationId = "deadbeef";
+      writeFileSync(arbitration.getGenerationExitFile(childSession, remediationId), JSON.stringify({
+        version: 1,
+        runningChildId: remediationId,
+        type: "remediation",
+        claimedAt: 1,
+        reason: "pane-unavailable",
+      }));
+      const remediationAbort = new AbortController();
+      await assert.rejects(
+        poll(
+          "pane-remediation",
+          remediationAbort.signal,
+          {
+            interval: 0,
+            sessionFile: childSession,
+            runningChildId: remediationId,
+            onTick() { remediationAbort.abort(); },
+          },
+          async () => "__SUBAGENT_DONE_7__",
+        ),
+        /Aborted/,
+        "a remediation record owns terminal delivery, so the watcher must not fall through to a sentinel",
+      );
+    });
+  });
+
+  it("reacquires an existing remediation publication on a later in-memory remediation tick", async () => {
+    const arbitration = await loadSidecarArbitration();
+    const boundary = createTerminalFilesystem();
+    const first = arbitration.tryPublishRemediation({
+      sessionFile: session,
+      runningChildId: childId,
+      reason: "heartbeat-stale",
+      claimedAt: 1,
+      fs: boundary.fs,
+    });
+    const second = arbitration.tryPublishRemediation({
+      sessionFile: session,
+      runningChildId: childId,
+      reason: "heartbeat-stale",
+      claimedAt: 2,
+      fs: boundary.fs,
+    });
+    assert.equal(first.kind, "acquired");
+    assert.equal(second.kind, "acquired-existing");
+  });
+});
+
+describe("generation terminal production paths", () => {
+  const childId = "a1b2c3d4";
+
+  function setChildTerminalEnv(sessionFile: string, autoExit = false) {
+    process.env.PI_SUBAGENT_SESSION = sessionFile;
+    process.env.PI_SUBAGENT_ID = childId;
+    if (autoExit) process.env.PI_SUBAGENT_AUTO_EXIT = "1";
+    else delete process.env.PI_SUBAGENT_AUTO_EXIT;
+  }
+
+  it("publishes normal and provider-error agent_end records through the registered event path", async () => {
+    const arbitration = await loadSidecarArbitration();
+    const originalSession = process.env.PI_SUBAGENT_SESSION;
+    const originalId = process.env.PI_SUBAGENT_ID;
+    const originalAutoExit = process.env.PI_SUBAGENT_AUTO_EXIT;
+    try {
+      withTempDir((dir) => {
+        for (const [name, message] of [
+          ["normal", { role: "assistant", stopReason: "stop" }],
+          ["provider", { role: "assistant", stopReason: "error", errorMessage: "provider unavailable" }],
+        ] as const) {
+          const sessionFile = join(dir, `${name}.jsonl`);
+          const { api, eventHandlers } = createMockExtensionApi();
+          let shutdowns = 0;
+          setChildTerminalEnv(sessionFile, true);
+          subagentDoneExtension(api);
+          eventHandlers.get("agent_end")![0]({ messages: [message] }, { shutdown() { shutdowns++; } });
+          const read = arbitration.readGenerationTerminal(sessionFile, childId);
+          assert.equal(read.kind, "child");
+          assert.equal(read.record.type, name === "normal" ? "done" : "error");
+          assert.equal(shutdowns, 1);
+        }
+      });
+    } finally {
+      restoreEnvVar("PI_SUBAGENT_SESSION", originalSession);
+      restoreEnvVar("PI_SUBAGENT_ID", originalId);
+      restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", originalAutoExit);
+    }
+  });
+
+  it("publishes caller_ping and subagent_done through their registered tool paths", async () => {
+    const arbitration = await loadSidecarArbitration();
+    const originalSession = process.env.PI_SUBAGENT_SESSION;
+    const originalId = process.env.PI_SUBAGENT_ID;
+    const originalAutoExit = process.env.PI_SUBAGENT_AUTO_EXIT;
+    try {
+      await withTempDirAsync(async (dir) => {
+          for (const toolName of ["caller_ping", "subagent_done"]) {
+            const sessionFile = join(dir, `${toolName}.jsonl`);
+            const { api, registeredTools } = createMockExtensionApi();
+            setChildTerminalEnv(sessionFile);
+            subagentDoneExtension(api);
+            const tool = registeredTools.find((entry) => entry.name === toolName);
+            let shutdowns = 0;
+            await tool.execute("call", toolName === "caller_ping" ? { message: "need a decision" } : {}, undefined, undefined, { shutdown() { shutdowns++; } });
+            const read = arbitration.readGenerationTerminal(sessionFile, childId);
+            assert.equal(read.kind, "child");
+            assert.equal(read.record.type, toolName === "caller_ping" ? "ping" : "done");
+            assert.equal(shutdowns, 1);
+          }
+      });
+    } finally {
+      restoreEnvVar("PI_SUBAGENT_SESSION", originalSession);
+      restoreEnvVar("PI_SUBAGENT_ID", originalId);
+      restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", originalAutoExit);
+    }
+  });
+
+  it("makes explicit caller_ping and subagent_done surface generation publication failures", async () => {
+    await loadSidecarArbitration();
+    const originalSession = process.env.PI_SUBAGENT_SESSION;
+    const originalId = process.env.PI_SUBAGENT_ID;
+    try {
+      for (const toolName of ["caller_ping", "subagent_done"]) {
+        const { api, registeredTools } = createMockExtensionApi();
+        setChildTerminalEnv(join(createTestDir(), "missing", "child.jsonl"));
+        subagentDoneExtension(api);
+        const tool = registeredTools.find((entry) => entry.name === toolName);
+        await assert.rejects(
+          tool.execute("call", toolName === "caller_ping" ? { message: "need help" } : {}, undefined, undefined, { shutdown() {} }),
+          /publish|terminal|ENOENT/i,
+        );
+      }
+    } finally {
+      restoreEnvVar("PI_SUBAGENT_SESSION", originalSession);
+      restoreEnvVar("PI_SUBAGENT_ID", originalId);
+    }
+  });
+
+  async function assertActualWatcherDeliveryIsSuppressed(toolName: "subagent" | "subagent_resume") {
+    await loadSidecarArbitration();
+    await withFakeHerdr(async () => {
+      const { api, registeredTools, eventHandlers, sentMessages } = createMockExtensionApi();
+      const testApi = (subagentsModule as any).__test__;
+      const runningMap = testApi.runningSubagents as Map<string, any>;
+      runningMap.clear();
+      (subagentsModule as any).default(api);
+      eventHandlers.get("session_start")![0]({}, {});
+      const dir = createTestDir();
+      const parentSession = join(dir, "parent.jsonl");
+      const resumeSession = join(dir, "resume.jsonl");
+      writeFileSync(parentSession, "");
+      writeFileSync(resumeSession, "");
+      const ctx = {
+        cwd: dir,
+        sessionManager: {
+          getSessionFile() { return parentSession; },
+          getSessionId() { return "parent"; },
+          getSessionDir() { return dir; },
+        },
+      };
+      try {
+        const tool = registeredTools.find((entry) => entry.name === toolName);
+        const started = await tool.execute(
+          "call",
+          toolName === "subagent"
+            ? { name: "Worker", task: "finish" }
+            : { sessionPath: resumeSession, name: "Resume" },
+          undefined,
+          undefined,
+          ctx,
+        );
+        const running = runningMap.get(started.details.id);
+        assert.ok(running, "the real tool must register its watcher before returning");
+        running.terminalClaim = "remediation";
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        assert.equal(sentMessages.length, 0, "a lost watcher claim must not deliver a second result");
+      } finally {
+        eventHandlers.get("session_shutdown")![0]({}, {});
+        runningMap.clear();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+
+  it("suppresses a lost claim in the actual spawn watcher delivery path", async () => {
+    await assertActualWatcherDeliveryIsSuppressed("subagent");
+  });
+
+  it("suppresses a lost claim in the actual resume watcher delivery path", async () => {
+    await assertActualWatcherDeliveryIsSuppressed("subagent_resume");
+  });
+
+  it("does not create terminal ownership artifacts when command delivery fails", async () => {
+    await loadSidecarArbitration();
+    await withFakeHerdr(async () => {
+      const originalPath = process.env.PATH;
+      const originalFail = process.env.PI_TEST_HERDR_FAIL_RUN;
+      const dir = createTestDir();
+      const bin = originalPath!.split(":")[0];
+      const herdr = join(bin, "herdr");
+      writeFileSync(herdr, `#!/bin/sh
+if [ "$1" = "pane" ] && [ "$2" = "split" ]; then
+  echo '{"id":"cli:pane:split","result":{"type":"pane_info","pane":{"pane_id":"w1:p2"}}}'
+else
+  exit 9
+fi
+`);
+      chmodSync(herdr, 0o755);
+      try {
+        const { api, registeredTools, eventHandlers } = createMockExtensionApi();
+        (subagentsModule as any).default(api);
+        eventHandlers.get("session_start")![0]({}, {});
+        const tool = registeredTools.find((entry) => entry.name === "subagent");
+        await assert.rejects(tool.execute("call", { name: "Worker", task: "fail" }, undefined, undefined, {
+          cwd: dir,
+          sessionManager: {
+            getSessionFile() { return join(dir, "parent.jsonl"); },
+            getSessionId() { return "parent"; },
+            getSessionDir() { return dir; },
+          },
+        }));
+        assert.equal(
+          readdirSync(dir, { recursive: true }).some((entry: string) => /subagent-[a-f0-9]{8}.*\.exit|\.subagent-terminal-/.test(entry)),
+          false,
+        );
+      } finally {
+        restoreEnvVar("PI_TEST_HERDR_FAIL_RUN", originalFail);
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  });
+});
+
+describe("terminal claim and autonomous remediation", () => {
+  function makeBrokenRunning(overrides: Record<string, unknown> = {}) {
+    return {
+      id: "a1b2c3d4",
+      owner: Symbol("owner"),
+      name: "Worker",
+      task: "finish task",
+      surface: "pane-1",
+      startTime: 0,
+      sessionFile: "/sessions/worker.jsonl",
+      interactive: false,
+      abortController: { abort() {} },
+      statusState: createStatusState({ source: "pi", startTimeMs: 0 }),
+      ...overrides,
+    };
+  }
+
+  const brokenSnapshot = { kind: "broken", statusLabel: "pane unavailable" } as any;
+
+  it("allows exactly one terminal owner and makes shutdown respect the same claim", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const running = makeBrokenRunning();
+    assert.equal(testApi.claimTerminal(running, "watcher"), true);
+    assert.equal(testApi.claimTerminal(running, "remediation"), false);
+    assert.equal(testApi.claimTerminal(running, "shutdown"), false);
+    assert.equal(running.terminalClaim, "watcher");
+  });
+
+  it("gives session shutdown only the unclaimed terminal owner", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    const { api, eventHandlers } = createMockExtensionApi();
+    runningMap.clear();
+    (subagentsModule as any).default(api);
+    eventHandlers.get("session_start")![0]({}, {});
+    const owner = (globalThis as any)[Symbol.for("pi-subagents/poll-abort-controller")].owner;
+    let winnerAborts = 0;
+    let loserAborts = 0;
+    const winner = makeBrokenRunning({ owner, abortController: { abort() { winnerAborts++; } } });
+    const loser = makeBrokenRunning({
+      id: "b1b2c3d4",
+      owner,
+      terminalClaim: "watcher",
+      abortController: { abort() { loserAborts++; } },
+    });
+    runningMap.set(winner.id, winner);
+    runningMap.set(loser.id, loser);
+    try {
+      eventHandlers.get("session_shutdown")![0]({}, {});
+      assert.equal(winner.terminalClaim, "shutdown");
+      assert.equal(winnerAborts, 1);
+      assert.equal(runningMap.has(winner.id), false);
+      assert.equal(loserAborts, 0);
+      assert.equal(runningMap.get(loser.id), loser);
+    } finally {
+      runningMap.clear();
+    }
+  });
+
+  it("remediates only an autonomous broken run and keeps interactive or done runs silent", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    const calls: string[] = [];
+    const dependencies = {
+      publishRemediation() { return { kind: "acquired" }; },
+      close() { calls.push("close"); },
+      updateWidget() { calls.push("widget"); },
+      send() { calls.push("send"); },
+    };
+    const autonomous = makeBrokenRunning({ abortController: { abort() { calls.push("abort"); } } });
+    const interactive = makeBrokenRunning({ id: "b1b2c3d4", interactive: true });
+    const done = makeBrokenRunning({ id: "c1b2c3d4" });
+    done.statusState.phase = "done";
+    runningMap.clear();
+    runningMap.set(autonomous.id, autonomous);
+    runningMap.set(interactive.id, interactive);
+    runningMap.set(done.id, done);
+    try {
+      assert.equal(testApi.remediateBrokenSubagent(autonomous, brokenSnapshot, dependencies).kind, "remediated");
+      assert.equal(testApi.remediateBrokenSubagent(interactive, brokenSnapshot, dependencies).kind, "skipped");
+      assert.equal(testApi.remediateBrokenSubagent(done, brokenSnapshot, dependencies).kind, "skipped");
+      assert.deepEqual(calls, ["abort", "close", "widget", "send"]);
+      assert.equal(runningMap.has(autonomous.id), false);
+      assert.equal(runningMap.get(interactive.id), interactive);
+      assert.equal(runningMap.get(done.id), done);
+    } finally {
+      runningMap.clear();
+    }
+  });
+
+  it("delivers one real parent remediation from status refresh and leaves an interactive peer untouched", async () => {
+    const arbitration = await loadSidecarArbitration();
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    await withFakeHerdr(async () => {
+      await withTempDirAsync(async (dir) => {
+        const { api, sentMessages } = createMockExtensionApi();
+        const autonomous = makeBrokenRunning({
+          sessionFile: join(dir, "autonomous.jsonl"),
+          abortController: { abort() {} },
+        });
+        const interactive = makeBrokenRunning({
+          id: "b1b2c3d4",
+          sessionFile: join(dir, "interactive.jsonl"),
+          interactive: true,
+        });
+        autonomous.statusState.consecutivePaneFailures = 3;
+        interactive.statusState.consecutivePaneFailures = 3;
+        runningMap.clear();
+        runningMap.set(autonomous.id, autonomous);
+        runningMap.set(interactive.id, interactive);
+        try {
+          testApi.refreshSubagentStatuses(api, 1_000);
+          assert.equal(runningMap.has(autonomous.id), false);
+          assert.equal(runningMap.get(interactive.id), interactive);
+          assert.equal(sentMessages.length, 1);
+          assert.equal(sentMessages[0].message.customType, "subagent_result");
+          assert.match(sentMessages[0].message.content, /multiplexer pane became unavailable/);
+          assert.equal(
+            arbitration.readGenerationTerminal(autonomous.sessionFile, autonomous.id).kind,
+            "remediation",
+          );
+          assert.equal(
+            arbitration.readGenerationTerminal(interactive.sessionFile, interactive.id).kind,
+            "missing",
+          );
+        } finally {
+          runningMap.clear();
+        }
+      });
+    });
+  });
+
+  it("defers remediation when a child terminal record already won", async () => {
+    const arbitration = await loadSidecarArbitration();
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    const running = makeBrokenRunning();
+    const boundary = createTerminalFilesystem();
+    arbitration.publishGenerationTerminal({
+      sessionFile: running.sessionFile,
+      runningChildId: running.id,
+      terminal: { type: "done" },
+      fs: boundary.fs,
+    });
+    runningMap.clear();
+    runningMap.set(running.id, running);
+    try {
+      const result = testApi.remediateBrokenSubagent(running, brokenSnapshot, {
+        publishRemediation(params: any) {
+          return arbitration.tryPublishRemediation({ ...params, fs: boundary.fs });
+        },
+        close() { throw new Error("must not close"); },
+        updateWidget() { throw new Error("must not render"); },
+        send() { throw new Error("must not send"); },
+      });
+      assert.equal(result.kind, "defer");
+      assert.equal(runningMap.get(running.id), running);
+      assert.equal(running.terminalClaim, undefined);
+    } finally {
+      runningMap.clear();
+    }
+  });
+
+  it("recovers a pre-existing remediation record without republishing", async () => {
+    const arbitration = await loadSidecarArbitration();
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    const running = makeBrokenRunning();
+    const boundary = createTerminalFilesystem();
+    arbitration.tryPublishRemediation({
+      sessionFile: running.sessionFile,
+      runningChildId: running.id,
+      reason: "pane-unavailable",
+      claimedAt: 1,
+      fs: boundary.fs,
+    });
+    let publishes = 0;
+    runningMap.clear();
+    runningMap.set(running.id, running);
+    try {
+      const result = testApi.remediateBrokenSubagent(running, brokenSnapshot, {
+        publishRemediation(params: any) {
+          publishes++;
+          return arbitration.tryPublishRemediation({ ...params, fs: boundary.fs });
+        },
+        close() {}, updateWidget() {}, send() {},
+      });
+      assert.equal(result.kind, "remediated");
+      assert.equal(publishes, 1);
+    } finally {
+      runningMap.clear();
+    }
+  });
+
+  it("contains widget, close, and send failures while preserving identity-safe cleanup and one attempted delivery", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    const running = makeBrokenRunning();
+    const replacement = makeBrokenRunning({ name: "replacement" });
+    let sends = 0;
+    runningMap.clear();
+    runningMap.set(running.id, running);
+    try {
+      const result = testApi.remediateBrokenSubagent(running, brokenSnapshot, {
+        publishRemediation() { return { kind: "acquired" }; },
+        close() { runningMap.set(running.id, replacement); throw new Error("close failed"); },
+        updateWidget() { throw new Error("widget failed"); },
+        send() { sends++; throw new Error("delivery failed"); },
+      });
+      assert.equal(result.kind, "remediated");
+      assert.equal(sends, 1, "a delivery failure must not produce a second steer");
+      assert.equal(runningMap.get(running.id), replacement, "only the exact running object may be removed");
+    } finally {
+      runningMap.clear();
+    }
+  });
+
+  it("keeps arbitration errors contained and retries only after the error changes", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    const running = makeBrokenRunning();
+    const diagnostics: string[] = [];
+    runningMap.clear();
+    runningMap.set(running.id, running);
+    try {
+      const dependencies = {
+        publishRemediation() { return { kind: "error", error: "filesystem unavailable" }; },
+        report(error: string) { diagnostics.push(error); },
+      };
+      assert.equal(testApi.remediateBrokenSubagent(running, brokenSnapshot, dependencies).kind, "error");
+      assert.equal(testApi.remediateBrokenSubagent(running, brokenSnapshot, dependencies).kind, "error");
+      assert.deepEqual(diagnostics, ["filesystem unavailable"]);
+      assert.equal(runningMap.get(running.id), running);
+    } finally {
+      runningMap.clear();
+    }
   });
 });
 
@@ -2313,7 +3211,7 @@ describe("subagent lifecycle hardening", () => {
   it("leaves a status-phase done pane registered for the completion watcher", () => {
     const testApi = (subagentsModule as any).__test__;
     const runningMap = testApi.runningSubagents as Map<string, any>;
-    const { api } = createMockExtensionApi();
+    const { api, sentMessages } = createMockExtensionApi();
     const running = {
       id: "done-child",
       name: "Done child",
@@ -2332,6 +3230,7 @@ describe("subagent lifecycle hardening", () => {
       testApi.refreshSubagentStatuses(api, 1_000_000);
       assert.equal(runningMap.get(running.id), running);
       assert.equal(running.statusState.phase, "done");
+      assert.equal(sentMessages.length, 0, "done-phase status runs must remain silent");
       assert.doesNotMatch(
         testApi.refreshSubagentStatuses.toString(),
         /closeSurface|runningSubagents\.delete/,
