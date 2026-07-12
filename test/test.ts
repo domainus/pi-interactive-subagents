@@ -4838,6 +4838,41 @@ describe("configured launch model", () => {
     for (const secret of fakeSecrets) assert.doesNotMatch(rendered, new RegExp(secret.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   }
 
+  const hostileDisplaySecrets = ["display-secret-osc52", "display-secret-osc8", "display-secret-dcs", "display-secret-c1"];
+  const hostileTerminalControls = [
+    "\x1b]52;c;display-secret-osc52\x07",
+    "\x1b]8;;https://display-secret-osc8.example/\x1b\\\x1b]8;;\x1b\\",
+    "\x1bPdisplay-secret-dcs\x1b\\",
+    "\x1b[31m",
+    "\x1b7",
+    "\u0000\u0001\u001f",
+    "\x9B31m",
+    "\x9Ddisplay-secret-c1\x9C",
+  ].join("");
+  const wideHostileModelSuffix = "界🫠".repeat(80);
+
+  function assertSafeModelText(value: unknown, label: string) {
+    assert.equal(typeof value, "string", `${label} must be a string`);
+    const display = value as string;
+    assert.doesNotMatch(display, /[\x00-\x1F\x7F-\x9F]/, `${label} must not contain terminal controls`);
+    assert.doesNotMatch(display, /\x1b/, `${label} must not contain ESC`);
+    assert.doesNotMatch(display, /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/, `${label} must not split a surrogate pair`);
+    for (const secret of hostileDisplaySecrets) assert.doesNotMatch(display, new RegExp(secret), `${label} leaked ${secret}`);
+  }
+
+  function assertSafeBoundedModelDisplay(value: unknown, label: string) {
+    assertSafeModelText(value, label);
+    assert.ok(visibleWidth(value as string) <= 120, `${label} must fit within 120 visible columns`);
+  }
+
+  function renderRegisteredSpawnResult(result: any, width = 1_000): string {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const tool = registeredTools.find((entry) => entry.name === "subagent");
+    const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+    return tool.renderResult(result, {}, theme).render(width).join("\n");
+  }
+
   async function withRegisteredSpawn(
     dir: string,
     params: Record<string, unknown>,
@@ -4945,6 +4980,55 @@ describe("configured launch model", () => {
         assert.equal(readFileSync(join(dir, ".herdr.log"), "utf8"), "");
         assert.equal(readdirSync(dir, { recursive: true }).some((entry: string) => String(entry).includes("artifacts")), false);
         assertNoSecret(result);
+      });
+    });
+  });
+
+  it("sanitizes and bounds requested and effective model details from a successful registered launch", async () => {
+    await withTempDirAsync(async (dir) => {
+      const rawId = `${hostileTerminalControls}${wideHostileModelSuffix}`;
+      const explicit = `oauth/${rawId}`;
+      await withRegisteredSpawn(dir, { name: "Hostile explicit", task: "run", model: explicit }, registry([model("oauth", rawId)], [explicit]), (result) => {
+        assertSafeBoundedModelDisplay(result.details.model.requested, "requested model");
+        assertSafeBoundedModelDisplay(result.details.model.effective, "effective model");
+        assert.match(readFileSync(result.details.launchScriptFile, "utf8"), /display-secret-osc52/);
+      });
+    });
+  });
+
+  it("sanitizes and bounds fallback details, content, and rendering from a registered launch", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir, projectDir }) => {
+      const rawId = `${hostileTerminalControls}${wideHostileModelSuffix}`;
+      const effective = `oauth/${rawId}`;
+      writeAgentFile(projectAgentsDir, "hostile-fallback-agent", `name: hostile-fallback-agent\nmodel: absent/${hostileTerminalControls}${wideHostileModelSuffix}`);
+      await withRegisteredSpawn(projectDir, { name: "Hostile fallback", task: "run", agent: "hostile-fallback-agent" }, registry([model("oauth", rawId)], [effective]), (result) => {
+        assertSafeBoundedModelDisplay(result.details.model.preferred, "preferred model");
+        assertSafeBoundedModelDisplay(result.details.model.effective, "fallback effective model");
+        assertSafeModelText(result.content[0].text, "fallback launch content");
+        for (const [index, line] of renderRegisteredSpawnResult(result, 120).split("\n").entries()) {
+          assertSafeBoundedModelDisplay(line, `fallback render line ${index}`);
+        }
+        assert.match(readFileSync(result.details.launchScriptFile, "utf8"), /display-secret-dcs/);
+      });
+    });
+  });
+
+  it("sanitizes and bounds explicit-unavailable alternatives before the registered launch path", async () => {
+    await withTempDirAsync(async (dir) => {
+      const rawId = `${hostileTerminalControls}${wideHostileModelSuffix}`;
+      const available = model("oauth", rawId);
+      await withRegisteredSpawn(dir, { name: "Hostile unavailable", task: "nope", model: "missing/model" }, registry([available], [`oauth/${rawId}`]), (result, running) => {
+        assert.equal(result.details.error, "explicit-unknown");
+        for (const [index, alternative] of result.details.alternatives.entries()) {
+          assertSafeBoundedModelDisplay(alternative, `alternative ${index}`);
+        }
+        assertSafeModelText(result.content[0].text, "unavailable content");
+        for (const [index, line] of renderRegisteredSpawnResult(result, 120).split("\n").entries()) {
+          assertSafeBoundedModelDisplay(line, `unavailable render line ${index}`);
+        }
+        assert.equal(running.size, 0);
+        assert.equal(readFileSync(join(dir, ".herdr.log"), "utf8"), "");
+        assert.equal(existsSync(join(dir, "artifacts")), false);
       });
     });
   });

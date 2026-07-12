@@ -530,8 +530,35 @@ function getShellReadyDelayMs(): number {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : 500;
 }
 
+const DISPLAY_FIELD_MAX_WIDTH = 120;
+
+// Terminal string controls carry arbitrary payloads until BEL or ST. Strip
+// them before removing individual control bytes so OSC/DCS payloads cannot
+// reach details or renderers as ordinary-looking text.
+const OSC_SEQUENCE = /(?:\x1B\]|\x9D)[\s\S]*?(?:\x07|\x1B\\|\x9C)/g;
+const ST_STRING_SEQUENCE = /(?:\x1B[P^_X]|[\x90\x98\x9E\x9F])[\s\S]*?(?:\x1B\\|\x9C)/g;
+const CSI_SEQUENCE = /(?:\x1B\[|\x9B)[\x30-\x3F]*[\x20-\x2F]*[\x40-\x7E]/g;
+const ESCAPE_SEQUENCE = /\x1B(?:[\x20-\x2F]*[\x30-\x7E])?/g;
+const C0_C1_CONTROLS = /[\x00-\x1F\x7F-\x9F]/g;
+
+function stripTerminalControls(value: string): string {
+  return value
+    .replace(OSC_SEQUENCE, "")
+    .replace(ST_STRING_SEQUENCE, "")
+    .replace(CSI_SEQUENCE, "")
+    .replace(ESCAPE_SEQUENCE, "")
+    .replace(C0_C1_CONTROLS, "");
+}
+
+function compactDisplayText(value: unknown, maxWidth = DISPLAY_FIELD_MAX_WIDTH): string {
+  const plain = typeof value === "string"
+    ? stripTerminalControls(value).replace(/\s+/g, " ").trim()
+    : "";
+  return stripTerminalControls(truncateToWidth(plain, maxWidth));
+}
+
 function modelReferenceForDisplay(value: string): string {
-  return value.replace(/\s+/g, " ").trim().slice(0, 120);
+  return compactDisplayText(value);
 }
 
 function configuredModelErrorResult(resolution: Exclude<ReturnType<typeof resolveConfiguredModel>, { ok: true }>) {
@@ -575,17 +602,8 @@ type ListingModelResolution =
   | { authType: "external" };
 
 const LISTING_LINE_MAX_WIDTH = 360;
-const LISTING_FIELD_MAX_WIDTH = 120;
+const LISTING_FIELD_MAX_WIDTH = DISPLAY_FIELD_MAX_WIDTH;
 const LISTING_DIAGNOSTIC_MAX_WIDTH = 180;
-
-// Terminal string controls carry arbitrary payloads until BEL or ST. Strip
-// them before removing individual control bytes so OSC/DCS payloads cannot
-// reach details or renderers as ordinary-looking text.
-const OSC_SEQUENCE = /(?:\x1B\]|\x9D)[\s\S]*?(?:\x07|\x1B\\|\x9C)/g;
-const ST_STRING_SEQUENCE = /(?:\x1B[P^_X]|[\x90\x98\x9E\x9F])[\s\S]*?(?:\x1B\\|\x9C)/g;
-const CSI_SEQUENCE = /(?:\x1B\[|\x9B)[\x30-\x3F]*[\x20-\x2F]*[\x40-\x7E]/g;
-const ESCAPE_SEQUENCE = /\x1B(?:[\x20-\x2F]*[\x30-\x7E])?/g;
-const C0_C1_CONTROLS = /[\x00-\x1F\x7F-\x9F]/g;
 const LISTING_ALTERNATIVE_LIMIT = 3;
 
 type ListedAgentDetails = {
@@ -596,20 +614,8 @@ type ListedAgentDetails = {
   modelResolution: ListingModelResolution;
 };
 
-function stripTerminalControls(value: string): string {
-  return value
-    .replace(OSC_SEQUENCE, "")
-    .replace(ST_STRING_SEQUENCE, "")
-    .replace(CSI_SEQUENCE, "")
-    .replace(ESCAPE_SEQUENCE, "")
-    .replace(C0_C1_CONTROLS, "");
-}
-
 function compactListingText(value: unknown, maxWidth = LISTING_FIELD_MAX_WIDTH): string {
-  const plain = typeof value === "string"
-    ? stripTerminalControls(value).replace(/\s+/g, " ").trim()
-    : "";
-  return stripTerminalControls(truncateToWidth(plain, maxWidth));
+  return compactDisplayText(value, maxWidth);
 }
 
 function boundedListingAlternatives(value: unknown): string[] {
