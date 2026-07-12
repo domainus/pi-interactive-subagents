@@ -4,6 +4,7 @@ description: Fast codebase reconnaissance - maps existing code, conventions, and
 tools: read, bash
 deny-tools: claude
 model: openai-codex/gpt-5.6-luna
+model-tier: fast
 output: context.md
 spawning: false
 auto-exit: true

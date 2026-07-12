@@ -2,6 +2,7 @@
 name: claude-code
 description: Deprecated compatibility alias for chatgpt-code
 model: openai-codex/gpt-5.6-sol
+model-tier: deep
 auto-exit: true
 spawning: false
 deny-tools: claude

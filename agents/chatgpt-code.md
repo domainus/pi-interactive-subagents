@@ -2,6 +2,7 @@
 name: chatgpt-code
 description: Self-driving ChatGPT coding session for deep investigation, experimentation, and code exploration
 model: openai-codex/gpt-5.6-sol
+model-tier: deep
 auto-exit: true
 spawning: false
 deny-tools: claude

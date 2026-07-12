@@ -4,6 +4,7 @@ description: Implements tasks from todos - writes code, runs tests, commits with
 tools: read, bash, write, edit
 deny-tools: claude
 model: openai-codex/gpt-5.6-sol
+model-tier: balanced
 thinking: minimal
 spawning: false
 auto-exit: true

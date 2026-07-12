@@ -279,6 +279,7 @@ async function withFakeHerdr(
 
   mkdirSync(binDir, { recursive: true });
   writeFileSync(herdr, `#!/bin/sh
+[ -n "$PI_TEST_HERDR_LOG" ] && echo "$1 $2" >> "$PI_TEST_HERDR_LOG"
 if [ "$1" = "pane" ] && [ "$2" = "split" ]; then
   echo '{"id":"cli:pane:split","result":{"type":"pane_info","pane":{"pane_id":"w1:p2"}}}'
 elif [ "$1" = "pane" ] && [ "$2" = "read" ]; then
@@ -1221,22 +1222,22 @@ describe("subagent discovery", () => {
     assert.doesNotMatch(claudeBlock, /buildThinkingArgs/);
   });
 
-  it("validates thinking before creating a launch surface", () => {
+  it("validates thinking before requesting a launch surface", () => {
     const source = readFileSync(
       fileURLToPath(new URL("../pi-extension/subagents/index.ts", import.meta.url)),
       "utf8",
     );
-    const launchStart = source.indexOf("async function launchSubagent(");
-    const launchBlock = source.slice(launchStart, source.indexOf("\n/**\n * Watch a launched subagent", launchStart));
-    const thinkingSupportCheck = launchBlock.indexOf("assertThinkingSupportedForCli(params, agentDefs);");
-    const thinkingResolution = launchBlock.indexOf("const effectiveThinking = resolveEffectiveThinking(params, agentDefs);");
-    const surfaceCreation = launchBlock.indexOf("const surface = options?.surface ?? createSurface(params.name);");
+    const executeStart = source.indexOf("async execute(_toolCallId, params, _signal, _onUpdate, ctx)");
+    const executeBlock = source.slice(executeStart, source.indexOf("\n      renderCall", executeStart));
+    const thinkingSupportCheck = executeBlock.indexOf("assertThinkingSupportedForCli(params, agentDefs);");
+    const thinkingResolution = executeBlock.indexOf("effectiveThinking = resolveEffectiveThinking(params, agentDefs);");
+    const launchInvocation = executeBlock.indexOf("const running = await launchSubagent(params, ctx, extensionOwner, {");
 
     assert.ok(thinkingSupportCheck >= 0, "expected Pi/Claude thinking support validation");
     assert.ok(thinkingResolution >= 0, "expected effective thinking resolution");
-    assert.ok(surfaceCreation >= 0, "expected launch surface creation");
-    assert.ok(thinkingSupportCheck < surfaceCreation, "thinking support must be checked before surface creation");
-    assert.ok(thinkingResolution < surfaceCreation, "thinking must be resolved before surface creation");
+    assert.ok(launchInvocation >= 0, "expected deferred launch invocation");
+    assert.ok(thinkingSupportCheck < launchInvocation, "thinking support must be checked before launch");
+    assert.ok(thinkingResolution < launchInvocation, "thinking must be resolved before launch");
   });
 
   it("closes a locally owned pane when launch setup fails", async () => {
@@ -2508,6 +2509,12 @@ describe("generation terminal production paths", () => {
       writeFileSync(resumeSession, "");
       const ctx = {
         cwd: dir,
+        modelRegistry: {
+          getAvailable() { return [{ provider: "test", id: "luna" }]; },
+          find() { return { provider: "test", id: "luna" }; },
+          hasConfiguredAuth() { return true; },
+          isUsingOAuth() { return false; },
+        },
         sessionManager: {
           getSessionFile() { return parentSession; },
           getSessionId() { return "parent"; },
@@ -2632,6 +2639,12 @@ fi
         const tool = registeredTools.find((entry) => entry.name === "subagent");
         await assert.rejects(tool.execute("call", { name: "Worker", task: "fail" }, undefined, undefined, {
           cwd: dir,
+          modelRegistry: {
+            getAvailable() { return [{ provider: "test", id: "luna" }]; },
+            find() { return { provider: "test", id: "luna" }; },
+            hasConfiguredAuth() { return true; },
+            isUsingOAuth() { return false; },
+          },
           sessionManager: {
             getSessionFile() { return join(dir, "parent.jsonl"); },
             getSessionId() { return "parent"; },
@@ -4484,5 +4497,212 @@ describe("configured model selection", () => {
     assert.equal(result.ok, false);
     if (!result.ok) assert.equal(result.code, "registry-error");
     assertSecretSafe(result);
+  });
+});
+
+describe("configured launch model", () => {
+  const fakeSecrets = ["fake-api-key-123", "fake-oauth-token-456", "/private/auth.json"];
+  const testApi = (subagentsModule as any).__test__;
+
+  function model(provider: string, id: string, overrides: Record<string, unknown> = {}): Model<any> {
+    return {
+      provider, id, name: id, api: "openai-completions", baseUrl: "https://models.example.test",
+      reasoning: false, input: ["text"], cost: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 32_000, maxTokens: 4_000, headers: { authorization: "Bearer fake-oauth-token-456" },
+      ...overrides,
+    } as Model<any>;
+  }
+
+  function registry(models: Model<any>[], configured: string[], options: { throwGetAvailable?: boolean } = {}): ModelRegistryLike {
+    const reference = (provider: string, id: string) => `${provider}/${id}`.toLowerCase();
+    const configuredSet = new Set(configured.map((value) => value.toLowerCase()));
+    return {
+      secret: "fake-api-key-123",
+      getAvailable() {
+        if (options.throwGetAvailable) throw new Error("fake-api-key-123");
+        return models.filter((entry) => configuredSet.has(reference(entry.provider, entry.id)));
+      },
+      find(provider, id) { return models.find((entry) => reference(entry.provider, entry.id) === reference(provider, id)); },
+      hasConfiguredAuth(entry) { return configuredSet.has(reference(entry.provider, entry.id)); },
+      isUsingOAuth(entry) { return entry.provider === "oauth"; },
+    } as ModelRegistryLike;
+  }
+
+  function assertNoSecret(value: unknown) {
+    const rendered = JSON.stringify(value);
+    for (const secret of fakeSecrets) assert.doesNotMatch(rendered, new RegExp(secret.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  }
+
+  async function withRegisteredSpawn(
+    dir: string,
+    params: Record<string, unknown>,
+    modelRegistry: ModelRegistryLike,
+    check: (result: any, running: Map<string, any>) => Promise<void> | void,
+  ) {
+    await withFakeHerdr(async () => {
+      const { api, registeredTools, eventHandlers } = createMockExtensionApi();
+      const running = testApi.runningSubagents as Map<string, any>;
+      const previousLog = process.env.PI_TEST_HERDR_LOG;
+      const muxLog = join(dir, ".herdr.log");
+      writeFileSync(muxLog, "");
+      process.env.PI_TEST_HERDR_LOG = muxLog;
+      running.clear();
+      (subagentsModule as any).default(api);
+      eventHandlers.get("session_start")![0]({}, {});
+      const tool = registeredTools.find((entry) => entry.name === "subagent");
+      try {
+        const result = await tool.execute("call", params, undefined, undefined, {
+          cwd: dir,
+          modelRegistry,
+          sessionManager: {
+            getSessionFile() { return join(dir, "parent.jsonl"); },
+            getSessionId() { return "parent"; },
+            getSessionDir() { return dir; },
+          },
+        });
+        await check(result, running);
+      } finally {
+        eventHandlers.get("session_shutdown")![0]({}, {});
+        running.clear();
+        restoreEnvVar("PI_TEST_HERDR_LOG", previousLog);
+      }
+    });
+  }
+
+  it("model-tier parses valid frontmatter and defaults custom agents to balanced", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+      writeAgentFile(projectAgentsDir, "deep-tier-agent", "name: deep-tier-agent\nmodel-tier: deep");
+      writeAgentFile(projectAgentsDir, "implicit-tier-agent", "name: implicit-tier-agent");
+      const deep = testApi.loadAgentDefaults("deep-tier-agent");
+      const implicit = testApi.loadAgentDefaults("implicit-tier-agent");
+      assert.equal(deep.modelTier, "deep");
+      assert.equal(testApi.resolveEffectiveModelTier({ name: "D", task: "", agent: "deep-tier-agent" }, deep), "deep");
+      assert.equal(testApi.resolveEffectiveModelTier({ name: "I", task: "", agent: "implicit-tier-agent" }, implicit), "balanced");
+    });
+  });
+
+  it("model-tier rejects invalid frontmatter before any pane or artifact mutation", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir, projectDir }) => {
+      writeAgentFile(projectAgentsDir, "invalid-tier-agent", "name: invalid-tier-agent\nmodel-tier: sideways");
+      await withRegisteredSpawn(projectDir, { name: "Invalid", task: "never launch", agent: "invalid-tier-agent" }, registry([], []), async (result, running) => {
+        assert.match(result.content[0].text, /Invalid model tier "sideways"/);
+        assert.equal(running.size, 0);
+        assert.equal(readFileSync(join(projectDir, ".herdr.log"), "utf8"), "");
+        assert.equal(existsSync(join(projectDir, "artifacts")), false);
+      });
+    });
+  });
+
+  it("model-tier assigns every bundled agent its approved role tier", async () => {
+    await withIsolatedAgentEnv(async () => {
+      const expected = { scout: "fast", "visual-tester": "fast", planner: "balanced", worker: "balanced", reviewer: "deep", "chatgpt-code": "deep", "claude-code": "deep" };
+      for (const [name, tier] of Object.entries(expected)) {
+        assert.equal(testApi.loadAgentDefaults(name)?.modelTier, tier, `${name} must declare ${tier}`);
+      }
+    });
+  });
+
+  it("configured launch model keeps authenticated explicit overrides in the Pi command", async () => {
+    await withTempDirAsync(async (dir) => {
+      const selected = model("OpenAI", "gpt-explicit");
+      await withRegisteredSpawn(dir, { name: "Explicit", task: "run", model: "OpenAI/gpt-explicit" }, registry([selected], ["openai/gpt-explicit"]), (result) => {
+        assert.deepEqual(result.details.model, { requested: "OpenAI/gpt-explicit", effective: "OpenAI/gpt-explicit", authType: "api-key", tier: "balanced", source: "explicit" });
+        const command = readFileSync(result.details.launchScriptFile, "utf8");
+        assert.match(command, /--model 'OpenAI\/gpt-explicit'/);
+        assertNoSecret([result, command]);
+      });
+    });
+  });
+
+  it("unavailable explicit model returns alternatives before pane, artifact, or map entries", async () => {
+    await withTempDirAsync(async (dir) => {
+      const available = model("oauth", "luna");
+      await withRegisteredSpawn(dir, { name: "Unavailable", task: "nope", model: "missing/model" }, registry([available], ["oauth/luna"]), (result, running) => {
+        assert.match(result.content[0].text, /not known to Pi/i);
+        assert.match(result.content[0].text, /oauth\/luna/);
+        assert.equal(result.details.error, "explicit-unknown");
+        assert.deepEqual(result.details.alternatives, ["oauth/luna"]);
+        assert.equal(running.size, 0);
+        assert.equal(readFileSync(join(dir, ".herdr.log"), "utf8"), "");
+        assert.equal(readdirSync(dir, { recursive: true }).some((entry: string) => String(entry).includes("artifacts")), false);
+        assertNoSecret(result);
+      });
+    });
+  });
+
+  it("configured launch model preserves preferred defaults and uses fallbacks in the Pi command", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir, projectDir }) => {
+      writeAgentFile(projectAgentsDir, "preferred-agent", "name: preferred-agent\nmodel: anthropic/preferred\nmodel-tier: balanced");
+      const preferred = model("anthropic", "preferred");
+      await withRegisteredSpawn(projectDir, { name: "Preferred", task: "run", agent: "preferred-agent" }, registry([preferred], ["anthropic/preferred"]), (result) => {
+        assert.equal(result.details.model.source, "preferred");
+        assert.equal(result.details.model.effective, "anthropic/preferred");
+      });
+
+      writeAgentFile(projectAgentsDir, "fallback-agent", "name: fallback-agent\nmodel: absent/default\nmodel-tier: deep");
+      const fallback = model("oauth", "sol");
+      await withRegisteredSpawn(projectDir, { name: "Fallback", task: "run", agent: "fallback-agent" }, registry([fallback], ["oauth/sol"]), (result) => {
+        assert.deepEqual(result.details.model, { preferred: "absent/default", effective: "oauth/sol", authType: "oauth", tier: "deep", source: "fallback", fallbackReason: "preferred-unknown" });
+        const command = readFileSync(result.details.launchScriptFile, "utf8");
+        assert.match(command, /--model 'oauth\/sol'/);
+        assert.match(result.content[0].text, /fallback/i);
+        assertNoSecret([result, command]);
+      });
+    });
+  });
+
+  it("automatic effective model is supplied for bare Pi spawns and no configured models fail before launch", async () => {
+    await withTempDirAsync(async (dir) => {
+      const automatic = model("dynamic", "luna");
+      await withRegisteredSpawn(dir, { name: "Automatic", task: "run" }, registry([automatic], ["dynamic/luna"]), (result) => {
+        assert.deepEqual(result.details.model, { effective: "dynamic/luna", authType: "api-key", tier: "balanced", source: "automatic" });
+        assert.match(readFileSync(result.details.launchScriptFile, "utf8"), /--model 'dynamic\/luna'/);
+      });
+      await withTempDirAsync(async (emptyDir) => {
+        await withRegisteredSpawn(emptyDir, { name: "No models", task: "nope" }, registry([], []), (result, running) => {
+          assert.match(result.content[0].text, /No authenticated Pi models.*\/login|API key/i);
+          assert.equal(result.details.error, "no-configured-models");
+          assert.equal(running.size, 0);
+          assert.equal(readFileSync(join(emptyDir, ".herdr.log"), "utf8"), "");
+          assert.equal(readdirSync(emptyDir, { recursive: true }).some((entry: string) => String(entry).includes("artifacts")), false);
+        });
+      });
+    });
+  });
+
+  it("configured launch model bypasses registry resolution for external Claude and bounds registry errors before pane creation", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir, projectDir }) => {
+      writeAgentFile(projectAgentsDir, "external-agent", "name: external-agent\ncli: claude\nmodel: claude/terminal");
+      const throwing = registry([], [], { throwGetAvailable: true });
+      await withRegisteredSpawn(projectDir, { name: "External", task: "run", agent: "external-agent" }, throwing, (result) => {
+        assert.equal(result.details.status, "started");
+        assert.equal(result.details.model, undefined);
+        assert.match(readFileSync(result.details.launchScriptFile, "utf8"), /--model 'claude\/terminal'/);
+      });
+      await withRegisteredSpawn(projectDir, { name: "Broken registry", task: "nope" }, throwing, (result, running) => {
+        assert.match(result.content[0].text, /Unable to inspect configured Pi models/);
+        assert.equal(result.details.error, "registry-error");
+        assert.equal(running.size, 0);
+        assert.equal(readFileSync(join(projectDir, ".herdr.log"), "utf8"), "");
+        assertNoSecret(result);
+      });
+    });
+  });
+
+  it("model fallback disclosure is safe and shown only for substitution", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir, projectDir }) => {
+      writeAgentFile(projectAgentsDir, "disclosure-agent", "name: disclosure-agent\nmodel: absent/default");
+      const selected = model("oauth", "terra");
+      await withRegisteredSpawn(projectDir, { name: "Disclosure", task: "run", agent: "disclosure-agent" }, registry([selected], ["oauth/terra"]), (result) => {
+        const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+        const { api, registeredTools } = createMockExtensionApi();
+        (subagentsModule as any).default(api);
+        const tool = registeredTools.find((entry) => entry.name === "subagent");
+        const rendered = tool.renderResult(result, {}, theme).render(120).join("\n");
+        assert.match(rendered, /fallback/i);
+        assert.match(rendered, /oauth\/terra/);
+        assertNoSecret([result.content, result.details, rendered, readFileSync(result.details.launchScriptFile, "utf8")]);
+      });
+    });
   });
 });

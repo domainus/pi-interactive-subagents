@@ -58,6 +58,12 @@ import {
   type SubagentActivityState,
 } from "./activity.ts";
 import { tryPublishRemediation } from "./sidecar-arbitration.ts";
+import {
+  resolveConfiguredModel,
+  type ModelRegistryLike,
+  type ModelTier,
+  type ResolvedLaunchModel,
+} from "./model-selection.ts";
 
 /** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
 const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
@@ -141,6 +147,7 @@ function abortPollAbortOwner(owner: symbol) {
 
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 type ThinkingLevel = (typeof THINKING_LEVELS)[number];
+const MODEL_TIERS: readonly ModelTier[] = ["fast", "balanced", "deep"];
 const ThinkingLevelSchema = Type.Union(
   [
     Type.Literal("off"),
@@ -215,6 +222,8 @@ interface AgentDefaults {
   skills?: string;
   thinking?: ThinkingLevel;
   invalidThinking?: string;
+  modelTier?: ModelTier;
+  invalidModelTier?: string;
   denyTools?: string;
   spawning?: boolean;
   autoExit?: boolean;
@@ -292,6 +301,10 @@ function parseOptionalBoolean(value: string | undefined): boolean | undefined {
   return value != null ? value === "true" : undefined;
 }
 
+function parseModelTier(value: string | undefined): ModelTier | undefined {
+  return value && (MODEL_TIERS as readonly string[]).includes(value) ? value as ModelTier : undefined;
+}
+
 function parseSessionMode(value: string | undefined): SubagentSessionMode | undefined {
   if (value === "standalone" || value === "lineage-only" || value === "fork") {
     return value;
@@ -307,6 +320,7 @@ function parseAgentDefinition(content: string, fallbackName: string): AgentDefin
   const body = content.replace(/^---\n[\s\S]*?\n---\n*/, "").trim();
   const systemPromptMode = getFrontmatterValue(frontmatter, "system-prompt");
   const rawThinking = getFrontmatterValue(frontmatter, "thinking");
+  const rawModelTier = getFrontmatterValue(frontmatter, "model-tier");
 
   return {
     name: getFrontmatterValue(frontmatter, "name") ?? fallbackName,
@@ -322,6 +336,8 @@ function parseAgentDefinition(content: string, fallbackName: string): AgentDefin
     skills: getFrontmatterValue(frontmatter, "skill") ?? getFrontmatterValue(frontmatter, "skills"),
     thinking: isThinkingLevel(rawThinking) ? rawThinking : undefined,
     invalidThinking: rawThinking && !isThinkingLevel(rawThinking) ? rawThinking : undefined,
+    modelTier: parseModelTier(rawModelTier),
+    invalidModelTier: rawModelTier && !parseModelTier(rawModelTier) ? rawModelTier : undefined,
     denyTools: getFrontmatterValue(frontmatter, "deny-tools"),
     spawning: parseOptionalBoolean(getFrontmatterValue(frontmatter, "spawning")),
     autoExit: parseOptionalBoolean(getFrontmatterValue(frontmatter, "auto-exit")),
@@ -449,6 +465,17 @@ function resolveEffectiveThinking(
   return agentDefs?.thinking;
 }
 
+function resolveEffectiveModelTier(
+  params: Static<typeof SubagentParams>,
+  agentDefs: AgentDefaults | null,
+): ModelTier {
+  if (agentDefs?.invalidModelTier) {
+    const agentName = params.agent ?? "<unknown>";
+    throw new Error(`Invalid model tier "${agentDefs.invalidModelTier}" in agent definition "${agentName}"`);
+  }
+  return agentDefs?.modelTier ?? "balanced";
+}
+
 function buildThinkingArgs(level: ThinkingLevel | undefined): string[] {
   return level ? ["--thinking", level] : [];
 }
@@ -501,6 +528,33 @@ function getShellReadyDelayMs(): number {
   const raw = process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS?.trim();
   const parsed = raw ? Number.parseInt(raw, 10) : Number.NaN;
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : 500;
+}
+
+function modelReferenceForDisplay(value: string): string {
+  return value.replace(/\s+/g, " ").trim().slice(0, 120);
+}
+
+function configuredModelErrorResult(resolution: Exclude<ReturnType<typeof resolveConfiguredModel>, { ok: true }>) {
+  const alternatives = resolution.alternatives.map(modelReferenceForDisplay);
+  const alternativeHint = alternatives.length > 0
+    ? ` Available authenticated models: ${alternatives.join(", ")}.`
+    : "";
+  return {
+    content: [{ type: "text" as const, text: `Error: ${resolution.message}${alternativeHint}` }],
+    details: { error: resolution.code, alternatives },
+  };
+}
+
+function launchModelDetails(model: ResolvedLaunchModel) {
+  return {
+    ...(model.requestedModel === undefined ? {} : { requested: model.requestedModel }),
+    ...(model.preferredModel === undefined ? {} : { preferred: model.preferredModel }),
+    effective: model.effectiveModel,
+    authType: model.authType,
+    tier: model.tier,
+    source: model.source,
+    ...(model.fallbackReason === undefined ? {} : { fallbackReason: model.fallbackReason }),
+  };
 }
 
 function muxUnavailableResult() {
@@ -1298,6 +1352,8 @@ export const __test__ = {
   borderLine,
   THINKING_LEVELS,
   resolveEffectiveThinking,
+  parseModelTier,
+  resolveEffectiveModelTier,
   buildThinkingArgs,
   assertThinkingSupportedForCli,
   getShellReadyDelayMs,
@@ -1360,15 +1416,20 @@ async function launchSubagent(
   params: typeof SubagentParams.static,
   ctx: { sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string }; cwd: string },
   owner: symbol,
-  options?: { surface?: string },
+  options: {
+    agentDefs: AgentDefaults | null;
+    effectiveThinking: ThinkingLevel | undefined;
+    modelResolution: ResolvedLaunchModel | null;
+    surface?: string;
+  },
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
   const id = newRunningChildId();
 
-  const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
-  assertThinkingSupportedForCli(params, agentDefs);
-  const effectiveThinking = resolveEffectiveThinking(params, agentDefs);
-  const effectiveModel = params.model ?? agentDefs?.model;
+  const { agentDefs, effectiveThinking, modelResolution } = options;
+  const effectiveModel = agentDefs?.cli === "claude"
+    ? params.model ?? agentDefs?.model
+    : modelResolution?.effectiveModel;
   const effectiveTools = params.tools ?? agentDefs?.tools;
   const effectiveSkills = params.skills ?? agentDefs?.skills;
   const effectiveInteractive = resolveEffectiveInteractive(params, agentDefs);
@@ -1396,8 +1457,8 @@ async function launchSubagent(
 
   // Use pre-created surface (parallel mode) or create a new one.
   // For new surfaces, pause briefly so the shell is ready before sending the command.
-  const surfacePreCreated = !!options?.surface;
-  const surface = options?.surface ?? createSurface(params.name);
+  const surfacePreCreated = !!options.surface;
+  const surface = options.surface ?? createSurface(params.name);
   return withOwnedLaunchSurface({
     surface,
     owned: !surfacePreCreated,
@@ -1889,8 +1950,42 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         }
 
+        // Load and validate launch defaults before creating any pane or artifact.
+        const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
+        let effectiveThinking: ThinkingLevel | undefined;
+        let modelTier: ModelTier;
+        try {
+          assertThinkingSupportedForCli(params, agentDefs);
+          effectiveThinking = resolveEffectiveThinking(params, agentDefs);
+          modelTier = resolveEffectiveModelTier(params, agentDefs);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "Invalid subagent definition.";
+          return {
+            content: [{ type: "text", text: `Error: ${message}` }],
+            details: { error: "invalid agent definition" },
+          };
+        }
+
+        // Claude owns its own auth/model selection. Pi-backed children must use
+        // an authenticated effective model selected before launch mutation.
+        let modelResolution: ResolvedLaunchModel | null = null;
+        if (agentDefs?.cli !== "claude") {
+          const resolution = resolveConfiguredModel({
+            registry: ctx.modelRegistry as ModelRegistryLike,
+            tier: modelTier,
+            explicitModel: params.model,
+            preferredModel: agentDefs?.model,
+          });
+          if (!resolution.ok) return configuredModelErrorResult(resolution);
+          modelResolution = resolution.value;
+        }
+
         // Launch the subagent (creates pane, sends command)
-        const running = await launchSubagent(params, ctx, extensionOwner);
+        const running = await launchSubagent(params, ctx, extensionOwner, {
+          agentDefs,
+          effectiveThinking,
+          modelResolution,
+        });
 
         // Create a separate AbortController for the watcher
         // (the tool's signal completes when we return)
@@ -1914,8 +2009,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             {
               type: "text",
               text:
-                `Sub-agent "${params.name}" launched and is now running in the background. ` +
-                `Do NOT generate or assume any results — you have no idea what the sub-agent will do or produce. ` +
+                `Sub-agent "${params.name}" launched and is now running in the background.` +
+                (modelResolution?.source === "fallback"
+                  ? ` Using fallback model ${modelReferenceForDisplay(modelResolution.effectiveModel)}.`
+                  : "") +
+                ` Do NOT generate or assume any results — you have no idea what the sub-agent will do or produce. ` +
                 `The results will be delivered to you automatically as a steer message when the sub-agent finishes. ` +
                 `Until then, move on to other work or tell the user you're waiting.`,
             },
@@ -1927,6 +2025,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             agent: params.agent,
             sessionFile: running.sessionFile,
             launchScriptFile: running.launchScriptFile,
+            ...(modelResolution ? { model: launchModelDetails(modelResolution) } : {}),
             status: "started",
           },
         };
@@ -1972,11 +2071,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         // "Started" result — tool returned immediately
         if (details?.status === "started") {
+          const fallback = details?.model?.source === "fallback" && typeof details.model.effective === "string"
+            ? ` — fallback: ${modelReferenceForDisplay(details.model.effective)}`
+            : "";
           return new Text(
             theme.fg("accent", "▸") +
               " " +
               theme.fg("toolTitle", theme.bold(name)) +
-              theme.fg("dim", " — started"),
+              theme.fg("dim", ` — started${fallback}`),
             0,
             0,
           );
