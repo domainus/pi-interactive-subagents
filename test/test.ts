@@ -2538,6 +2538,69 @@ describe("generation terminal production paths", () => {
     await assertActualWatcherDeliveryIsSuppressed("subagent_resume");
   });
 
+  async function assertRegisteredResumeRollbackOnCommandDeliveryFailure(closeFails = false) {
+    await withFakeHerdr(async () => {
+      const originalCloseFailure = process.env.PI_TEST_HERDR_CLOSE_FAILURE;
+      const dir = createTestDir();
+      const bin = process.env.PATH!.split(":")[0];
+      const herdr = join(bin, "herdr");
+      const closeLog = join(dir, "closed-surfaces.log");
+      writeFileSync(closeLog, "");
+      writeFileSync(herdr, `#!/bin/sh
+if [ "$1" = "pane" ] && [ "$2" = "split" ]; then
+  echo '{"id":"cli:pane:split","result":{"type":"pane_info","pane":{"pane_id":"w1:p2"}}}'
+elif [ "$1" = "pane" ] && [ "$2" = "close" ]; then
+  echo "$3" >> "$PI_TEST_HERDR_CLOSE_LOG"
+  [ "$PI_TEST_HERDR_CLOSE_FAILURE" = "1" ] && exit 7
+else
+  exit 9
+fi
+`);
+      chmodSync(herdr, 0o755);
+      process.env.PI_TEST_HERDR_CLOSE_LOG = closeLog;
+      if (closeFails) process.env.PI_TEST_HERDR_CLOSE_FAILURE = "1";
+      else delete process.env.PI_TEST_HERDR_CLOSE_FAILURE;
+
+      const { api, registeredTools, eventHandlers } = createMockExtensionApi();
+      const runningMap = (subagentsModule as any).__test__.runningSubagents as Map<string, any>;
+      runningMap.clear();
+      (subagentsModule as any).default(api);
+      eventHandlers.get("session_start")![0]({}, {});
+      const resumeSession = join(dir, "resume.jsonl");
+      writeFileSync(resumeSession, "");
+      const tool = registeredTools.find((entry) => entry.name === "subagent_resume");
+      try {
+        await assert.rejects(
+          tool.execute("call", { sessionPath: resumeSession, name: "Resume" }, undefined, undefined, {
+            cwd: dir,
+            sessionManager: {
+              getSessionFile() { return join(dir, "parent.jsonl"); },
+              getSessionId() { return "parent"; },
+              getSessionDir() { return dir; },
+            },
+          }),
+          /Command failed: herdr pane run/,
+        );
+        assert.deepEqual(readFileSync(closeLog, "utf8").trim().split("\n"), ["w1:p2"]);
+        assert.equal(runningMap.size, 0, "failed resume setup must not register a running child");
+      } finally {
+        eventHandlers.get("session_shutdown")![0]({}, {});
+        runningMap.clear();
+        restoreEnvVar("PI_TEST_HERDR_CLOSE_FAILURE", originalCloseFailure);
+        delete process.env.PI_TEST_HERDR_CLOSE_LOG;
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+
+  it("rolls back a registered resume pane exactly once when command delivery fails", async () => {
+    await assertRegisteredResumeRollbackOnCommandDeliveryFailure();
+  });
+
+  it("preserves the registered resume delivery error when pane rollback close fails", async () => {
+    await assertRegisteredResumeRollbackOnCommandDeliveryFailure(true);
+  });
+
   it("does not create terminal ownership artifacts when command delivery fails", async () => {
     await loadSidecarArbitration();
     await withFakeHerdr(async () => {
@@ -3028,6 +3091,40 @@ describe("subagent activity snapshots", () => {
       assert.equal(after.activity.phase, "active");
       assert.equal(after.activity.toolName, "bash");
       assert.equal(after.activity.updatedAt, before.activity.updatedAt);
+    });
+  });
+
+  it("keeps a real observed child active when only its heartbeat is fresh beyond 120 seconds", () => {
+    withTempDir((dir) => {
+      const childId = "heartbeat-observed-child";
+      const activityFile = getSubagentActivityFile(dir, childId);
+      mkdirSync(join(dir, "subagent-activity"), { recursive: true });
+      const running = {
+        id: childId,
+        cli: "pi",
+        activityFile,
+        statusState: createStatusState({ source: "pi", startTimeMs: 0 }),
+      };
+      writeFileSync(activityFile, `${JSON.stringify(validActivity({
+        runningChildId: childId,
+        updatedAt: 1_000,
+        heartbeatAt: 124_000,
+        sequence: 1,
+        latestEvent: "tool_execution_start",
+        phase: "active",
+        agentActive: true,
+        toolActive: true,
+        activeScope: "tool",
+        activeSince: 1_000,
+        toolName: "bash",
+      }))}\n`);
+
+      (subagentsModule as any).__test__.observeRunningSubagent(running, 125_000);
+
+      assert.equal(running.statusState.lastActivityAtMs, 1_000);
+      assert.equal(running.statusState.lastActivitySequence, 1);
+      assert.equal(running.statusState.lastHeartbeatAtMs, 124_000);
+      assert.equal(classifyStatus(running.statusState, 125_000).kind, "active");
     });
   });
 

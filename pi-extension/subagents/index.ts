@@ -1084,6 +1084,7 @@ function observeRunningSubagent(running: RunningSubagent, observedAt = Date.now(
     running.statusState = observeStatus(running.statusState, {
       snapshot: "present",
       updatedAt: read.activity.updatedAt,
+      heartbeatAt: read.activity.heartbeatAt,
       sequence: read.activity.sequence,
       phase: read.activity.phase,
       active: read.activity.phase === "active",
@@ -2192,7 +2193,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const sessionBoundaryBefore = getSessionBoundary(params.sessionPath);
 
         const surface = createSurface(name);
-        await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
+        return withOwnedLaunchSurface({
+          surface,
+          owned: true,
+          launch: async () => {
+            await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
 
         // Build pi resume command
         const parts = ["pi", "--session", shellEscape(params.sessionPath)];
@@ -2292,16 +2297,18 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           .then((outcome) => deliverResumeWatchOutcome(pi, running, outcome, sessionBoundaryBefore))
           .catch(() => safeUpdateWidget());
 
-        return {
-          content: [{ type: "text", text: `Session "${name}" resumed.` }],
-          details: {
-            id,
-            name,
-            sessionPath: params.sessionPath,
-            launchScriptFile,
-            status: "started",
+            return {
+              content: [{ type: "text", text: `Session "${name}" resumed.` }],
+              details: {
+                id,
+                name,
+                sessionPath: params.sessionPath,
+                launchScriptFile,
+                status: "started",
+              },
+            };
           },
-        };
+        });
       },
     });
 
