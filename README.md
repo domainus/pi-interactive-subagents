@@ -6,12 +6,12 @@ https://github.com/user-attachments/assets/30adb156-cfb4-4c47-84ca-dd4aa80cba9f
 
 ## How It Works
 
-Call `subagent()` and it **returns immediately**. The sub-agent runs in its own terminal pane. A live widget above the input shows all running agents with their current state — `starting`, `active`, `waiting`, `stalled`, or `running`. When a sub-agent finishes, its result is **steered back** into the main session as an async notification — triggering a new turn so the agent can process it.
+Call `subagent()` and it **returns immediately**. The sub-agent runs in its own terminal pane. A live widget above the input shows all running agents with their current state — `starting`, `active`, `waiting`, `stalled`, `broken`, or `running`. When a sub-agent finishes, its result is **steered back** into the main session as an async notification — triggering a new turn so the agent can process it.
 
 ```
 ╭─ Subagents ──────────────────────────── 2 running ─╮
 │ 00:23  Scout: Auth (scout)        active · bash 7m │
-│ 00:45  Scout: DB (scout)                waiting 2m │
+│ 00:45  Scout: DB (scout)       broken · pane unavailable │
 ╰────────────────────────────────────────────────────╯
 ```
 
@@ -118,7 +118,7 @@ Multiple subagents run concurrently — each steers its result back independentl
 ╭─ Subagents ───────────────────────────────── 3 running ─╮
 │ 01:23  Scout: Auth (scout)            active · write 7m │
 │ 00:45  Researcher (researcher)               stalled 4m │
-│ 00:12  Scout: DB (scout)                      starting… │
+│ 00:12  Scout: DB (scout)       broken · pane unavailable │
 ╰─────────────────────────────────────────────────────────╯
 ```
 
@@ -131,12 +131,15 @@ The widget tracks each Pi-backed sub-agent from a child-written runtime snapshot
 - `starting` — launched, but no valid child snapshot has been observed yet
 - `active` — the child is doing observed runtime work: agent turn, provider request, streaming, or tool execution
 - `waiting` — the child finished a turn and is intentionally open for more input or another stage
-- `stalled` — the parent has gone too long without a valid current child snapshot and can no longer trust the run is healthy
-- `running` — fallback for backends without child snapshots (e.g. Claude)
+- `stalled` — no valid child heartbeat has been observed for 60 seconds
+- `broken` — no valid child heartbeat has been observed for 120 seconds, or three consecutive pane probes were unreadable
+- `running` — elapsed-only fallback for Claude-backed runs, which do not provide child snapshots
 
-These labels are no longer derived from session-file growth. Session JSONL is still used for transcript, resume, lineage, and result extraction, but Pi-backed liveness now comes from a small activity snapshot written by the child extension. A fixed internal watchdog marks a run as `stalled` when valid snapshots never appear, stop being readable, or stop matching the current child; valid long-running `active` or `waiting` states do not become `stalled` just because time passes. When a run enters `stalled` or recovers from it, the parent agent receives a steer message so it can react. All other status transitions stay in the widget only.
+Pi-backed children write a heartbeat every five seconds. These labels are no longer derived from session-file growth: session JSONL remains the transcript, resume, lineage, and result source, while Pi-backed liveness comes from a small activity snapshot written by the child extension. Valid long-running `active` or `waiting` states do not become `stalled` merely because elapsed time passes. Claude-backed runs remain `running` based on elapsed time only; they do not use heartbeat or pane-probe health classification.
 
-**Interactive subagents stay silent.** Long-running user-driven subagents (e.g. an `/iterate` fork or an explicitly `interactive: true` spawn) do not wake the parent session on `stalled`/`recovered` transitions — the user is working directly in the subagent's pane, and a steer message there would just burn an orchestrator turn on a no-op "still waiting" ping. The widget still updates normally, and child snapshots are still recorded/classified regardless of the `interactive` setting. By default, agents with `auto-exit: true` are treated as autonomous and get stall pings; agents without it are treated as interactive and stay quiet. Override per-agent with `interactive: true|false` in frontmatter, or per-spawn with `interactive: true|false` on the tool call.
+When an autonomous run becomes `broken`, the parent safely claims its terminal record, aborts and closes the child pane, removes only its own running entry, and sends exactly one failure notification. Its session file is preserved; use the `Resume: pi --session …` guidance in that notification or call `subagent_resume` with the session path to continue it.
+
+**Interactive subagents are detected but not automatically cleaned up.** Long-running user-driven subagents (e.g. an `/iterate` fork or an explicitly `interactive: true` spawn) still update the widget and are classified normally, but the parent neither closes their pane nor sends autonomous failure cleanup. They also do not wake the parent session on `stalled`/`recovered` transitions — the user is working directly in the subagent's pane, and a steer message there would just burn an orchestrator turn on a no-op "still waiting" ping. By default, agents with `auto-exit: true` are treated as autonomous and get stall pings; agents without it are treated as interactive and stay quiet. Override per-agent with `interactive: true|false` in frontmatter, or per-spawn with `interactive: true|false` on the tool call.
 
 #### Configuration
 

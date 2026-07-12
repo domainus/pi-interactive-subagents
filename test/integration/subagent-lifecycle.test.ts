@@ -111,6 +111,9 @@ for (const backend of backends) {
 
     // ── In-progress activity snapshots ──
 
+    // Broken-pane remediation is unit-tested with injected probes because the
+    // integration harness does not own the dynamically created child surface ID.
+    // Parsing pane titles or creation order would make this lifecycle test flaky.
     it("keeps a long active tool call from surfacing false stalled status", async () => {
       const id = uniqueId();
       const startFile = `/tmp/pi-integ-status-start-${id}.txt`;
@@ -133,25 +136,37 @@ for (const backend of backends) {
       startPi(surface, env.dir, task);
 
       const activeScreen = await waitForScreen(surface, /active[\s\S]*bash|bash[\s\S]*active/i, PI_TIMEOUT, 300);
-      assert.doesNotMatch(activeScreen, /Subagent status[\s\S]*stalled|stalled[\s\S]*Subagent status/i);
+      assert.doesNotMatch(
+        activeScreen,
+        /Subagent status[\s\S]*(stalled|broken)|(stalled|broken)[\s\S]*Subagent status/i,
+      );
 
       await waitForFile(startFile, PI_TIMEOUT, /START_/);
       assert.equal(existsSync(markerFile), false, "Completion marker should not exist before the long sleep");
       await sleep(65_000);
       assert.equal(existsSync(markerFile), false, "Completion marker should not exist before the watchdog assertion");
       const watchdogScreen = readScreen(surface, 300);
-      assert.doesNotMatch(watchdogScreen, /Subagent status[\s\S]*stalled|stalled[\s\S]*Subagent status/i);
+      assert.doesNotMatch(
+        watchdogScreen,
+        /Subagent status[\s\S]*(stalled|broken)|(stalled|broken)[\s\S]*Subagent status/i,
+      );
 
       const content = await waitForFile(markerFile, PI_TIMEOUT, /STATUS_/);
       assert.ok(content.includes(`STATUS_${id}`), `Marker file should contain STATUS_${id}`);
 
       const completionScreen = await waitForScreen(
         surface,
-        /STATUS_TEST_DONE|completed|Sub-agent.*"Status-/i,
+        /✓[\s\S]*?—\s*completed/i,
         PI_TIMEOUT,
         300,
       );
-      assert.ok(/STATUS_TEST_DONE|completed/i.test(completionScreen));
+      const completionResults = completionScreen.match(/✓[\s\S]*?—\s*completed/gi) ?? [];
+      assert.equal(completionResults.length, 1, "Parent should receive one completion result");
+      assert.doesNotMatch(
+        completionScreen,
+        /Health:\s*(multiplexer pane became unavailable|child heartbeat stopped)/i,
+        "Parent must not receive a broken-runtime result",
+      );
     });
 
     // ── Parallel subagent spawn ──
