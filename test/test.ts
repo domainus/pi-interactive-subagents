@@ -48,6 +48,7 @@ import {
   formatStatusLine,
   formatTransitionLine,
   observeStatus,
+  observePaneProbe,
   loadStatusConfig,
   parseStatusConfig,
 } from "../pi-extension/subagents/status.ts";
@@ -578,21 +579,22 @@ describe("status.ts", () => {
     });
   });
 
-  it("keeps a missing snapshot as starting until the fixed watchdog threshold", () => {
+  it("keeps a missing snapshot as starting until the heartbeat watchdog threshold", () => {
     let state = createStatusState({ source: "pi", startTimeMs: 0 });
     state = observeStatus(state, { snapshot: "missing" }, 1_000);
 
-    assert.equal(classifyStatus(state, 60_999).kind, "starting");
-    const stalled = classifyStatus(state, 61_000);
+    assert.equal(classifyStatus(state, 59_999).kind, "starting");
+    const stalled = classifyStatus(state, 60_000);
     assert.equal(stalled.kind, "stalled");
-    assert.equal(stalled.statusLabel, null);
+    assert.equal(stalled.statusLabel, "heartbeat 1m ago");
   });
 
-  it("classifies active snapshots without aging into stalled", () => {
+  it("classifies active snapshots with fresh heartbeats without aging into stalled", () => {
     let state = createStatusState({ source: "pi", startTimeMs: 0 });
     state = observeStatus(state, {
       snapshot: "present",
       updatedAt: 5_000,
+      heartbeatAt: 239_000,
       sequence: 1,
       phase: "active",
       active: true,
@@ -608,11 +610,12 @@ describe("status.ts", () => {
     assert.equal(snapshot.activeDurationText, "3m");
   });
 
-  it("classifies waiting snapshots as healthy idle without becoming stalled", () => {
+  it("classifies waiting snapshots with fresh heartbeats as healthy idle", () => {
     let state = createStatusState({ source: "pi", startTimeMs: 0 });
     state = observeStatus(state, {
       snapshot: "present",
       updatedAt: 10_000,
+      heartbeatAt: 239_000,
       sequence: 1,
       phase: "waiting",
       waitingSince: 10_000,
@@ -845,7 +848,14 @@ describe("status.ts", () => {
   it("caps visible status lines and reports overflow consistently", () => {
     const waitingState = observeStatus(
       createStatusState({ source: "pi", startTimeMs: 0 }),
-      { snapshot: "present", updatedAt: 180_000, sequence: 1, phase: "waiting", waitingSince: 180_000 },
+      {
+        snapshot: "present",
+        updatedAt: 180_000,
+        heartbeatAt: 299_000,
+        sequence: 1,
+        phase: "waiting",
+        waitingSince: 180_000,
+      },
       180_000,
     );
     const activeState = observeStatus(
@@ -875,6 +885,111 @@ describe("status.ts", () => {
     assert.match(aggregate, /^Subagent status:/);
     assert.match(aggregate, /\+2 more running\./);
     assert.doesNotMatch(aggregate, /\/tmp|\.jsonl/);
+  });
+
+  it("uses fresh heartbeats to keep old semantic activity healthy", () => {
+    let state = createStatusState({ source: "pi", startTimeMs: 0 });
+    state = observeStatus(state, {
+      snapshot: "present",
+      updatedAt: 5_000,
+      heartbeatAt: 115_000,
+      sequence: 1,
+      phase: "active",
+      active: true,
+      activeScope: "tool",
+      activeSince: 5_000,
+      activityLabel: "bash",
+    }, 115_000);
+
+    const snapshot = classifyStatus(state, 125_000);
+    assert.equal(snapshot.kind, "active");
+    assert.equal(snapshot.heartbeatAgeMs, 10_000);
+    assert.equal(snapshot.heartbeatAgeText, "10s");
+  });
+
+  it("ages heartbeat through stalled and broken", () => {
+    let state = createStatusState({ source: "pi", startTimeMs: 0 });
+    state = observeStatus(state, {
+      snapshot: "present",
+      updatedAt: 1_000,
+      heartbeatAt: 1_000,
+      sequence: 1,
+      phase: "waiting",
+      waitingSince: 1_000,
+    }, 1_000);
+
+    assert.equal(classifyStatus(state, 60_999).kind, "waiting");
+    assert.equal(classifyStatus(state, 61_000).kind, "stalled");
+    assert.equal(classifyStatus(state, 121_000).kind, "broken");
+  });
+
+  it("confirms pane breakage after three consecutive failures and resets on success", () => {
+    let state = createStatusState({ source: "pi", startTimeMs: 0 });
+    state = observePaneProbe(state, { readable: false, error: "pane missing" }, 1_000);
+    state = observePaneProbe(state, { readable: false, error: "pane missing" }, 2_000);
+    assert.notEqual(classifyStatus(state, 2_000).kind, "broken");
+    state = observePaneProbe(state, { readable: true }, 3_000);
+    assert.equal(state.consecutivePaneFailures, 0);
+    state = observePaneProbe(state, { readable: false, error: "pane missing" }, 4_000);
+    state = observePaneProbe(state, { readable: false, error: "pane missing" }, 5_000);
+    state = observePaneProbe(state, { readable: false, error: "pane missing" }, 6_000);
+    assert.equal(classifyStatus(state, 6_000).kind, "broken");
+  });
+
+  it("reports stalled, broken, and recovered transitions for health changes", () => {
+    let state = createStatusState({ source: "pi", startTimeMs: 0 });
+    state = observeStatus(state, {
+      snapshot: "present",
+      updatedAt: 1_000,
+      heartbeatAt: 1_000,
+      sequence: 1,
+      phase: "waiting",
+      waitingSince: 1_000,
+    }, 1_000);
+
+    let advanced = advanceStatusState(state, 61_000);
+    assert.equal(advanced.transition, "stalled");
+    state = advanced.nextState;
+    advanced = advanceStatusState(state, 121_000);
+    assert.equal(advanced.transition, "broken");
+    state = observeStatus(advanced.nextState, {
+      snapshot: "present",
+      updatedAt: 122_000,
+      heartbeatAt: 122_000,
+      sequence: 2,
+      phase: "waiting",
+      waitingSince: 1_000,
+    }, 122_000);
+    advanced = advanceStatusState(state, 122_000);
+    assert.equal(advanced.transition, "recovered");
+    assert.equal(advanced.snapshot.kind, "waiting");
+  });
+
+  it("formats bounded broken pane health without leaking backend errors", () => {
+    let state = createStatusState({ source: "pi", startTimeMs: 0 });
+    for (let now = 1_000; now <= 3_000; now += 1_000) {
+      state = observePaneProbe(state, { readable: false, error: "/tmp/private\nbackend failure" }, now);
+    }
+
+    const snapshot = classifyStatus(state, 3_000);
+    const line = formatStatusLine(`Worker ${"very-long-name-".repeat(12)}`, snapshot);
+    const transition = formatTransitionLine("Worker", snapshot, "broken");
+    assert.equal(snapshot.kind, "broken");
+    assert.match(line, /broken \(pane unavailable\)/);
+    assert.match(transition, /broken \(pane unavailable\)/);
+    assert.doesNotMatch(line, /\/tmp|backend failure|\n/);
+    assert.ok(line.length <= 120, `expected bounded line length, got ${line.length}`);
+    assert.ok(transition.length <= 120, `expected bounded line length, got ${transition.length}`);
+  });
+
+  it("keeps the Claude fallback running despite stale health state", () => {
+    let state = createStatusState({ source: "claude", startTimeMs: 0 });
+    state = observePaneProbe(state, { readable: false, error: "pane missing" }, 1_000);
+    const snapshot = classifyStatus(state, 121_000);
+
+    assert.equal(snapshot.kind, "running");
+    assert.equal(snapshot.consecutivePaneFailures, 0);
+    assert.equal(snapshot.paneError, null);
   });
 });
 

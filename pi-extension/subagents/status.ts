@@ -3,6 +3,9 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const SNAPSHOT_STALLED_AFTER_MS = 60_000;
+export const HEARTBEAT_STALLED_AFTER_MS = 60_000;
+export const HEARTBEAT_BROKEN_AFTER_MS = 120_000;
+export const PANE_BROKEN_AFTER_FAILURES = 3;
 export const DEFAULT_STATUS_LINE_LIMIT = 4;
 export const MAX_STATUS_NAME_LENGTH = 72;
 export const MAX_STATUS_LINE_LENGTH = 120;
@@ -11,9 +14,9 @@ const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const DEFAULT_STATUS_CONFIG_PATH = join(PACKAGE_ROOT, "config.json");
 const STATUS_CONFIG_EXAMPLE_PATH = join(PACKAGE_ROOT, "config.json.example");
 
-export type SubagentStatusKind = "starting" | "active" | "waiting" | "stalled" | "running";
+export type SubagentStatusKind = "starting" | "active" | "waiting" | "stalled" | "broken" | "running";
 export type SubagentStatusSource = "pi" | "claude";
-export type SubagentStatusTransition = "stalled" | "recovered" | null;
+export type SubagentStatusTransition = "stalled" | "broken" | "recovered" | null;
 export type StatusSnapshotState = "unseen" | "present" | "missing" | "invalid" | "wrong-id";
 export type StatusActivityPhase = "starting" | "active" | "waiting" | "done";
 
@@ -26,6 +29,7 @@ export type StatusObservation =
   | {
       snapshot: "present";
       updatedAt: number;
+      heartbeatAt?: number;
       sequence: number;
       phase: StatusActivityPhase;
       active?: boolean;
@@ -40,11 +44,19 @@ export type StatusObservation =
       snapshotError?: string;
     };
 
+export type PaneProbeObservation =
+  | { readable: true }
+  | { readable: false; error?: string };
+
 export interface SubagentStatusState {
   source: SubagentStatusSource;
   startTimeMs: number;
   firstObservationAtMs: number | null;
   lastActivityAtMs: number | null;
+  lastHeartbeatAtMs: number | null;
+  consecutivePaneFailures: number;
+  paneProblemSinceMs: number | null;
+  paneError: string | null;
   lastActivitySequence: number | null;
   localOverrideAtMs: number | null;
   localOverrideSequence: number | null;
@@ -65,6 +77,10 @@ export interface StatusSnapshot {
   kind: SubagentStatusKind;
   elapsedMs: number;
   elapsedText: string;
+  heartbeatAgeMs: number;
+  heartbeatAgeText: string;
+  consecutivePaneFailures: number;
+  paneError: string | null;
   activeSinceMs: number | null;
   activeDurationText: string | null;
   activeScope: string | null;
@@ -208,6 +224,10 @@ export function createStatusState(params: {
     startTimeMs: params.startTimeMs,
     firstObservationAtMs: null,
     lastActivityAtMs: null,
+    lastHeartbeatAtMs: null,
+    consecutivePaneFailures: 0,
+    paneProblemSinceMs: null,
+    paneError: null,
     lastActivitySequence: null,
     localOverrideAtMs: null,
     localOverrideSequence: null,
@@ -243,6 +263,7 @@ export function observeStatus(
   }
 
   const updatedAt = observation.updatedAt;
+  const heartbeatAt = observation.heartbeatAt ?? updatedAt;
   const sequence = observation.sequence;
   const lastActivityAtMs = state.lastActivityAtMs;
   const lastActivitySequence = state.lastActivitySequence;
@@ -271,6 +292,7 @@ export function observeStatus(
     ...state,
     firstObservationAtMs: state.firstObservationAtMs ?? now,
     lastActivityAtMs: updatedAt,
+    lastHeartbeatAtMs: heartbeatAt,
     lastActivitySequence: sequence,
     activeNow,
     activeSinceMs,
@@ -287,6 +309,23 @@ export function observeStatus(
   };
 }
 
+export function observePaneProbe(
+  state: SubagentStatusState,
+  observation: PaneProbeObservation,
+  now: number,
+): SubagentStatusState {
+  if (state.source === "claude") return state;
+  if (observation.readable) {
+    return { ...state, consecutivePaneFailures: 0, paneProblemSinceMs: null, paneError: null };
+  }
+  return {
+    ...state,
+    consecutivePaneFailures: state.consecutivePaneFailures + 1,
+    paneProblemSinceMs: state.paneProblemSinceMs ?? now,
+    paneError: observation.error?.replace(/\s+/g, " ").trim().slice(0, 200) || null,
+  };
+}
+
 export function forceStatusAfterInterrupt(state: SubagentStatusState, now: number): SubagentStatusState {
   if (state.source === "claude") return state;
 
@@ -294,6 +333,7 @@ export function forceStatusAfterInterrupt(state: SubagentStatusState, now: numbe
     ...state,
     firstObservationAtMs: state.firstObservationAtMs ?? now,
     lastActivityAtMs: now,
+    lastHeartbeatAtMs: now,
     localOverrideAtMs: now,
     localOverrideSequence: state.lastActivitySequence,
     activeNow: false,
@@ -339,12 +379,19 @@ function classifyProblemState(state: SubagentStatusState, now: number): Pick<Sta
 export function classifyStatus(state: SubagentStatusState, now: number): StatusSnapshot {
   const elapsedMs = Math.max(0, now - state.startTimeMs);
   const elapsedText = formatElapsedDuration(elapsedMs);
+  const heartbeatReferenceMs = state.lastHeartbeatAtMs ?? state.lastActivityAtMs ?? state.startTimeMs;
+  const heartbeatAgeMs = Math.max(0, now - heartbeatReferenceMs);
+  const heartbeatAgeText = formatElapsedDuration(heartbeatAgeMs);
 
   if (state.source === "claude") {
     return {
       kind: "running",
       elapsedMs,
       elapsedText,
+      heartbeatAgeMs,
+      heartbeatAgeText,
+      consecutivePaneFailures: 0,
+      paneError: null,
       activeSinceMs: null,
       activeDurationText: null,
       activeScope: null,
@@ -362,7 +409,16 @@ export function classifyStatus(state: SubagentStatusState, now: number): StatusS
   let kind: SubagentStatusKind;
   let statusLabel: string | null = null;
 
-  if (state.snapshotState === "present") {
+  if (state.consecutivePaneFailures >= PANE_BROKEN_AFTER_FAILURES) {
+    kind = "broken";
+    statusLabel = "pane unavailable";
+  } else if (heartbeatAgeMs >= HEARTBEAT_BROKEN_AFTER_MS) {
+    kind = "broken";
+    statusLabel = `heartbeat ${heartbeatAgeText} ago`;
+  } else if (heartbeatAgeMs >= HEARTBEAT_STALLED_AFTER_MS) {
+    kind = "stalled";
+    statusLabel = `heartbeat ${heartbeatAgeText} ago`;
+  } else if (state.snapshotState === "present") {
     if (state.phase === "active" || state.activeNow) {
       kind = "active";
     } else if (state.phase === "waiting") {
@@ -396,6 +452,10 @@ export function classifyStatus(state: SubagentStatusState, now: number): StatusS
     kind,
     elapsedMs,
     elapsedText,
+    heartbeatAgeMs,
+    heartbeatAgeText,
+    consecutivePaneFailures: state.consecutivePaneFailures,
+    paneError: state.paneError,
     activeSinceMs: state.activeSinceMs,
     activeDurationText,
     activeScope: state.activeScope,
@@ -420,11 +480,14 @@ export function advanceStatusState(
 } {
   const snapshot = classifyStatus(state, now);
   const transition =
-    state.currentKind !== "stalled" && snapshot.kind === "stalled"
-      ? "stalled"
-      : state.currentKind === "stalled" && (snapshot.kind === "active" || snapshot.kind === "waiting")
-        ? "recovered"
-        : null;
+    state.currentKind !== "broken" && snapshot.kind === "broken"
+      ? "broken"
+      : state.currentKind !== "stalled" && snapshot.kind === "stalled"
+        ? "stalled"
+        : (state.currentKind === "stalled" || state.currentKind === "broken") &&
+            (snapshot.kind === "active" || snapshot.kind === "waiting")
+          ? "recovered"
+          : null;
 
   return {
     snapshot,
@@ -454,6 +517,11 @@ function formatStalledDetail(snapshot: StatusSnapshot): string {
   return `stalled${duration}${detail}`;
 }
 
+function formatBrokenDetail(snapshot: StatusSnapshot): string {
+  const detail = snapshot.statusLabel ? ` (${snapshot.statusLabel})` : "";
+  return `broken${detail}`;
+}
+
 export function formatStatusLine(name: string, snapshot: StatusSnapshot): string {
   const boundedName = normalizeStatusName(name);
 
@@ -477,6 +545,10 @@ export function formatStatusLine(name: string, snapshot: StatusSnapshot): string
         ? " (done)"
         : "";
     return boundStatusLine(`${boundedName} running ${snapshot.elapsedText}, ${formatWaitingDetail(snapshot)}${problem}.`);
+  }
+
+  if (snapshot.kind === "broken") {
+    return boundStatusLine(`${boundedName} running ${snapshot.elapsedText}, ${formatBrokenDetail(snapshot)}.`);
   }
 
   return boundStatusLine(`${boundedName} running ${snapshot.elapsedText}, ${formatStalledDetail(snapshot)}.`);
