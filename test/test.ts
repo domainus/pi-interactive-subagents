@@ -1951,6 +1951,55 @@ describe("subagent discovery", () => {
       }
     }
   });
+
+  it("subagents_list removes terminal controls from registered details and rendered alternatives", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+      const controls = "\x1b]52;c;dGVzdA==\x07\x1b]8;;https://example.test\x1b\\\x1b]8;;\x1b\\\x1bPpayload\x1b\\\u0000\u0001\u001f\x1b[31m";
+      writeAgentFile(
+        projectAgentsDir,
+        "listing-terminal-controls-agent",
+        `name: Project-${controls}agent\nmodel: provider/${controls}model\ndescription: description café 😀${controls}`,
+      );
+      const fallback = listingModel("oauth", "luna");
+      const registry = createListingRegistry([fallback], ["oauth/luna"], ["oauth/luna"]);
+      const { api, registeredTools } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+      const tool = registeredTools.find((entry) => entry.name === "subagents_list");
+      const result = await runRegisteredListing(tool, registry);
+      const agent = result.details.agents.find((entry: any) => entry.source === "project");
+      assert.ok(agent, "expected project agent in listing details");
+      // Listing content is newline-delimited; all other C0/C1 controls must be absent.
+      const assertNoTerminalControls = (value: string) => assert.doesNotMatch(value, /[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/);
+
+      assertNoTerminalControls(agent.name);
+      assert.equal(agent.name, "Project-agent");
+      assert.equal(agent.model, "provider/model");
+      assert.equal(agent.description, "description café 😀");
+      assertNoTerminalControls(result.content[0].text);
+      for (const value of [agent.name, agent.model, agent.description, agent.modelResolution.preferred]) {
+        assertNoTerminalControls(value);
+      }
+
+      const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+      const rendered = tool.renderResult({
+        content: [{ type: "text", text: "unused" }],
+        details: {
+          agents: [{
+            name: `Rendered${controls} agent`,
+            source: "project",
+            modelResolution: {
+              unavailable: true,
+              tier: "balanced",
+              error: `Error${controls} text`,
+              alternatives: [`first/${controls}alternative café 😀`],
+            },
+          }],
+        },
+      }, { expanded: false, isPartial: false }, theme).render(400).join("\n");
+      assert.match(rendered, /first\/alternative café 😀/);
+      assertNoTerminalControls(rendered);
+    });
+  });
 });
 describe("subagent-done.ts", () => {
   it("does not override Pi's built-in multiline-input shortcuts", () => {
