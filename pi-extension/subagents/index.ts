@@ -557,6 +557,101 @@ function launchModelDetails(model: ResolvedLaunchModel) {
   };
 }
 
+type ListingModelResolution =
+  | {
+      effective: string;
+      authType: "oauth" | "api-key";
+      tier: ModelTier;
+      source: ResolvedLaunchModel["source"];
+      preferred?: string;
+      fallbackReason?: ResolvedLaunchModel["fallbackReason"];
+    }
+  | {
+      unavailable: true;
+      tier: ModelTier;
+      error: string;
+      alternatives: string[];
+    }
+  | { authType: "external" };
+
+const LISTING_LINE_MAX_WIDTH = 360;
+const LISTING_ALTERNATIVE_LIMIT = 3;
+
+function listingModelResolution(
+  agent: ListedAgentDefinition,
+  registry: ModelRegistryLike,
+  availableModels: ReturnType<ModelRegistryLike["getAvailable"]>,
+  registryError?: string,
+): ListingModelResolution {
+  if (agent.cli === "claude") return { authType: "external" };
+
+  let tier: ModelTier;
+  try {
+    tier = resolveEffectiveModelTier({ name: agent.name, task: "", agent: agent.name }, agent);
+  } catch (error) {
+    return {
+      unavailable: true,
+      tier: agent.modelTier ?? "balanced",
+      error: error instanceof Error ? error.message : "Invalid subagent definition.",
+      alternatives: [],
+    };
+  }
+
+  if (registryError) {
+    return { unavailable: true, tier, error: registryError, alternatives: [] };
+  }
+
+  const resolution = resolveConfiguredModel({
+    registry,
+    tier,
+    preferredModel: agent.model,
+    availableModels,
+  });
+  if (!resolution.ok) {
+    return {
+      unavailable: true,
+      tier,
+      error: resolution.message,
+      alternatives: resolution.alternatives
+        .slice(0, LISTING_ALTERNATIVE_LIMIT)
+        .map(modelReferenceForDisplay),
+    };
+  }
+
+  return {
+    ...(resolution.value.source === "fallback" && resolution.value.preferredModel !== undefined
+      ? { preferred: modelReferenceForDisplay(resolution.value.preferredModel) }
+      : {}),
+    effective: modelReferenceForDisplay(resolution.value.effectiveModel),
+    authType: resolution.value.authType,
+    tier: resolution.value.tier,
+    source: resolution.value.source,
+    ...(resolution.value.fallbackReason === undefined
+      ? {}
+      : { fallbackReason: resolution.value.fallbackReason }),
+  };
+}
+
+function listingModelSummary(resolution: ListingModelResolution): string {
+  if (resolution.authType === "external") return "external auth";
+  if ("unavailable" in resolution) {
+    const alternatives = resolution.alternatives.length > 0
+      ? ` Alternatives: ${resolution.alternatives.join(", ")}.`
+      : "";
+    return `unavailable: ${resolution.error}${alternatives}`;
+  }
+
+  const auth = resolution.authType === "oauth" ? "OAuth" : "API key";
+  if (resolution.source === "fallback") {
+    return `fallback: ${resolution.effective} (${auth}, ${resolution.tier}; preferred unavailable)`;
+  }
+  return `configured: ${resolution.effective} (${auth}, ${resolution.tier})`;
+}
+
+function compactListingText(value: string | undefined, maxWidth = 120): string {
+  return truncateToWidth((value ?? "").replace(/\s+/g, " ").trim(), maxWidth);
+}
+
 function muxUnavailableResult() {
   return {
     content: [
@@ -2157,8 +2252,18 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         "Project-local agents override global ones with the same name.",
       parameters: Type.Object({}),
 
-      async execute() {
+      async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
         const list = discoverAgentDefinitions().filter((agent) => !agent.disableModelInvocation);
+        const registry = ctx.modelRegistry as ModelRegistryLike;
+        let availableModels: ReturnType<ModelRegistryLike["getAvailable"]> = [];
+        let registryError: string | undefined;
+        try {
+          // Take one auth snapshot for the entire listing so every annotation
+          // is coherent and resolver calls never re-query the registry.
+          availableModels = registry.getAvailable();
+        } catch {
+          registryError = "Unable to inspect configured Pi models. Check /login or provider configuration, then retry.";
+        }
 
         if (list.length === 0) {
           return {
@@ -2167,16 +2272,21 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         }
 
-        const lines = list.map((a) => {
-          const badge = a.source === "project" ? " (project)" : "";
-          const desc = a.description ? ` — ${a.description}` : "";
-          const model = a.model ? ` [${a.model}]` : "";
-          return `• ${a.name}${badge}${model}${desc}`;
+        const agents = list.map((agent) => ({
+          ...agent,
+          modelResolution: listingModelResolution(agent, registry, availableModels, registryError),
+        }));
+        const lines = agents.map((agent) => {
+          const badge = agent.source === "project" ? " (project)" : "";
+          const model = agent.model ? ` [${compactListingText(agent.model)}]` : "";
+          const desc = agent.description ? ` — ${compactListingText(agent.description)}` : "";
+          const annotation = ` [${listingModelSummary(agent.modelResolution)}]`;
+          return truncateToWidth(`• ${agent.name}${badge}${model}${desc}${annotation}`, LISTING_LINE_MAX_WIDTH);
         });
 
         return {
           content: [{ type: "text", text: lines.join("\n") }],
-          details: { agents: list },
+          details: { agents },
         };
       },
 
@@ -2188,9 +2298,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
         const lines = agents.map((a: any) => {
           const badge = a.source === "project" ? theme.fg("accent", " (project)") : "";
-          const desc = a.description ? theme.fg("dim", ` — ${a.description}`) : "";
-          const model = a.model ? theme.fg("dim", ` [${a.model}]`) : "";
-          return `  ${theme.fg("toolTitle", theme.bold(a.name))}${badge}${model}${desc}`;
+          const desc = a.description ? theme.fg("dim", ` — ${compactListingText(a.description)}`) : "";
+          const model = a.model ? theme.fg("dim", ` [${compactListingText(a.model)}]`) : "";
+          const annotation = a.modelResolution
+            ? theme.fg("dim", ` [${listingModelSummary(a.modelResolution)}]`)
+            : "";
+          return `  ${theme.fg("toolTitle", theme.bold(a.name))}${badge}${model}${desc}${annotation}`;
         });
         return new Text(lines.join("\n"), 0, 0);
       },

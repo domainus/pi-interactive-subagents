@@ -311,7 +311,8 @@ You are a specialized agent that does X...
 | ------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `name`        | string  | Agent name (used in `agent: "my-agent"`)                                                                                                                                                                                                                                    |
 | `description` | string  | Shown in `subagents_list` output                                                                                                                                                                                                                                            |
-| `model`       | string  | Default model (e.g. `openai-codex/gpt-5.6-sol`)                                                                                                                                                                                                                          |
+| `model`       | string  | Preferred default model (e.g. `openai-codex/gpt-5.6-sol`); Pi uses it when authenticated, otherwise chooses a configured fallback                                                                                                                                          |
+| `model-tier`  | string  | Role preference for configured fallback: `fast`, `balanced`, or `deep`; custom agents default to `balanced`                                                                                                                                                                |
 | `thinking`    | string  | Thinking level: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`                                                                                                                                                                                               |
 | `tools`       | string  | Comma-separated **native pi tools only**: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`                                                                                                                                                                             |
 | `skills`      | string  | Comma-separated skill names to auto-load                                                                                                                                                                                                                                    |
@@ -330,6 +331,18 @@ You are a specialized agent that does X...
 New Pi subagents use the tool-call `thinking` value first, then valid agent frontmatter, then Pi's inherited/configured default. Resumed sessions keep their persisted level unless `subagent_resume.thinking` is supplied. Pi may clamp higher levels to model capabilities. Pi thinking levels are not supported for Claude-backed custom agents.
 
 Discovery still resolves precedence before visibility filtering. If a project-local hidden agent has the same name as a visible global or bundled agent, the hidden project agent wins and the lower-precedence agent does not appear in `subagents_list`.
+
+### Configured model selection
+
+Pi-backed subagents resolve models from Pi's configured model registry immediately before launch. The registry is the source of truth for authenticated access: this extension does not inspect credentials, make provider network requests, or probe auth files.
+
+- A tool-call `model: "provider/model"` is an explicit override. It is strict: the model must be known to Pi **and** have configured authenticated access, or the launch returns an actionable error with up to three configured alternatives. It never silently substitutes an explicit model.
+- An agent's frontmatter `model` is a preferred default. If it is unavailable, Pi selects a configured fallback for the agent's `model-tier`; `fast`, `balanced`, and `deep` are the supported tiers, and custom agents without a tier use `balanced`.
+- Fallback selection is deterministic and role-aware, preferring configured OAuth/subscription access before API-key access, then the closest tier. Bundled defaults are: `scout` and `visual-tester` `fast`; `planner` and `worker` `balanced`; `reviewer`, `chatgpt-code`, and the hidden `claude-code` alias `deep`.
+- A Pi-backed launch with no configured model returns the `/login` or provider-API-key guidance **before** it creates a pane, artifact, or running-agent entry.
+- `subagents_list` takes one registry snapshot per listing and annotates each visible Pi-backed agent with its configured model, fallback, or safe unavailable status. Results label OAuth, API-key, and `external auth` separately; annotations use only bounded public model references and alternatives.
+
+Claude CLI agents are excluded from Pi model resolution: their launch uses Claude's own model/auth handling and their listing annotation reads `external auth`.
 
 ### `session-mode`
 

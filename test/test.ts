@@ -1592,7 +1592,9 @@ describe("subagent discovery", () => {
       const tool = registeredTools.find((tool) => tool.name === "subagents_list");
       assert.ok(tool, "expected subagents_list to be registered");
 
-      const result = await tool.execute();
+      const result = await tool.execute("call", {}, undefined, undefined, {
+        modelRegistry: createListingRegistry([], []),
+      });
       const agents = result.details?.agents ?? [];
 
       assert.ok(agents.some((agent: any) => agent.name === "visible-discovery-test-agent"));
@@ -1620,7 +1622,9 @@ describe("subagent discovery", () => {
       const tool = registeredTools.find((tool) => tool.name === "subagents_list");
       assert.ok(tool, "expected subagents_list to be registered");
 
-      const result = await tool.execute();
+      const result = await tool.execute("call", {}, undefined, undefined, {
+        modelRegistry: createListingRegistry([], []),
+      });
       const agents = result.details?.agents ?? [];
 
       assert.equal(agents.some((agent: any) => agent.name === "hidden-discovery-test-agent"), false);
@@ -1664,7 +1668,9 @@ describe("subagent discovery", () => {
       const tool = registeredTools.find((tool) => tool.name === "subagents_list");
       assert.ok(tool, "expected subagents_list to be registered");
 
-      const result = await tool.execute();
+      const result = await tool.execute("call", {}, undefined, undefined, {
+        modelRegistry: createListingRegistry([], []),
+      });
       const agents = result.details?.agents ?? [];
 
       assert.equal(agents.some((agent: any) => agent.name === "shadowed-discovery-test-agent"), false);
@@ -1675,6 +1681,171 @@ describe("subagent discovery", () => {
       assert.equal(loaded.model, "anthropic/test-project");
       assert.equal(loaded.body, "You are the project hidden agent.");
       assert.equal(loaded.disableModelInvocation, true);
+    });
+  });
+
+  function listingModel(provider: string, id: string, overrides: Record<string, unknown> = {}): Model<any> {
+    return {
+      provider,
+      id,
+      name: id,
+      api: "openai-completions",
+      baseUrl: "https://models.example.test",
+      reasoning: false,
+      input: ["text"],
+      cost: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 32_000,
+      maxTokens: 4_000,
+      headers: { authorization: "Bearer fake-listing-header-789" },
+      ...overrides,
+    } as Model<any>;
+  }
+
+  function createListingRegistry(
+    models: Model<any>[],
+    configured: string[],
+    oauth: string[] = [],
+  ): ModelRegistryLike & { calls: number; internals: Record<string, string> } {
+    const canonical = (provider: string, id: string) => `${provider.trim().toLowerCase()}/${id.trim().toLowerCase()}`;
+    const configuredSet = new Set(configured.map((reference) => reference.toLowerCase()));
+    const oauthSet = new Set(oauth.map((reference) => reference.toLowerCase()));
+    const registry = {
+      calls: 0,
+      internals: {
+        apiKey: "fake-listing-api-key-123",
+        token: "fake-listing-oauth-token-456",
+        authPath: "/private/listing-auth.json",
+      },
+      getAvailable() {
+        registry.calls++;
+        return models.filter((entry) => configuredSet.has(canonical(entry.provider, entry.id)));
+      },
+      find(provider: string, id: string) {
+        return models.find((entry) => canonical(entry.provider, entry.id) === canonical(provider, id));
+      },
+      hasConfiguredAuth(entry: Model<any>) {
+        return configuredSet.has(canonical(entry.provider, entry.id));
+      },
+      isUsingOAuth(entry: Model<any>) {
+        return oauthSet.has(canonical(entry.provider, entry.id));
+      },
+    };
+    return registry;
+  }
+
+  async function runRegisteredListing(tool: any, modelRegistry: ModelRegistryLike) {
+    return tool.execute("call", {}, undefined, undefined, { modelRegistry });
+  }
+
+  function listedAgent(result: any, name: string): any {
+    const agent = result.details?.agents?.find((entry: any) => entry.name === name);
+    assert.ok(agent, `expected ${name} in listing details`);
+    return agent;
+  }
+
+  it("subagents_list annotates configured preferred models and auth type through the registered tool", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+      writeAgentFile(projectAgentsDir, "listing-preferred-agent", "name: listing-preferred-agent\nmodel: Anthropic/preferred\nmodel-tier: deep");
+      writeAgentFile(projectAgentsDir, "listing-api-agent", "name: listing-api-agent\nmodel: openai/api-model");
+      const preferred = listingModel("Anthropic", "preferred", { reasoning: true });
+      const api = listingModel("openai", "api-model");
+      const registry = createListingRegistry([preferred, api], ["anthropic/preferred", "openai/api-model"], ["anthropic/preferred"]);
+      const { api: extensionApi, registeredTools } = createMockExtensionApi();
+      (subagentsModule as any).default(extensionApi);
+      const tool = registeredTools.find((entry) => entry.name === "subagents_list");
+      const result = await runRegisteredListing(tool, registry);
+
+      assert.equal(registry.calls, 1);
+      assert.deepEqual(listedAgent(result, "listing-preferred-agent").modelResolution, {
+        effective: "Anthropic/preferred", authType: "oauth", tier: "deep", source: "preferred",
+      });
+      assert.deepEqual(listedAgent(result, "listing-api-agent").modelResolution, {
+        effective: "openai/api-model", authType: "api-key", tier: "balanced", source: "preferred",
+      });
+      assert.match(result.content[0].text, /Anthropic\/preferred.*OAuth/);
+      assert.match(result.content[0].text, /openai\/api-model.*API key/);
+    });
+  });
+
+  it("subagents_list annotates unavailable preferred models with a deterministic fallback", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+      writeAgentFile(projectAgentsDir, "listing-fallback-agent", "name: listing-fallback-agent\nmodel: absent/preferred\nmodel-tier: deep");
+      const fallback = listingModel("oauth", "sol", { reasoning: true });
+      const registry = createListingRegistry([fallback], ["oauth/sol"], ["oauth/sol"]);
+      const { api, registeredTools } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+      const result = await runRegisteredListing(registeredTools.find((entry) => entry.name === "subagents_list"), registry);
+
+      assert.equal(registry.calls, 1);
+      assert.deepEqual(listedAgent(result, "listing-fallback-agent").modelResolution, {
+        preferred: "absent/preferred", effective: "oauth/sol", authType: "oauth", tier: "deep", source: "fallback", fallbackReason: "preferred-unknown",
+      });
+      assert.match(result.content[0].text, /fallback.*oauth\/sol.*preferred unavailable/i);
+    });
+  });
+
+  it("subagents_list retains agents with no configured Pi model and labels external auth", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+      writeAgentFile(projectAgentsDir, "listing-unavailable-agent", "name: listing-unavailable-agent\nmodel: absent/preferred");
+      writeAgentFile(projectAgentsDir, "listing-external-agent", "name: listing-external-agent\ncli: claude\nmodel: claude/terminal");
+      const registry = createListingRegistry([], []);
+      const { api, registeredTools } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+      const result = await runRegisteredListing(registeredTools.find((entry) => entry.name === "subagents_list"), registry);
+
+      assert.equal(registry.calls, 1);
+      const unavailable = listedAgent(result, "listing-unavailable-agent").modelResolution;
+      assert.deepEqual(unavailable, {
+        unavailable: true,
+        tier: "balanced",
+        error: "No authenticated Pi models are configured. Use /login or configure a provider API key, then retry.",
+        alternatives: [],
+      });
+      assert.ok(unavailable.alternatives.length <= 3);
+      assert.ok(unavailable.alternatives.every((value: string) => value.length <= 120));
+      assert.deepEqual(listedAgent(result, "listing-external-agent").modelResolution, { authType: "external" });
+      assert.match(result.content[0].text, /listing-unavailable-agent/);
+      assert.match(result.content[0].text, /No authenticated Pi models are configured/);
+      assert.match(result.content[0].text, /listing-external-agent.*external auth/i);
+    });
+  });
+
+  it("subagents_list model annotations use one registry snapshot and remain deterministic, bounded, and safe", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+      writeAgentFile(projectAgentsDir, "listing-bounds-agent", `name: listing-bounds-agent\nmodel: ${"p".repeat(180)}/${"m".repeat(180)}\ndescription: ${"d".repeat(600)}`);
+      const alpha = listingModel("alpha", "luna");
+      const beta = listingModel("beta", "luna");
+      const gamma = listingModel("gamma", "luna");
+      const delta = listingModel("delta", "luna");
+      const configured = ["alpha/luna", "beta/luna", "gamma/luna", "delta/luna"];
+      const forward = createListingRegistry([delta, beta, alpha, gamma], configured);
+      const reverse = createListingRegistry([gamma, alpha, beta, delta], configured);
+      const { api: firstApi, registeredTools: firstTools } = createMockExtensionApi();
+      (subagentsModule as any).default(firstApi);
+      const first = await runRegisteredListing(firstTools.find((entry) => entry.name === "subagents_list"), forward);
+      const { api: secondApi, registeredTools: secondTools } = createMockExtensionApi();
+      (subagentsModule as any).default(secondApi);
+      const second = await runRegisteredListing(secondTools.find((entry) => entry.name === "subagents_list"), reverse);
+      const firstAgent = listedAgent(first, "listing-bounds-agent");
+      const secondAgent = listedAgent(second, "listing-bounds-agent");
+
+      assert.equal(forward.calls, 1);
+      assert.equal(reverse.calls, 1);
+      assert.deepEqual(firstAgent.modelResolution, secondAgent.modelResolution);
+      assert.deepEqual(firstAgent.modelResolution, {
+        preferred: `${"p".repeat(180)}/${"m".repeat(180)}`.slice(0, 120),
+        effective: "alpha/luna",
+        authType: "api-key",
+        tier: "balanced",
+        source: "fallback",
+        fallbackReason: "preferred-unknown",
+      });
+      assert.ok(firstAgent.modelResolution.preferred.length <= 120);
+      assert.ok(first.content[0].text.split("\n").find((line: string) => line.includes("listing-bounds-agent"))!.length <= 360);
+      assert.ok(first.content[0].text.split("\n").every((line: string) => line.length <= 360));
+      for (const secret of ["fake-listing-api-key-123", "fake-listing-oauth-token-456", "fake-listing-header-789", "/private/listing-auth.json"]) {
+        assert.doesNotMatch(JSON.stringify([first.content, first.details]), new RegExp(secret.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+      }
     });
   });
 });
