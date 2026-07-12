@@ -1275,6 +1275,24 @@ function resolveResumeLaunchBehavior(params: { autoExit?: boolean }): { autoExit
   return { autoExit, interactive: !autoExit };
 }
 
+async function withOwnedLaunchSurface<T>(params: {
+  surface: string;
+  owned: boolean;
+  close?: (surface: string) => void;
+  launch: () => Promise<T> | T;
+}): Promise<T> {
+  try {
+    return await params.launch();
+  } catch (error) {
+    if (params.owned) {
+      try {
+        (params.close ?? closeSurface)(params.surface);
+      } catch {}
+    }
+    throw error;
+  }
+}
+
 export const __test__ = {
   borderLine,
   THINKING_LEVELS,
@@ -1298,6 +1316,7 @@ export const __test__ = {
   handleSubagentInterrupt,
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
+  withOwnedLaunchSurface,
   activatePollAbortOwner,
   getOwnedModuleAbortSignal,
   abortPollAbortOwner,
@@ -1378,11 +1397,15 @@ async function launchSubagent(
   // For new surfaces, pause briefly so the shell is ready before sending the command.
   const surfacePreCreated = !!options?.surface;
   const surface = options?.surface ?? createSurface(params.name);
-  if (!surfacePreCreated) {
-    await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
-  }
+  return withOwnedLaunchSurface({
+    surface,
+    owned: !surfacePreCreated,
+    launch: async () => {
+      if (!surfacePreCreated) {
+        await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
+      }
 
-  const launchBehavior = resolveLaunchBehavior(params, agentDefs);
+      const launchBehavior = resolveLaunchBehavior(params, agentDefs);
 
   if (launchBehavior.seededSessionMode) {
     seedSubagentSessionFile({
@@ -1625,8 +1648,10 @@ async function launchSubagent(
     }),
   };
 
-  runningSubagents.set(id, running);
-  return running;
+      runningSubagents.set(id, running);
+      return running;
+    },
+  });
 }
 
 /**

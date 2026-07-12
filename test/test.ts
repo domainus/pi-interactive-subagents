@@ -1231,6 +1231,51 @@ describe("subagent discovery", () => {
     assert.ok(thinkingResolution < surfaceCreation, "thinking must be resolved before surface creation");
   });
 
+  it("closes a locally owned pane when launch setup fails", async () => {
+    const closed: string[] = [];
+    await assert.rejects(
+      () => testApi.withOwnedLaunchSurface({
+        surface: "pane-1",
+        owned: true,
+        close: (surface: string) => closed.push(surface),
+        launch: async () => { throw new Error("seed failed"); },
+      }),
+      /seed failed/,
+    );
+    assert.deepEqual(closed, ["pane-1"]);
+  });
+
+  it("does not close a caller-owned pre-created pane", async () => {
+    const closed: string[] = [];
+    await assert.rejects(
+      () => testApi.withOwnedLaunchSurface({
+        surface: "pane-2",
+        owned: false,
+        close: (surface: string) => closed.push(surface),
+        launch: async () => { throw new Error("send failed"); },
+      }),
+      /send failed/,
+    );
+    assert.deepEqual(closed, []);
+  });
+
+  it("preserves the original error when owned pane rollback close fails", async () => {
+    let closeAttempts = 0;
+    await assert.rejects(
+      () => testApi.withOwnedLaunchSurface({
+        surface: "pane-3",
+        owned: true,
+        close: () => {
+          closeAttempts++;
+          throw new Error("close failed");
+        },
+        launch: async () => { throw new Error("artifact failed"); },
+      }),
+      /artifact failed/,
+    );
+    assert.equal(closeAttempts, 1);
+  });
+
   it("loads session-mode from frontmatter", async () => {
     await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
       writeAgentFile(
