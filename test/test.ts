@@ -1158,6 +1158,66 @@ describe("subagent discovery", () => {
     return (schema.anyOf ?? []).map((entry: any) => entry.const);
   }
 
+  it("bundles autonomous Sol/high literary agents with role-specific permissions", async () => {
+    await withIsolatedAgentEnv(async () => {
+      const expected = {
+        translator: "read, write, edit",
+        "translator-reviewer": "read",
+        editor: "read, write, edit",
+      };
+
+      const bundled = testApi.discoverAgentDefinitions()
+        .filter((definition: any) => definition.source === "package");
+      const visible = new Set(
+        bundled
+          .filter((definition: any) => !definition.disableModelInvocation)
+          .map((definition: any) => definition.name),
+      );
+
+      for (const [name, tools] of Object.entries(expected)) {
+        const defaults = testApi.loadAgentDefaults(name);
+        assert.ok(defaults, `expected bundled ${name}`);
+        assert.equal(defaults.model, "openai-codex/gpt-5.6-sol");
+        assert.equal(defaults.modelTier, "deep");
+        assert.equal(defaults.thinking, "high");
+        assert.equal(defaults.tools, tools);
+        assert.equal(defaults.spawning, false);
+        assert.equal(defaults.autoExit, true);
+        assert.equal(defaults.systemPromptMode, "append");
+        assert.equal(
+          testApi.resolveEffectiveInteractive({ name, task: "" }, defaults),
+          false,
+        );
+        assert.ok(visible.has(name), `${name} should be publicly discoverable`);
+      }
+    });
+  });
+
+  it("keeps literary role instructions separated by responsibility", () => {
+    const agentsDir = join(fileURLToPath(new URL("..", import.meta.url)), "agents");
+    const translator = readFileSync(join(agentsDir, "translator.md"), "utf8");
+    const reviewer = readFileSync(join(agentsDir, "translator-reviewer.md"), "utf8");
+    const editor = readFileSync(join(agentsDir, "editor.md"), "utf8");
+
+    assert.match(translator, /source language.*English/is);
+    assert.match(translator, /voice.*tone.*register/is);
+    assert.match(translator, /ambigu/i);
+    assert.match(translator, /must not silently.*(embellish|simplify)/is);
+    assert.match(translator, /translator(?:'s)? note/i);
+
+    assert.match(reviewer, /compare.*source.*English translation/is);
+    assert.match(reviewer, /Critical.*Important.*Minor/is);
+    assert.match(reviewer, /omission|addition/i);
+    assert.match(reviewer, /optional stylistic/i);
+    assert.match(reviewer, /do not modify files/i);
+
+    assert.match(editor, /publication-quality/is);
+    assert.match(editor, /grammar.*spelling.*punctuation/is);
+    assert.match(editor, /typography|formatting/i);
+    assert.match(editor, /preserv.*authorial.*voice/is);
+    assert.match(editor, /translator reviewer.*fidelity/is);
+  });
+
   it("exposes all Pi reasoning levels on subagent", () => {
     const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);
@@ -4966,7 +5026,7 @@ describe("configured launch model", () => {
 
   it("model-tier assigns every bundled agent its approved role tier", async () => {
     await withIsolatedAgentEnv(async () => {
-      const expected = { scout: "fast", "visual-tester": "fast", planner: "balanced", worker: "balanced", reviewer: "deep", "chatgpt-code": "deep", "claude-code": "deep" };
+      const expected = { scout: "fast", "visual-tester": "fast", planner: "balanced", worker: "balanced", reviewer: "deep", "chatgpt-code": "deep", "claude-code": "deep", translator: "deep", "translator-reviewer": "deep", editor: "deep" };
       for (const [name, tier] of Object.entries(expected)) {
         assert.equal(testApi.loadAgentDefaults(name)?.modelTier, tier, `${name} must declare ${tier}`);
       }
