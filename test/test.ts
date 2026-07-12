@@ -1832,21 +1832,124 @@ describe("subagent discovery", () => {
       assert.equal(forward.calls, 1);
       assert.equal(reverse.calls, 1);
       assert.deepEqual(firstAgent.modelResolution, secondAgent.modelResolution);
-      assert.deepEqual(firstAgent.modelResolution, {
-        preferred: `${"p".repeat(180)}/${"m".repeat(180)}`.slice(0, 120),
+      const { preferred, ...fallbackResolution } = firstAgent.modelResolution;
+      assert.deepEqual(fallbackResolution, {
         effective: "alpha/luna",
         authType: "api-key",
         tier: "balanced",
         source: "fallback",
         fallbackReason: "preferred-unknown",
       });
-      assert.ok(firstAgent.modelResolution.preferred.length <= 120);
+      assert.ok(visibleWidth(preferred) <= 120);
       assert.ok(first.content[0].text.split("\n").find((line: string) => line.includes("listing-bounds-agent"))!.length <= 360);
       assert.ok(first.content[0].text.split("\n").every((line: string) => line.length <= 360));
       for (const secret of ["fake-listing-api-key-123", "fake-listing-oauth-token-456", "fake-listing-header-789", "/private/listing-auth.json"]) {
         assert.doesNotMatch(JSON.stringify([first.content, first.details]), new RegExp(secret.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
       }
     });
+  });
+
+  it("subagents_list projects bounded secret-safe agent details through the registered tool", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+      const longModel = `${"provider".repeat(30)}/${"model".repeat(30)}fake-listing-details-model-secret`;
+      const longDescription = `${"description ".repeat(40)}fake-listing-details-description-secret`;
+      const body = `${"body ".repeat(60)}fake-listing-details-body-secret`;
+      writeAgentFile(
+        projectAgentsDir,
+        "listing-safe-details-agent",
+        `name: listing-safe-details-agent\nmodel: ${longModel}\ndescription: ${longDescription}`,
+        body,
+      );
+      const fallback = listingModel("oauth", "luna");
+      const registry = createListingRegistry([fallback], ["oauth/luna"], ["oauth/luna"]);
+      const { api, registeredTools } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+      const result = await runRegisteredListing(registeredTools.find((entry) => entry.name === "subagents_list"), registry);
+      const agent = listedAgent(result, "listing-safe-details-agent");
+
+      assert.deepEqual(Object.keys(agent).sort(), ["description", "model", "modelResolution", "name", "source"]);
+      assert.ok(visibleWidth(agent.name) <= 120);
+      assert.ok(visibleWidth(agent.model) <= 120);
+      assert.ok(visibleWidth(agent.description) <= 120);
+      assert.doesNotMatch(agent.model, /\x1b\[/);
+      assert.doesNotMatch(agent.description, /\x1b\[/);
+      const rendered = JSON.stringify([result.content, result.details]);
+      for (const secret of [
+        "fake-listing-details-model-secret",
+        "fake-listing-details-description-secret",
+        "fake-listing-details-body-secret",
+      ]) {
+        assert.doesNotMatch(rendered, new RegExp(secret.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+      }
+    });
+  });
+
+  it("subagents_list reports the launch invalid-tier error before external auth classification", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+      writeAgentFile(
+        projectAgentsDir,
+        "listing-external-invalid-tier-agent",
+        "name: listing-external-invalid-tier-agent\ncli: claude\nmodel-tier: sideways",
+      );
+      const registry = createListingRegistry([], []);
+      const { api, registeredTools } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+      const result = await runRegisteredListing(registeredTools.find((entry) => entry.name === "subagents_list"), registry);
+      const agent = listedAgent(result, "listing-external-invalid-tier-agent");
+
+      assert.deepEqual(agent.modelResolution, {
+        unavailable: true,
+        tier: "balanced",
+        error: 'Invalid model tier "sideways" in agent definition "listing-external-invalid-tier-agent"',
+        alternatives: [],
+      });
+      assert.doesNotMatch(result.content[0].text, /external auth/i);
+      assert.match(result.content[0].text, /Invalid model tier "sideways"/);
+    });
+  });
+
+  it("subagents_list renders bounded unavailable diagnostics and alternatives at every width", () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const tool = registeredTools.find((entry) => entry.name === "subagents_list");
+    const fakeSecret = "fake-listing-render-secret";
+    const result = {
+      content: [{ type: "text", text: "unused" }],
+      details: {
+        agents: [{
+          name: "unavailable-render",
+          source: "project",
+          model: "provider/model",
+          description: "Unavailable model diagnostics",
+          modelResolution: {
+            unavailable: true,
+            tier: "balanced",
+            error: `${"diagnostic ".repeat(80)}${fakeSecret}`,
+            alternatives: [
+              `first/${"alternative".repeat(80)}${fakeSecret}`,
+              `second/${"alternative".repeat(80)}${fakeSecret}`,
+              `third/${"alternative".repeat(80)}${fakeSecret}`,
+              `fourth/${"alternative".repeat(80)}${fakeSecret}`,
+            ],
+          },
+        }],
+      },
+    };
+    const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+    const rendered = tool.renderResult(result, { expanded: false, isPartial: false }, theme);
+    const wideOutput = rendered.render(1_000).join("\n");
+    assert.match(wideOutput, /Alternatives: first\//);
+    assert.doesNotMatch(wideOutput, /fourth\//);
+
+    for (const width of [8, 24, 80]) {
+      for (const line of rendered.render(width)) {
+        assert.ok(
+          visibleWidth(line) <= width,
+          `expected line width <= ${width}, got ${visibleWidth(line)} for ${JSON.stringify(line)}`,
+        );
+        assert.doesNotMatch(line, new RegExp(fakeSecret));
+      }
+    }
   });
 });
 describe("subagent-done.ts", () => {

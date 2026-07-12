@@ -575,7 +575,34 @@ type ListingModelResolution =
   | { authType: "external" };
 
 const LISTING_LINE_MAX_WIDTH = 360;
+const LISTING_FIELD_MAX_WIDTH = 120;
+const ANSI_ESCAPE_SEQUENCE = /\x1B\[[0-?]*[ -/]*[@-~]/g;
+const LISTING_DIAGNOSTIC_MAX_WIDTH = 180;
 const LISTING_ALTERNATIVE_LIMIT = 3;
+
+type ListedAgentDetails = {
+  name: string;
+  source: AgentSource;
+  description?: string;
+  model?: string;
+  modelResolution: ListingModelResolution;
+};
+
+function compactListingText(value: unknown, maxWidth = LISTING_FIELD_MAX_WIDTH): string {
+  const plain = typeof value === "string"
+    ? value.replace(ANSI_ESCAPE_SEQUENCE, "").replace(/\s+/g, " ").trim()
+    : "";
+  return truncateToWidth(plain, maxWidth).replace(ANSI_ESCAPE_SEQUENCE, "");
+}
+
+function boundedListingAlternatives(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value
+      .filter((alternative): alternative is string => typeof alternative === "string")
+      .slice(0, LISTING_ALTERNATIVE_LIMIT)
+      .map((alternative) => compactListingText(alternative))
+    : [];
+}
 
 function listingModelResolution(
   agent: ListedAgentDefinition,
@@ -583,8 +610,6 @@ function listingModelResolution(
   availableModels: ReturnType<ModelRegistryLike["getAvailable"]>,
   registryError?: string,
 ): ListingModelResolution {
-  if (agent.cli === "claude") return { authType: "external" };
-
   let tier: ModelTier;
   try {
     tier = resolveEffectiveModelTier({ name: agent.name, task: "", agent: agent.name }, agent);
@@ -592,13 +617,25 @@ function listingModelResolution(
     return {
       unavailable: true,
       tier: agent.modelTier ?? "balanced",
-      error: error instanceof Error ? error.message : "Invalid subagent definition.",
+      error: compactListingText(
+        error instanceof Error ? error.message : "Invalid subagent definition.",
+        LISTING_DIAGNOSTIC_MAX_WIDTH,
+      ),
       alternatives: [],
     };
   }
 
+  // Validate tiers before classifying external auth so listing agrees with the
+  // launch path, which rejects malformed frontmatter before invoking Claude.
+  if (agent.cli === "claude") return { authType: "external" };
+
   if (registryError) {
-    return { unavailable: true, tier, error: registryError, alternatives: [] };
+    return {
+      unavailable: true,
+      tier,
+      error: compactListingText(registryError, LISTING_DIAGNOSTIC_MAX_WIDTH),
+      alternatives: [],
+    };
   }
 
   const resolution = resolveConfiguredModel({
@@ -611,18 +648,16 @@ function listingModelResolution(
     return {
       unavailable: true,
       tier,
-      error: resolution.message,
-      alternatives: resolution.alternatives
-        .slice(0, LISTING_ALTERNATIVE_LIMIT)
-        .map(modelReferenceForDisplay),
+      error: compactListingText(resolution.message, LISTING_DIAGNOSTIC_MAX_WIDTH),
+      alternatives: boundedListingAlternatives(resolution.alternatives),
     };
   }
 
   return {
     ...(resolution.value.source === "fallback" && resolution.value.preferredModel !== undefined
-      ? { preferred: modelReferenceForDisplay(resolution.value.preferredModel) }
+      ? { preferred: compactListingText(resolution.value.preferredModel) }
       : {}),
-    effective: modelReferenceForDisplay(resolution.value.effectiveModel),
+    effective: compactListingText(resolution.value.effectiveModel),
     authType: resolution.value.authType,
     tier: resolution.value.tier,
     source: resolution.value.source,
@@ -632,24 +667,37 @@ function listingModelResolution(
   };
 }
 
-function listingModelSummary(resolution: ListingModelResolution): string {
-  if (resolution.authType === "external") return "external auth";
-  if ("unavailable" in resolution) {
-    const alternatives = resolution.alternatives.length > 0
-      ? ` Alternatives: ${resolution.alternatives.join(", ")}.`
-      : "";
-    return `unavailable: ${resolution.error}${alternatives}`;
-  }
-
-  const auth = resolution.authType === "oauth" ? "OAuth" : "API key";
-  if (resolution.source === "fallback") {
-    return `fallback: ${resolution.effective} (${auth}, ${resolution.tier}; preferred unavailable)`;
-  }
-  return `configured: ${resolution.effective} (${auth}, ${resolution.tier})`;
+function projectListedAgentDetails(
+  agent: ListedAgentDefinition,
+  modelResolution: ListingModelResolution,
+): ListedAgentDetails {
+  return {
+    name: compactListingText(agent.name),
+    source: agent.source,
+    ...(agent.description ? { description: compactListingText(agent.description) } : {}),
+    ...(agent.model ? { model: compactListingText(agent.model) } : {}),
+    modelResolution,
+  };
 }
 
-function compactListingText(value: string | undefined, maxWidth = 120): string {
-  return truncateToWidth((value ?? "").replace(/\s+/g, " ").trim(), maxWidth);
+function listingModelSummary(resolution: ListingModelResolution | unknown): string {
+  const value = resolution as Partial<ListingModelResolution> | null;
+  if (value?.authType === "external") return "external auth";
+  if (value && "unavailable" in value && value.unavailable === true) {
+    const alternatives = boundedListingAlternatives(value.alternatives);
+    const alternativeText = alternatives.length > 0
+      ? ` Alternatives: ${alternatives.join(", ")}.`
+      : "";
+    return `unavailable: ${compactListingText(value.error, LISTING_DIAGNOSTIC_MAX_WIDTH)}${alternativeText}`;
+  }
+
+  const auth = value?.authType === "oauth" ? "OAuth" : "API key";
+  const tier = value?.tier === "fast" || value?.tier === "deep" ? value.tier : "balanced";
+  const effective = compactListingText(value?.effective);
+  if (value?.source === "fallback") {
+    return `fallback: ${effective} (${auth}, ${tier}; preferred unavailable)`;
+  }
+  return `configured: ${effective} (${auth}, ${tier})`;
 }
 
 function muxUnavailableResult() {
@@ -2272,14 +2320,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         }
 
-        const agents = list.map((agent) => ({
-          ...agent,
-          modelResolution: listingModelResolution(agent, registry, availableModels, registryError),
-        }));
+        const agents = list.map((agent) => projectListedAgentDetails(
+          agent,
+          listingModelResolution(agent, registry, availableModels, registryError),
+        ));
         const lines = agents.map((agent) => {
           const badge = agent.source === "project" ? " (project)" : "";
-          const model = agent.model ? ` [${compactListingText(agent.model)}]` : "";
-          const desc = agent.description ? ` — ${compactListingText(agent.description)}` : "";
+          const model = agent.model ? ` [${agent.model}]` : "";
+          const desc = agent.description ? ` — ${agent.description}` : "";
           const annotation = ` [${listingModelSummary(agent.modelResolution)}]`;
           return truncateToWidth(`• ${agent.name}${badge}${model}${desc}${annotation}`, LISTING_LINE_MAX_WIDTH);
         });
@@ -2297,13 +2345,17 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           return new Text(theme.fg("dim", "No subagent definitions found."), 0, 0);
         }
         const lines = agents.map((a: any) => {
+          const name = compactListingText(a.name);
           const badge = a.source === "project" ? theme.fg("accent", " (project)") : "";
           const desc = a.description ? theme.fg("dim", ` — ${compactListingText(a.description)}`) : "";
           const model = a.model ? theme.fg("dim", ` [${compactListingText(a.model)}]`) : "";
           const annotation = a.modelResolution
             ? theme.fg("dim", ` [${listingModelSummary(a.modelResolution)}]`)
             : "";
-          return `  ${theme.fg("toolTitle", theme.bold(a.name))}${badge}${model}${desc}${annotation}`;
+          return truncateToWidth(
+            `  ${theme.fg("toolTitle", theme.bold(name))}${badge}${model}${desc}${annotation}`,
+            LISTING_LINE_MAX_WIDTH,
+          );
         });
         return new Text(lines.join("\n"), 0, 0);
       },
