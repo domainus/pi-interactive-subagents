@@ -4,6 +4,7 @@ import {
   linkSync,
   openSync,
   readFileSync,
+  statSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -14,6 +15,7 @@ import type { PollResult } from "./cmux.ts";
 const GENERATION_ID = /^[a-f0-9]{8}$/i;
 const MAX_RECORD_TEXT = 200;
 const MAX_STOP_REASON_TEXT = 80;
+export const MAX_TERMINAL_RECORD_BYTES = 16 * 1024;
 
 export type ChildTerminalInput =
   | { type: "done" }
@@ -59,6 +61,7 @@ export interface TerminalFilesystem {
   closeSync(fd: number): void;
   linkSync(existingPath: string, newPath: string): void;
   unlinkSync(path: string): void;
+  statSync(path: string): { size: number };
   readFileSync(path: string, encoding?: string): string | Buffer;
 }
 
@@ -69,6 +72,7 @@ const nodeFilesystem: TerminalFilesystem = {
   closeSync,
   linkSync,
   unlinkSync,
+  statSync,
   readFileSync,
 };
 
@@ -223,6 +227,20 @@ export function readGenerationTerminal(
     finalFile = getGenerationExitFile(sessionFile, runningChildId);
   } catch (error) {
     return { kind: "invalid", error: boundedError(error) };
+  }
+
+  let size: number;
+  try {
+    size = fs.statSync(finalFile).size;
+  } catch (error) {
+    if (isErrno(error, "ENOENT")) return { kind: "missing" };
+    return { kind: "error", error: boundedError(error) };
+  }
+  if (!Number.isFinite(size) || size < 0) {
+    return { kind: "invalid", error: "terminal record has an invalid file size" };
+  }
+  if (size > MAX_TERMINAL_RECORD_BYTES) {
+    return { kind: "invalid", error: `terminal record exceeds ${MAX_TERMINAL_RECORD_BYTES} byte limit` };
   }
 
   let text: string | Buffer;

@@ -661,6 +661,18 @@ function boundDiagnostic(value: unknown): string {
   return raw.replace(/\s+/g, " ").trim().slice(0, 200) || "unknown diagnostic";
 }
 
+/** Report a permanent-record problem once until its bounded detail changes. */
+function reportTerminalRecordProblem(running: RunningSubagent, error: unknown): void {
+  const diagnostic = boundDiagnostic(error);
+  if (running.terminalRecordError === diagnostic) return;
+  running.terminalRecordError = diagnostic;
+  try {
+    console.warn(`Subagent terminal record problem: ${diagnostic}`);
+  } catch {
+    // Polling/supervision must continue even when diagnostic output fails.
+  }
+}
+
 function buildBrokenSubagentResult(running: RunningSubagent, snapshot: StatusSnapshot): SubagentResult {
   const reason = snapshot.statusLabel === "pane unavailable"
     ? "multiplexer pane became unavailable"
@@ -1296,6 +1308,7 @@ export const __test__ = {
   createCompletionPollOptions,
   claimTerminal,
   deleteRunningIdentitySafe,
+  reportTerminalRecordProblem,
   buildBrokenSubagentResult,
   remediateBrokenSubagent,
   deliverSpawnWatchOutcome,
@@ -1655,7 +1668,7 @@ function createCompletionPollOptions(running: RunningSubagent) {
       running.statusState = observePaneProbe(running.statusState, observation, Date.now());
     },
     onTerminalRecordProblem(error: string) {
-      running.terminalRecordError = boundDiagnostic(error);
+      reportTerminalRecordProblem(running, error);
     },
   };
 }

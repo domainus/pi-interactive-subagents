@@ -165,12 +165,13 @@ function errno(message: string, code: string) {
 
 /**
  * Deterministic filesystem boundary for atomic terminal-record tests. It keeps
- * open descriptors private until close so linkSync can prove publication only
- * happens after the full write/fsync/close sequence.
+ * temp inode existence faithfully from exclusive open through caller-owned
+ * unlink, while linkSync still rejects an unclosed descriptor.
  */
 function createTerminalFilesystem() {
   const files = new Map<string, string>();
   const descriptors = new Map<number, { path: string; content: string; synced: boolean }>();
+  const closedTempPaths = new Set<string>();
   const calls: string[] = [];
   let nextFd = 10;
   let writeFailure: Error | undefined;
@@ -183,6 +184,8 @@ function createTerminalFilesystem() {
       calls.push(`open:${path}:${flags}:${mode.toString(8)}`);
       if (files.has(path)) throw errno("temporary exists", "EEXIST");
       const fd = nextFd++;
+      files.set(path, "");
+      closedTempPaths.delete(path);
       descriptors.set(fd, { path, content: "", synced: false });
       return fd;
     },
@@ -192,6 +195,7 @@ function createTerminalFilesystem() {
       const descriptor = descriptors.get(fd);
       if (!descriptor) throw new Error("write to closed descriptor");
       descriptor.content = content;
+      files.set(descriptor.path, content);
     },
     fsyncSync(fd: number) {
       calls.push(`fsync:${fd}`);
@@ -204,13 +208,15 @@ function createTerminalFilesystem() {
       calls.push(`close:${fd}`);
       const descriptor = descriptors.get(fd);
       if (!descriptor) throw new Error("close unknown descriptor");
-      if (!descriptor.synced) throw new Error("closed before fsync");
-      files.set(descriptor.path, descriptor.content);
+      closedTempPaths.add(descriptor.path);
       descriptors.delete(fd);
     },
     linkSync(source: string, destination: string) {
       calls.push(`link:${source}:${destination}`);
       if (linkFailure) throw linkFailure;
+      if (Array.from(descriptors.values()).some((descriptor) => descriptor.path === source) || !closedTempPaths.has(source)) {
+        throw new Error("link before close");
+      }
       if (files.has(destination)) throw errno("winner exists", "EEXIST");
       const content = files.get(source);
       if (content === undefined) throw errno("source missing", "ENOENT");
@@ -219,6 +225,13 @@ function createTerminalFilesystem() {
     unlinkSync(path: string) {
       calls.push(`unlink:${path}`);
       files.delete(path);
+      closedTempPaths.delete(path);
+    },
+    statSync(path: string) {
+      calls.push(`stat:${path}`);
+      const content = files.get(path);
+      if (content === undefined) throw errno("record missing", "ENOENT");
+      return { size: Buffer.byteLength(content) };
     },
     readFileSync(path: string) {
       calls.push(`read:${path}`);
@@ -2157,6 +2170,9 @@ describe("generation-scoped atomic terminal records", () => {
       assert.match(outcome.error, new RegExp(`${failure} failure`));
       assert.equal(boundary.files.has(finalFile), false, failure);
       assert.equal(boundary.calls.some((call) => call === `unlink:${finalFile}`), false, failure);
+      const tempUnlinks = boundary.calls.filter((call) => call.startsWith("unlink:/sessions/.subagent-terminal-"));
+      assert.equal(tempUnlinks.length, 1, `${failure} must clean the caller-owned temp`);
+      assert.equal(boundary.files.size, 0, `${failure} cleanup must leave no temp or final record`);
     }
   });
 
@@ -2223,6 +2239,20 @@ describe("generation-scoped atomic terminal records", () => {
     const unreadable = arbitration.readGenerationTerminal(session, childId, readBoundary.fs);
     assert.equal(unreadable.kind, "error");
     assert.ok(unreadable.error.length <= 200);
+  });
+
+  it("rejects oversized final records before synchronous read or JSON parsing", async () => {
+    const arbitration = await loadSidecarArbitration();
+    const boundary = createTerminalFilesystem();
+    const finalFile = arbitration.getGenerationExitFile(session, childId);
+    boundary.files.set(finalFile, "x".repeat(16 * 1024 + 1));
+
+    const result = arbitration.readGenerationTerminal(session, childId, boundary.fs);
+
+    assert.equal(result.kind, "invalid");
+    assert.ok(result.error.length <= 200);
+    assert.equal(boundary.calls.some((call) => call.startsWith("read:")), false);
+    assert.equal(boundary.calls.filter((call) => call === `stat:${finalFile}`).length, 1);
   });
 
   it("keeps permanent records for duplicate watcher reads and isolates poller generations", async () => {
@@ -2745,6 +2775,53 @@ describe("terminal claim and autonomous remediation", () => {
 });
 
 describe("subagent health completion wiring", () => {
+  it("reports each unchanged invalid or read-error terminal record once through the real poll callback", async () => {
+    const arbitration = await loadSidecarArbitration();
+    const testApi = (subagentsModule as any).__test__;
+    const poll = (cmuxModule as any).__pollForExitTest__.pollForExitWithReadScreen;
+    const originalWarn = console.warn;
+
+    try {
+      await withTempDirAsync(async (dir) => {
+        for (const kind of ["invalid", "read-error"] as const) {
+          const sessionFile = join(dir, `${kind}.jsonl`);
+          const childId = kind === "invalid" ? "a1b2c3d4" : "b1b2c3d4";
+          const finalFile = arbitration.getGenerationExitFile(sessionFile, childId);
+          if (kind === "invalid") writeFileSync(finalFile, "{ malformed");
+          else mkdirSync(finalFile);
+
+          const running = {
+            id: childId,
+            cli: "pi",
+            sessionFile,
+            statusState: createStatusState({ source: "pi", startTimeMs: 0 }),
+          };
+          const options = testApi.createCompletionPollOptions(running);
+          const controller = new AbortController();
+          let ticks = 0;
+          options.interval = 0;
+          options.onTick = () => {
+            ticks++;
+            if (ticks === 2) controller.abort();
+          };
+          const warnings: string[] = [];
+          console.warn = (...args: unknown[]) => warnings.push(args.join(" "));
+
+          await assert.rejects(
+            poll("pane-1", controller.signal, options, async () => ""),
+            /Aborted/,
+          );
+
+          assert.equal(warnings.length, 1, `${kind} must not spam an unchanged diagnostic`);
+          assert.match(warnings[0], /terminal record/i);
+          assert.ok((running as any).terminalRecordError.length <= 200);
+        }
+      });
+    } finally {
+      console.warn = originalWarn;
+    }
+  });
+
   it("records a numeric failure timestamp through completion poll options", () => {
     const testApi = (subagentsModule as any).__test__;
     const running = {
