@@ -18,6 +18,7 @@ import type { Model } from "@mariozechner/pi-ai";
 import { createHostPolicyArtifact } from "../pi-extension/subagents/workflow/capabilities.ts";
 import { cleanupWorkflowPolicySecret, guardWorkflowToolPath, loadWorkflowPolicyTransport, verifyWorkflowActiveTools, verifyWorkflowChildPolicy, writeWorkflowPolicyTransport } from "../pi-extension/subagents/workflow/child-policy.ts";
 import { formatWorkflowStatus, workflowStatusDetails } from "../pi-extension/subagents/workflow/status.ts";
+import { registerWorkflowUI, WORKFLOW_CONFIRMATION_OPERATIONS } from "../pi-extension/subagents/workflow/ui.ts";
 
 import {
   getLeafId,
@@ -5309,6 +5310,77 @@ describe("configured launch model", () => {
 });
 
 describe("workflow UI registration", () => {
+  it("keeps interactive confirmation only for final apply", () => {
+    assert.deepEqual([...WORKFLOW_CONFIRMATION_OPERATIONS], ["apply"]);
+    const source = readFileSync(new URL("../pi-extension/subagents/workflow/ui.ts", import.meta.url), "utf8");
+    assert.equal(source.match(/ctx\.ui\.confirm\(/g)?.length, 1);
+    assert.match(source, /confirmApply\(ctx,/);
+    assert.doesNotMatch(source, /Plan mutating build workflow|Run mutating build workflow|Resume mutating build workflow/);
+  });
+  it("prompts only final apply across tools and slash commands and rejects pre-aborted side effects", async () => {
+    const { api, registeredTools, registeredCommands } = createMockExtensionApi();
+    const calls: string[] = [];
+    let confirmations = 0;
+    const metadata = { version: 1 as const, runId: "run", workflowId: "wf", sessionId: "session", cwd: "/tmp/repo", worktreeRoot: "/tmp/worktrees", workflowIntegrity: "a".repeat(64), template: "build" as const, status: "pending" as const, updatedAt: 1 };
+    const host = {
+      plan: (_input: any) => { calls.push("plan"); return { metadata, workflow: { nodes: [{ id: "task" }] } }; },
+      run: (_id: string, confirmed: boolean) => { calls.push(`run:${confirmed}`); return Promise.resolve({ state: { status: "completed" } }); },
+      resume: (_id: string, confirmed: boolean) => { calls.push(`resume:${confirmed}`); return Promise.resolve({ state: { status: "completed" } }); },
+      statusSnapshot: () => ({ metadata }),
+      previewApproval: () => ({ workflowId: "wf", nodeId: "task", attempt: 1, evidenceDigest: "b".repeat(64), changedFiles: ["file.ts"], changedFileCount: 1, gateDigests: [] }),
+      approve: (_workflowId: string, _nodeId: string, _attempt: number, confirmed: boolean) => { calls.push(`approve:${confirmed}`); return { token: "c".repeat(64), workflowId: "wf", nodeId: "task", attempt: 1, evidenceDigest: "b".repeat(64), changedFiles: ["file.ts"], changedFileCount: 1, gateDigests: [] }; },
+      previewApply: () => ({ workflowId: "wf", nodeId: "task", attempt: 1, token: "c".repeat(64), evidenceDigest: "b".repeat(64) }),
+      apply: (_workflowId: string, _nodeId: string, _token: string, confirmed: boolean) => { calls.push(`apply:${confirmed}`); return { workflowId: "wf", nodeId: "task", attempt: 1, applied: true as const }; },
+      cancel: async () => {},
+      shutdown: async () => {},
+    };
+    registerWorkflowUI(api as any, { owner: Symbol("test"), launcher: () => ({}) as any, moduleSignal: new AbortController().signal, hostFactory: () => host as any });
+    const ctx = {
+      cwd: "/tmp/repo", modelRegistry: {}, hasUI: false,
+      sessionManager: { getSessionId: () => "session", getSessionDir: () => "/tmp/session" },
+      ui: { confirm: async () => { confirmations++; return true; }, notify() {}, setWidget() {} },
+    } as any;
+    const tool = (name: string) => registeredTools.find((entry) => entry.name === name)!;
+    await tool("workflow_plan").execute("1", { workflowId: "wf", template: "build", generated: { objective: "x", nodes: [{ id: "task", objective: "x" }] } }, undefined, undefined, ctx);
+    await tool("workflow_run").execute("2", { workflowId: "wf" }, undefined, undefined, ctx);
+    await tool("workflow_resume").execute("3", { workflowId: "wf" }, undefined, undefined, ctx);
+    await tool("workflow_approve").execute("4", { workflowId: "wf", nodeId: "task", attempt: 1 }, undefined, undefined, ctx);
+    const acceptedApply = await tool("workflow_apply").execute("5", { workflowId: "wf", nodeId: "task", token: "c".repeat(64) }, undefined, undefined, ctx);
+    assert.equal(acceptedApply.details?.error, undefined, JSON.stringify(acceptedApply));
+    assert.equal(confirmations, 1);
+    assert.deepEqual(calls, ["plan", "run:true", "resume:true", "approve:true", "apply:true"]);
+
+    const aborted = new AbortController(); aborted.abort();
+    for (const [name, args] of [
+      ["workflow_plan", { workflowId: "wf", template: "build", generated: {} }],
+      ["workflow_run", { workflowId: "wf" }],
+      ["workflow_resume", { workflowId: "wf" }],
+      ["workflow_approve", { workflowId: "wf", nodeId: "task", attempt: 1 }],
+    ] as const) {
+      const result = await tool(name).execute("aborted", args, aborted.signal, undefined, ctx);
+      assert.equal(result.details?.error, true, name);
+    }
+    assert.equal(confirmations, 1);
+    assert.deepEqual(calls, ["plan", "run:true", "resume:true", "approve:true", "apply:true"]);
+
+    ctx.ui.confirm = async () => { confirmations++; return false; };
+    await tool("workflow_apply").execute("rejected", { workflowId: "wf", nodeId: "task", token: "c".repeat(64) }, undefined, undefined, ctx);
+    const applyAbort = new AbortController();
+    ctx.ui.confirm = async () => { confirmations++; applyAbort.abort(); return true; };
+    await tool("workflow_apply").execute("aborted-apply", { workflowId: "wf", nodeId: "task", token: "c".repeat(64) }, applyAbort.signal, undefined, ctx);
+    assert.equal(confirmations, 3);
+    assert.deepEqual(calls, ["plan", "run:true", "resume:true", "approve:true", "apply:true"]);
+
+    ctx.ui.confirm = async () => { confirmations++; return true; };
+    const command = (name: string) => registeredCommands.find((entry) => entry.name === name)!;
+    await command("workflow-plan").handler(JSON.stringify({ workflowId: "wf", template: "build", generated: { objective: "x", nodes: [{ id: "task", objective: "x" }] } }), ctx);
+    await command("workflow-run").handler("wf", ctx);
+    await command("workflow-resume").handler("wf", ctx);
+    await command("workflow-approve").handler(JSON.stringify({ workflowId: "wf", nodeId: "task", attempt: 1 }), ctx);
+    await command("workflow-apply").handler(JSON.stringify({ workflowId: "wf", nodeId: "task", token: "c".repeat(64) }), ctx);
+    assert.equal(confirmations, 4);
+    assert.deepEqual(calls.slice(-5), ["plan", "run:true", "resume:true", "approve:true", "apply:true"]);
+  });
   it("registers workflow tools, commands, and renderers without replacing legacy surfaces", () => {
     const { api, registeredTools, registeredCommands, registeredMessageRenderers } = createMockExtensionApi();
     subagentsModule.default(api as any);

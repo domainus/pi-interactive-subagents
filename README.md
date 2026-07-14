@@ -52,7 +52,7 @@ The seven strict host tools are:
 | Tool | Purpose |
 | --- | --- |
 | `workflow_plan` | Validate JSON and persist a host-compiled plan |
-| `workflow_run` | Start a detached run; mutating builds require confirmation |
+| `workflow_run` | Start a detached run without an interaction prompt |
 | `workflow_status` | Read durable run metadata and bounded aggregate node-state counts |
 | `workflow_cancel` | Request cancellation and persist the outcome |
 | `workflow_resume` | Reload a persisted run after interruption/restart |
@@ -70,9 +70,9 @@ workflow_approve({ workflowId: "build-auth", nodeId: "implement", attempt: 1 });
 workflow_apply({ workflowId: "build-auth", nodeId: "implement", token: "<64-hex token returned by workflow_approve>" });
 ```
 
-`workflow_cancel` and `workflow_resume` each take `{ workflowId }`. Build plan/run/resume, approval issuance, and apply open explicit confirmation prompts.
+`workflow_cancel` and `workflow_resume` each take `{ workflowId }`. Plan, run, resume, and approval issuance use the trusted global workflow UI as standing authorization and do not open interaction prompts. Final apply alone opens an explicit confirmation prompt.
 
-Matching slash commands are `/workflow-plan`, `/workflow-run`, `/workflow-status`, `/workflow-cancel`, `/workflow-resume`, `/workflow-approve`, and `/workflow-apply`. `/workflow-plan` accepts the full JSON object, run/status/cancel/resume accept a workflow ID, and approve/apply accept their JSON argument objects. Runs are detached from the chat turn: completion is delivered as a terminal `workflow_result` message and durable state remains available through status/reload. Every mutating node receives host-generated result-schema, dependency-success, and diff-scope gates bound to its exact attempt evidence. Approval tokens are HMAC-authenticated, evidence/gate/path scoped, time bounded, and consumed by apply. There is no automatic apply, commit, worktree cleanup, or retry beyond the configured bounds. The operator explicitly confirms planning/running/resuming mutating builds, approval issuance, and apply.
+Matching slash commands are `/workflow-plan`, `/workflow-run`, `/workflow-status`, `/workflow-cancel`, `/workflow-resume`, `/workflow-approve`, and `/workflow-apply`. `/workflow-plan` accepts the full JSON object, run/status/cancel/resume accept a workflow ID, and approve/apply accept their JSON argument objects. Runs are detached from the chat turn: completion is delivered as a terminal `workflow_result` message and durable state remains available through status/reload. Every mutating node receives host-generated result-schema, dependency-success, and diff-scope gates bound to its exact attempt evidence. Approval tokens are HMAC-authenticated, evidence/gate/path scoped, time bounded, and consumed by apply. There is no automatic apply, commit, worktree cleanup, or retry beyond the configured bounds. The trusted global workflow UI provides standing authorization for plan/run/resume and approval issuance; the operator explicitly confirms final apply only.
 
 Workflow artifacts live under `<sessionDir>/artifacts/<session-id>/workflow/<workflow-id>/`. Build worktrees are external and durable. Set absolute `PI_WORKFLOW_WORKTREE_ROOT` to choose a trusted host root; otherwise hashed worktrees live beneath `~/.pi/agent/workflow-worktrees`. Set `PI_WORKFLOW_APPROVAL_SECRET` to provide a stable secret of at least 32 bytes; otherwise a private `0600` key is created beneath `~/.pi/agent/workflow-secrets/`. Worktree status and diffs are bounded sidecar artifacts, while workflow state stores evidence digests and provenance. Explicit resume reloads verified metadata, state, gates, artifacts, and approval journals; ambiguous, stale, corrupt, or forged records fail closed and require operator action.
 
