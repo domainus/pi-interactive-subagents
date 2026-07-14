@@ -1,8 +1,8 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdtempSync, readdirSync, writeFileSync, readFileSync, mkdirSync, rmSync } from "node:fs";
-import { join } from "node:path";
-import { tmpdir } from "node:os";
+import { chmodSync, existsSync, mkdtempSync, readdirSync, writeFileSync, readFileSync, mkdirSync, rmSync, realpathSync, statSync, symlinkSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { homedir, tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { visibleWidth } from "@mariozechner/pi-tui";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
@@ -15,6 +15,9 @@ import {
   type ModelRegistryLike,
 } from "../pi-extension/subagents/model-selection.ts";
 import type { Model } from "@mariozechner/pi-ai";
+import { createHostPolicyArtifact } from "../pi-extension/subagents/workflow/capabilities.ts";
+import { cleanupWorkflowPolicySecret, guardWorkflowToolPath, loadWorkflowPolicyTransport, verifyWorkflowActiveTools, verifyWorkflowChildPolicy, writeWorkflowPolicyTransport } from "../pi-extension/subagents/workflow/child-policy.ts";
+import { formatWorkflowStatus, workflowStatusDetails } from "../pi-extension/subagents/workflow/status.ts";
 
 import {
   getLeafId,
@@ -5271,5 +5274,52 @@ describe("configured launch model", () => {
         assertNoSecret([result.content, result.details, rendered, readFileSync(result.details.launchScriptFile, "utf8")]);
       });
     });
+  });
+
+  it("workflow child policy verifies exact identity/tools and cleans its separate secret transport", () => {
+    withTempDir((directory) => {
+      const cwd = realpathSync(directory);
+      const secret = Buffer.alloc(32, 9);
+      const node = { version: 1 as const, id: "node", kernel: "readonly" as const, objective: "inspect", expertise: [], capabilities: ["read-files"], mode: "read-only" as const, requiresWorktree: false };
+      const artifact = createHostPolicyArtifact({ workflow: { id: "workflow", capabilities: ["read-files"] }, node, attempt: 1, cwd, hostApprovedCapabilities: ["read-files"], nativeAllowlist: ["read"], signingSecret: secret });
+      const transport = writeWorkflowPolicyTransport({ root: cwd, artifact, secret, identity: { workflowId: "workflow", nodeId: "node", attempt: 1, cwd, allowedTools: ["read"] } });
+      assert.equal((statSync(transport.artifactPath).mode & 0o777).toString(8), "600");
+      assert.equal(verifyWorkflowChildPolicy(artifact, secret, { workflowId: "workflow", nodeId: "node", attempt: 1, cwd, allowedTools: ["read"] }, ["read", "write"]).ok, false);
+      assert.equal(verifyWorkflowChildPolicy({ ...artifact, cwd: resolve(cwd, "wrong") }, secret, { workflowId: "workflow", nodeId: "node", attempt: 1, cwd, allowedTools: ["read"] }).ok, false);
+      const loaded = loadWorkflowPolicyTransport(transport, ["read"]); assert.equal(loaded.ok, true); if (!loaded.ok) throw new Error("expected verified policy"); cleanupWorkflowPolicySecret(transport.secretPath, loaded.secret); assert.equal(loaded.secret.every((byte) => byte === 0), true);
+      cleanupWorkflowPolicySecret(undefined, secret); assert.equal(secret.every((byte) => byte === 0), true); assert.equal(existsSync(transport.secretPath), false);
+    });
+  });
+
+  it("workflow child config root ignores repository-controlled .pi agent data", () => {
+    withTempDir((directory) => { const trusted = join(directory, "trusted-agent"); const worktree = join(directory, "worktree"); mkdirSync(trusted); mkdirSync(join(worktree, ".pi", "agent"), { recursive: true }); writeFileSync(join(worktree, ".pi", "agent", "models.json"), JSON.stringify({ malicious: true })); const previous = process.env.PI_CODING_AGENT_DIR; process.env.PI_CODING_AGENT_DIR = trusted; try { assert.equal(testApi.getTrustedWorkflowAgentDir(), resolve(trusted)); assert.notEqual(testApi.getTrustedWorkflowAgentDir(), join(worktree, ".pi", "agent")); process.env.PI_CODING_AGENT_DIR = "~/.pi/agent"; assert.equal(testApi.getTrustedWorkflowAgentDir(), resolve(join(homedir(), ".pi", "agent"))); } finally { restoreEnvVar("PI_CODING_AGENT_DIR", previous); } });
+  });
+
+  it("workflow child guard rejects parent, sibling-worktree, symlink, denied, and spoofed-tool escapes", () => {
+    withTempDir((directory) => {
+      const managerRoot = realpathSync(directory); const cwd = join(managerRoot, "owned"); const sibling = join(managerRoot, "sibling"); mkdirSync(cwd); mkdirSync(sibling); writeFileSync(join(cwd, "inside.txt"), "ok"); writeFileSync(join(sibling, "foreign.txt"), "no"); const outside = join(resolve(managerRoot, ".."), `outside-${Date.now()}.txt`); writeFileSync(outside, "outside"); symlinkSync(outside, join(cwd, "escape-link"));
+      try { const policy = { cwd: realpathSync(cwd), worktreeRoot: managerRoot, allowGlobs: ["**"], denyGlobs: ["package-lock.json", "**/package-lock.json"] };
+        assert.equal(guardWorkflowToolPath("read", { path: "inside.txt" }, policy).ok, true); assert.equal(guardWorkflowToolPath("write", { path: "new/nested.txt" }, policy).ok, true); assert.equal(guardWorkflowToolPath("ls", {}, policy).ok, true);
+        for (const path of [outside, join(sibling, "foreign.txt"), join(cwd, "escape-link")]) assert.equal(guardWorkflowToolPath("read", { path }, policy).ok, false, path);
+        assert.equal(guardWorkflowToolPath("write", { path: outside }, policy).ok, false); assert.equal(guardWorkflowToolPath("write", { path: "package-lock.json" }, policy).ok, false); assert.equal(guardWorkflowToolPath("read", { path: "missing.txt" }, policy).ok, false);
+        assert.equal(verifyWorkflowActiveTools([{ name: "read", sourceInfo: { source: "builtin", path: "<builtin:read>" } }], ["read"]).ok, true); assert.equal(verifyWorkflowActiveTools([{ name: "read", sourceInfo: { source: "extension", path: "evil.ts" } }], ["read"]).ok, false); assert.equal(verifyWorkflowActiveTools([{ name: "read", sourceInfo: { source: "builtin", path: "<builtin:read>" } }, { name: "bash", sourceInfo: { source: "builtin", path: "<builtin:bash>" } }], ["read"]).ok, false);
+      } finally { rmSync(outside, { force: true }); }
+    });
+  });
+});
+
+describe("workflow UI registration", () => {
+  it("registers workflow tools, commands, and renderers without replacing legacy surfaces", () => {
+    const { api, registeredTools, registeredCommands, registeredMessageRenderers } = createMockExtensionApi();
+    subagentsModule.default(api as any);
+    const tools = new Set(registeredTools.map((entry) => entry.name));
+    for (const name of ["subagent", "subagent_resume", "subagents_list", "workflow_plan", "workflow_run", "workflow_status", "workflow_cancel", "workflow_resume", "workflow_approve", "workflow_apply"]) assert.equal(tools.has(name), true, name);
+    const commands = new Set(registeredCommands.map((entry) => entry.name));
+    for (const name of ["workflow-plan", "workflow-run", "workflow-status", "workflow-cancel", "workflow-resume", "workflow-approve", "workflow-apply"]) assert.equal(commands.has(name), true, name);
+    const renderers = new Set(registeredMessageRenderers.map((entry) => entry.name)); assert.equal(renderers.has("workflow_result"), true); assert.equal(renderers.has("workflow_status"), true); assert.equal(renderers.has("subagent_result"), true);
+  });
+  it("bounds status text and exposes aggregate counts only", () => {
+    const metadata = { version: 1 as const, runId: "r12345678", workflowId: "wf", sessionId: "s", cwd: "/tmp", workflowIntegrity: "a".repeat(64), template: "research" as const, status: "running" as const, startedAt: 1, updatedAt: 1 };
+    const snapshot = { metadata, nodes: { a: "running" as const, b: "succeeded" as const } }; assert.ok(formatWorkflowStatus(snapshot, 24).length <= 24); const details = workflowStatusDetails(snapshot); assert.deepEqual(details.nodeCounts, { total: 2, running: 1, succeeded: 1 }); assert.equal("a" in details.nodeCounts, false);
   });
 });

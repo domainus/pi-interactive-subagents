@@ -7,6 +7,9 @@ export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 export type KernelName = "readonly" | "builder" | "validator" | "adjudicator" | "interactive";
 export type NodeStatus = "pending" | "running" | "retrying" | "succeeded" | "failed" | "blocked" | "cancelled";
 export type WorkflowStatus = "pending" | "running" | "paused" | "retrying" | "gated" | "completed" | "succeeded" | "failed" | "cancelled" | "recovered";
+/** Durable run lifecycle. This deliberately does not include adapter-specific states. */
+export type WorkflowRunStatus = "pending" | "running" | "cancelling" | "cancelled" | "completed" | "failed" | "recovered";
+export type WorkflowRunTemplate = "research" | "build" | "review";
 export type GateKind = "result-schema" | "dependency-success" | "diff-scope" | "command";
 export type NodeMode = "read-only" | "mutating";
 
@@ -56,6 +59,22 @@ export interface WorkflowSpec {
   readonly nodes: readonly TaskNode[];
   readonly bounds?: WorkflowBounds;
   readonly policy?: WorkflowPolicy;
+}
+/** Host-owned durable identity and lifecycle for one workflow execution. No handles, secrets, or adapter state belong here. */
+export interface WorkflowRunMetadata {
+  readonly version: typeof WORKFLOW_VERSION;
+  readonly runId: string;
+  readonly workflowId: string;
+  readonly sessionId: string;
+  readonly cwd: string;
+  /** Required for the mutating build template; read-only templates may omit it. */
+  readonly worktreeRoot?: string;
+  readonly workflowIntegrity: string;
+  readonly template: WorkflowRunTemplate;
+  readonly status: WorkflowRunStatus;
+  readonly startedAt?: number;
+  readonly updatedAt?: number;
+  readonly finishedAt?: number;
 }
 export interface AgentResultEnvelope { readonly version: typeof WORKFLOW_VERSION; readonly status: "succeeded" | "failed" | "blocked"; readonly output?: unknown; readonly error?: string | null; readonly retryable?: boolean; }
 export interface HostPolicyArtifact {

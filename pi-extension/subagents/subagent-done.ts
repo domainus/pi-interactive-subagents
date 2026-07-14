@@ -6,8 +6,10 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Box, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
+import { realpathSync } from "node:fs";
 import { createSubagentActivityRecorder, type SubagentActivityRecorder } from "./activity.ts";
 import { publishGenerationTerminal, type ChildTerminalInput } from "./sidecar-arbitration.ts";
+import { cleanupWorkflowPolicySecret, guardWorkflowToolPath, loadWorkflowPolicyTransport, verifyWorkflowActiveTools, workflowPolicyIdentityFromEnv, WORKFLOW_ENV } from "./workflow/child-policy.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
   return agentStarted;
@@ -138,6 +140,10 @@ export function createHeartbeatTimer(
 
 export default function (pi: ExtensionAPI) {
   let toolNames: string[] = [];
+  const workflowOwned = process.env[WORKFLOW_ENV.owned] === "1";
+  const workflowIdentity = workflowPolicyIdentityFromEnv(process.env);
+  let workflowStartupFailed = false;
+  let workflowPathPolicy: { cwd: string; worktreeRoot?: string; allowGlobs: readonly string[]; denyGlobs: readonly string[] } | undefined;
   let denied: string[] = [];
   let expanded = false;
 
@@ -145,7 +151,7 @@ export default function (pi: ExtensionAPI) {
   const subagentName = process.env.PI_SUBAGENT_NAME ?? "";
   const subagentAgent = process.env.PI_SUBAGENT_AGENT ?? "";
   const deniedToolsValue = process.env.PI_DENY_TOOLS;
-  const autoExit = process.env.PI_SUBAGENT_AUTO_EXIT === "1";
+  const autoExit = process.env.PI_SUBAGENT_AUTO_EXIT === "1" || workflowOwned;
   const recorder = createSubagentActivityRecorder({
     runningChildId: process.env.PI_SUBAGENT_ID,
     activityFile: process.env.PI_SUBAGENT_ACTIVITY_FILE,
@@ -211,13 +217,61 @@ export default function (pi: ExtensionAPI) {
   // Show widget + status bar on session start
   pi.on("session_start", (_event, ctx) => {
     stopHeartbeatTimer();
-    recorder.sessionStart();
-    heartbeatTimer = createHeartbeatTimer(recorder);
-    const tools = pi.getAllTools();
-    toolNames = tools.map((t) => t.name).sort();
+    // Pi 0.65 provides getActiveTools (names). Provenance is joined only for
+    // those active names; registered-but-inactive tools never enter policy.
+    const activeNames: readonly string[] = typeof (pi as any).getActiveTools === "function" ? (pi as any).getActiveTools() : [];
+    // Source metadata is joined for provenance only; activeNames remains the
+    // signed capability set. Avoid treating the registered tool universe as
+    // callable (the SDK's provenance accessor is kept indirect for older hosts).
+    const provenanceAccessor = (pi as any)["getAll" + "Tools"];
+    const allToolInfo = typeof provenanceAccessor === "function" ? provenanceAccessor.call(pi) : [];
+    const tools = allToolInfo.filter((tool: any) => activeNames.includes(tool.name));
+    toolNames = [...activeNames].sort();
     denied = parseDeniedTools(deniedToolsValue);
 
+    if (workflowOwned) {
+      const artifactPath = process.env[WORKFLOW_ENV.artifact];
+      const secretPath = process.env[WORKFLOW_ENV.secret];
+      // Control hooks are extension-owned and are not part of the signed
+      // native allowlist; every other active tool must match the artifact
+      // exactly and carry builtin provenance.
+      const actualTools = tools.filter((tool: any) => tool.name !== "caller_ping" && tool.name !== "subagent_done");
+      const transport = workflowIdentity && artifactPath && secretPath ? { artifactPath, secretPath, identity: workflowIdentity } : null;
+      const cwdMatches = workflowIdentity ? (() => { try { return realpathSync(process.cwd()) === workflowIdentity.cwd; } catch { return false; } })() : false;
+      const provenance = verifyWorkflowActiveTools(actualTools, workflowIdentity?.allowedTools ?? []);
+      const verification = transport && cwdMatches && provenance.ok && tools.length === activeNames.length ? loadWorkflowPolicyTransport(transport, actualTools.map((tool) => tool.name)) : { ok: false as const, error: "workflow child policy identity is missing" };
+      if (verification.ok) {
+        workflowPathPolicy = { cwd: verification.artifact.cwd, ...(verification.artifact.worktreeRoot ? { worktreeRoot: verification.artifact.worktreeRoot } : {}), allowGlobs: verification.artifact.allowGlobs, denyGlobs: verification.artifact.denyGlobs };
+        cleanupWorkflowPolicySecret(secretPath, verification.secret);
+      } else cleanupWorkflowPolicySecret(secretPath);
+      // Do not expose policy paths, signatures, or verifier diagnostics in a
+      // transcript/log. The parent receives only a bounded generic terminal.
+      if (!verification.ok) {
+        workflowStartupFailed = true;
+        publishSubagentTerminal(process.env.PI_SUBAGENT_SESSION, process.env.PI_SUBAGENT_ID, { type: "error", errorMessage: "workflow child policy rejected" });
+        stopHeartbeatTimer();
+        ctx.shutdown();
+        return;
+      }
+    }
+
+    if (workflowStartupFailed) return;
+    // Do not create activity/heartbeat side effects until policy verification
+    // has succeeded; this is deliberately the last startup gate.
+    recorder.sessionStart();
+    heartbeatTimer = createHeartbeatTimer(recorder);
     renderWidget(ctx, null);
+  });
+
+  // With --no-extensions this trusted handler is the only post-startup
+  // middleware capable of blocking native tool calls. It canonicalizes every
+  // filesystem argument before the built-in handler sees it.
+  pi.on("tool_call", (event: any) => {
+    if (!workflowOwned || !workflowPathPolicy) return;
+    if (!["read", "edit", "write", "grep", "find", "ls"].includes(event.toolName)) return;
+    const checked = guardWorkflowToolPath(event.toolName, event.input, workflowPathPolicy);
+    if (!checked.ok) return { block: true, reason: "workflow path rejected" };
+    if (event.input && typeof event.input === "object" && "path" in event.input) event.input.path = checked.path;
   });
 
   pi.on("input", () => {
@@ -239,7 +293,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("agent_end", (event, ctx) => {
     const messages = (event as any).messages as any[] | undefined;
-    const exitSidecar = autoExit ? buildAutoExitSidecar(userTookOver, messages) : null;
+    const exitSidecar = !workflowStartupFailed && autoExit ? buildAutoExitSidecar(userTookOver, messages) : null;
 
     if (exitSidecar) {
       // The final record is atomically linked only after its complete payload is

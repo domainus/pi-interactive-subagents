@@ -1,6 +1,7 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, fsyncSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { constants as fsConstants } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { assertCompiledWorkflowIntegrity, type CompiledWorkflow } from "./planner.ts";
 import type { ApplyApprovalRecord, ApprovalState, GateResult, TaskNode, WorktreeEvidence, WorktreeMetadata } from "./types.ts";
@@ -89,6 +90,15 @@ function atomicApproval(path: string, record: ApplyApprovalRecord): void {
   catch (error) { if (fd !== undefined) try { closeSync(fd); } catch {} try { unlinkSync(temp); } catch {} throw error; }
 }
 /** Durable fail-closed approval journal. A crash-held lock requires operator inspection rather than permitting replay. */
+export function loadVerifiedFileApprovalRecord(directory: string, token: string, secret: Uint8Array): ApplyApprovalRecord {
+  if (!isAbsolute(directory) || resolve(directory) !== directory || directory.includes("\0") || !/^[a-f0-9]{64}$/.test(token)) throw new Error("approval journal path is invalid");
+  let root: string; try { root = realpathSync(directory); } catch { throw new Error("approval is forged or unavailable"); } if (root !== directory) throw new Error("approval journal path must not be a symlink");
+  const path = join(root, `${token}.json`); let fd: number | undefined; let text: string;
+  try { fd = openSync(path, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0)); const info = fstatSync(fd); const uid = typeof process.getuid === "function" ? process.getuid() : undefined; if (!info.isFile() || (info.mode & 0o777) !== 0o600 || (uid !== undefined && info.uid !== uid)) throw new Error("approval journal record is untrusted"); if (info.size < 1 || info.size > 65_536) throw new Error("approval journal record exceeds limit"); const bytes = Buffer.alloc(info.size); let offset = 0; while (offset < bytes.length) { const count = readSync(fd, bytes, offset, bytes.length - offset, null); if (!count) break; offset += count; } if (offset !== bytes.length) throw new Error("approval journal record is invalid"); text = bytes.toString("utf8"); bytes.fill(0); } catch (error) { if ((error as NodeJS.ErrnoException)?.code === "ENOENT" || (error as NodeJS.ErrnoException)?.code === "ELOOP") throw new Error("approval is forged or unavailable"); throw error; } finally { if (fd !== undefined) try { closeSync(fd); } catch {} }
+  let value: unknown; try { value = JSON.parse(text); } catch { throw new Error("approval journal record is invalid"); } if (!validApprovalRecord(value) || value.token !== token) throw new Error("approval journal record is invalid");
+  const actual = Buffer.from(value.signature, "hex"); const expected = Buffer.from(approvalSignature(value, secret), "hex"); if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) throw new Error("approval is forged or unavailable"); return value;
+}
+
 export function createFileApprovalStore(directory: string): ApprovalStore {
   if (!isAbsolute(directory) || resolve(directory) !== directory || directory.includes("\0")) throw new Error("approval journal path must be absolute and normalized"); mkdirSync(directory, { recursive: true, mode: 0o700 }); const root = realpathSync(directory); if (root !== directory) throw new Error("approval journal path must not be a symlink");
   const pathFor = (token: string) => { if (!/^[a-f0-9]{64}$/.test(token)) throw new Error("invalid approval token path"); return join(root, `${token}.json`); };
@@ -252,6 +262,12 @@ export class GitWorktreeManager {
     this.approvalStore?.transition(record, next); this.approvals.set(record.token, next); return next;
   }
   private verifyApprovalMac(record: ApplyApprovalRecord): boolean { try { const actual = Buffer.from(record.signature, "hex"); const expected = Buffer.from(approvalSignature(record, this.approvalSecret), "hex"); return actual.length === expected.length && timingSafeEqual(actual, expected); } catch { return false; } }
+  /** Load an opaque durable approval only after its host MAC verifies. */
+  loadApproval(token: string): ApplyApprovalRecord {
+    const record = this.approvalStore?.load(token) ?? this.approvals.get(token);
+    if (!record || !this.verifyApprovalMac(record)) throw new Error("approval is forged or unavailable");
+    return record;
+  }
   private immutableApproval(record: ApplyApprovalRecord): string { const { state: _state, updatedAt: _updatedAt, signature: _signature, ...identity } = record; return canonical(identity); }
   private parentPatch(base: string): { clean: boolean; exactHash?: string } { const status = cleanStatus(this.cwd); if (!status) return { clean: true }; return { clean: false, exactHash: captureDiff(this.cwd, base).diffHash }; }
   private finalizeApplied(record: ApplyApprovalRecord): void {

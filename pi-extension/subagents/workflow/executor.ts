@@ -5,6 +5,7 @@ import { createHostPolicyArtifact, validateHostPolicyArtifact, type CapabilityCa
 import { MAX_SERIALIZED_PAYLOAD_BYTES, validateAgentResultEnvelope, validateWorkflowState, validateWorktreeMetadata } from "./schema.ts";
 import { evaluateGate, type GateCommandLaunch } from "./gates.ts";
 import { assertCompiledWorkflowIntegrity, type CompiledWorkflow } from "./planner.ts";
+import { resolveCombinedModelPolicy } from "./kernels.ts";
 import { computeGateEvaluationId, computeGateResultDigest, toWorktreeEvidence, type WorktreeHandle } from "./worktree.ts";
 import type { AgentResultEnvelope, GateResult, HostPolicyArtifact, NodeAttempt, NodeStatus, TaskNode, TaskResult, WorkflowState, WorktreeEvidence, WorktreeMetadata } from "./types.ts";
 import type { WorkflowStorage } from "./storage.ts";
@@ -12,6 +13,8 @@ import type { WorkflowStorage } from "./storage.ts";
 export interface WorkflowNodeLaunchContext {
   readonly workflow: CompiledWorkflow; readonly node: TaskNode; readonly attempt: number; readonly cwd: string;
   readonly sourceNodeId?: string; readonly sourceEvidence?: WorktreeEvidence; readonly signal: AbortSignal;
+  /** Host-resolved exact model; adapters must not resolve or fall back. */
+  readonly resolvedModel: import("./types.ts").ModelSelection;
   /** Signed artifact and its separately transported secret are handed only to the trusted launcher adapter. */
   readonly policyArtifact: HostPolicyArtifact; readonly policySecret: Uint8Array;
 }
@@ -28,6 +31,7 @@ export interface ExecutorOptions {
   readonly signal?: AbortSignal; readonly recoveredState?: WorkflowState; readonly now?: () => number; readonly cwd?: string; readonly hostPolicy?: ExecutorHostPolicy;
   readonly runCommand?: (argv: readonly string[], cwd: string, signal: AbortSignal) => GateCommandLaunch;
   readonly commandRuntimeMs?: number; readonly commandOutputBytes?: number;
+  readonly resolvedModels?: Readonly<Record<string, import("./types.ts").ModelSelection>>;
   readonly worktree?: {
     readonly root?: string; readonly registerWorkflow?: (workflow: CompiledWorkflow) => void; readonly recordGateResult?: (result: GateResult) => void;
     readonly prepare: (node: TaskNode, attempt?: number) => WorktreeHandle; readonly adoptRecovered?: (evidence: WorktreeEvidence, node: TaskNode) => WorktreeHandle;
@@ -99,11 +103,12 @@ export async function executeWorkflow(workflow: CompiledWorkflow, options: Execu
   const runtimeCeiling = workflow.bounds?.maxRuntimeMs ?? 86_400_000; const maxRuntime = positiveBounded("maxRuntimeMs", options.maxRuntimeMs ?? runtimeCeiling, runtimeCeiling);
   const outputCeiling = workflow.policy?.maxOutputBytes ?? MAX_SERIALIZED_PAYLOAD_BYTES; const maxOutputBytes = positiveBounded("maxOutputBytes", options.maxOutputBytes ?? outputCeiling, outputCeiling);
   const settlementTimeoutMs = positiveBounded("settlementTimeoutMs", options.settlementTimeoutMs ?? 5_000, 30_000);
+  const resolvedModels = options.resolvedModels ?? Object.freeze(Object.fromEntries(workflow.nodes.map((node) => [node.id, resolveCombinedModelPolicy({ node: node.model, workflow: workflow.policy })])));
   if (options.cwd && (!isAbsolute(options.cwd) || resolve(options.cwd) !== options.cwd || options.cwd.includes("\0"))) throw new Error("executor cwd must be an absolute normalized path");
   options.worktree?.registerWorkflow?.(workflow);
   const now = options.now ?? Date.now; const started = now(); const recovered = normalizeRecovery(workflow, options.recoveredState, options.storage); const { nodes, results, attempts, gates, worktrees, recoveredResults, recoveredGateResults } = recovered;
   const policySecret = typeof options.hostPolicy?.signingSecret === "string" ? Buffer.from(options.hostPolicy.signingSecret) : options.hostPolicy?.signingSecret ? Buffer.from(options.hostPolicy.signingSecret) : randomBytes(32);
-  if (policySecret.byteLength < 32) throw new Error("host policy signing secret must contain at least 32 bytes");
+  if (policySecret.byteLength < 32) { policySecret.fill(0); throw new Error("host policy signing secret must contain at least 32 bytes"); }
   const policyArgv = options.hostPolicy?.allowedArgv ?? [];
   const savedResults = new Set(Object.keys(results)); const controller = new AbortController(); let timedOut = false;
   const externalAbort = () => controller.abort(); if (options.signal) { if (options.signal.aborted) controller.abort(); else options.signal.addEventListener("abort", externalAbort, { once: true }); }
@@ -121,7 +126,7 @@ export async function executeWorkflow(workflow: CompiledWorkflow, options: Execu
     const finishedAt = now(); const result: TaskResult = { version: 1, workflowId: workflow.id, nodeId: node.id, status, ...(envelope?.output !== undefined ? { output: envelope.output } : {}), ...(error ? { error } : {}), ...(attempt ? { attempt, startedAt: attempts[node.id]?.find((x) => x.attempt === attempt)?.startedAt } : {}), finishedAt, ...(envelope && rawDigest ? { rawEnvelope: envelope, rawEnvelopeDigest: rawDigest } : {}) };
     results[node.id] = result; nodes[node.id] = status; if (attempt) markAttempt(node, attempt, { status, finishedAt, ...(error ? { error } : {}), ...(classification ? { classification } : {}) }); saveResultOnce(result); save(); return result;
   };
-  persist();
+  try { persist(); } catch (error) { policySecret.fill(0); throw error; }
   const running = new Map<string, Promise<{ id: string; result: TaskResult }>>(); const handles = new Map<string, WorktreeHandle>();
   const adoptSource = (sourceId: string, sourceAttempt: number, evidence: WorktreeEvidence): WorktreeHandle => {
     const key = `${sourceId}:${sourceAttempt}`; const existing = handles.get(key); if (existing) return existing;
@@ -180,7 +185,7 @@ export async function executeWorkflow(workflow: CompiledWorkflow, options: Execu
         const cwd = handle?.cwd ?? options.cwd ?? process.cwd();
         const artifact = createHostPolicyArtifact({ workflow, node, attempt, cwd, ...(node.mode === "mutating" ? { worktreeRoot: options.worktree?.root ?? (handle?.path ? resolve(handle.path, "..") : undefined) } : {}), hostApprovedCapabilities: options.hostPolicy?.approvedCapabilities ?? [], nativeAllowlist: options.hostPolicy?.nativeAllowlist ?? [], allowedArgv: policyArgv, signingSecret: policySecret, catalog: options.hostPolicy?.catalog });
         if (!validateHostPolicyArtifact(artifact, policySecret, { workflowId: workflow.id, nodeId: node.id, attempt, cwd, ...(node.mode === "mutating" ? { worktreeRoot: options.worktree?.root ?? (handle?.path ? resolve(handle.path, "..") : undefined) } : {}) })) throw new WorkflowLaunchError("host policy artifact verification failed", "permanent");
-        const launch = options.launcher.launch({ workflow, node, attempt, cwd, policyArtifact: artifact, policySecret: Buffer.from(policySecret), signal: controller.signal }); value = await awaitLaunch(launch, controller.signal, settlementTimeoutMs);
+        const launch = options.launcher.launch({ workflow, node, attempt, cwd, resolvedModel: resolvedModels[node.id] ?? (() => { throw new WorkflowLaunchError("resolved model selection is required", "permanent"); })(), policyArtifact: artifact, policySecret: Buffer.from(policySecret), signal: controller.signal }); value = await awaitLaunch(launch, controller.signal, settlementTimeoutMs);
       } catch (error) { if (error instanceof WorkflowSettlementError) throw error; launchError = error instanceof WorkflowLaunchError ? error : new WorkflowLaunchError(error instanceof Error ? error.message : "node launch failed"); }
       finally {
         if (handle && options.worktree) try { const captured = options.worktree.capture(handle, node); const checked = validateWorktreeMetadata(captured); if (!checked.ok || captured.workflowId !== workflow.id || captured.nodeId !== node.id || captured.attempt !== attempt || captured.mode !== handle.mode || captured.base !== handle.base || captured.cwd !== handle.cwd || captured.path !== handle.path || captured.preserved !== handle.preserved) throw new Error("captured evidence ownership or integrity mismatch"); const metadata: WorktreeMetadata = Object.freeze({ ...checked.value, changedFiles: Object.freeze([...checked.value.changedFiles]) }); const evidence = toWorktreeEvidence(metadata); worktrees[`${node.id}:${attempt}`] = evidence; options.storage?.saveWorktreeMetadata?.(metadata); save(); } catch (error) { captureError = error instanceof Error ? error : new Error("evidence capture failed"); }
@@ -210,7 +215,7 @@ export async function executeWorkflow(workflow: CompiledWorkflow, options: Execu
     }
     if (running.size) await Promise.allSettled(running.values());
   } catch (error) { const active = [...running.values()]; controller.abort(); await Promise.allSettled(active); throw error; }
-  finally { clearTimeout(runtimeTimer); if (options.signal) options.signal.removeEventListener("abort", externalAbort); }
+  finally { clearTimeout(runtimeTimer); if (options.signal) options.signal.removeEventListener("abort", externalAbort); policySecret.fill(0); }
   const cancelled = Object.values(nodes).some((x) => x === "cancelled"); const failed = Object.values(nodes).some((x) => x === "failed" || x === "blocked"); const finalStatus = cancelled ? "cancelled" : failed ? "failed" : "completed";
   state = { ...state, status: finalStatus, nodes: { ...nodes }, results: { ...results }, attempts: Object.fromEntries(Object.entries(attempts).map(([k, v]) => [k, [...v]])), gates: Object.fromEntries(Object.entries(gates).map(([k, v]) => [k, [...v]])), worktrees: { ...worktrees }, updatedAt: now() }; persist(); return { state };
 }

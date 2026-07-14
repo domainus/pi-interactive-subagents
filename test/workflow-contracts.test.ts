@@ -1,15 +1,17 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { Value } from "@sinclair/typebox/value";
 import { WORKFLOW_MODELS } from "../pi-extension/subagents/workflow/types.ts";
-import { validateAgentResultEnvelope, validateTaskNode, validateTaskResult, validateWorkflowSpec, validateWorkflowState, WorkflowSpecSchema } from "../pi-extension/subagents/workflow/schema.ts";
+import { validateAgentResultEnvelope, validateTaskNode, validateTaskResult, validateWorkflowRunMetadata, validateWorkflowSpec, validateWorkflowState, WorkflowSpecSchema } from "../pi-extension/subagents/workflow/schema.ts";
 import { DEFAULT_CAPABILITY_CATALOG, effectiveKernelTools, resolveEffectiveTools } from "../pi-extension/subagents/workflow/capabilities.ts";
 import { resolveCombinedModelPolicy, resolveWorkflowModel } from "../pi-extension/subagents/workflow/kernels.ts";
 import { composeTaskPrompt } from "../pi-extension/subagents/workflow/prompt.ts";
 import { createWorkflowStorage, WorkflowStorageError } from "../pi-extension/subagents/workflow/storage.ts";
+import { WORKFLOW_TEMPLATES, mapGeneratedNodeIdsToHostPolicy } from "../pi-extension/subagents/workflow/templates.ts";
+import { isHashedWorkflowWorktreeRoot, resolveWorkflowWorktreeRoot } from "../pi-extension/subagents/workflow/paths.ts";
 
 const node = { version: 1 as const, id: "build", kernel: "builder" as const, objective: "compile", expertise: ["typescript"], capabilities: ["read-files"], mode: "read-only" as const, requiresWorktree: false, dependsOn: [] };
 const workflow = { version: 1 as const, id: "wf-1", sessionId: "sess-1", objective: "do work", nodes: [node], capabilities: ["read-files"] };
@@ -75,6 +77,20 @@ test("prompt safely layers host policy and gives a valid final envelope boundary
   const cyclic: Record<string, unknown> = {}; cyclic.self = cyclic;
   assert.throws(() => composeTaskPrompt({ ...input, node: { ...input.node, input: cyclic } }));
 });
+test("run metadata, host templates, and durable worktree roots are host constrained", () => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "workflow-phase3-contract-"))); try { const cwd = join(dir, "repo"); const sessionDir = join(dir, "sessions"); const home = join(dir, "home"); mkdirSync(cwd); mkdirSync(sessionDir); mkdirSync(home); const root = resolveWorkflowWorktreeRoot({ cwd, repoRoot: cwd, sessionId: "session", workflowId: "wf", home }); assert.equal(isHashedWorkflowWorktreeRoot(root), true); assert.equal(root.startsWith(home), true);
+    const metadata = { version: 1 as const, runId: "run", workflowId: "wf", sessionId: "session", cwd, workflowIntegrity: "a".repeat(64), template: "research" as const, status: "pending" as const, updatedAt: 1 }; assert.equal(validateWorkflowRunMetadata(metadata).ok, true); assert.equal(validateWorkflowRunMetadata({ ...metadata, extra: true }).ok, false); assert.equal(validateWorkflowRunMetadata({ ...metadata, template: "build" }).ok, false);
+    const storage = createWorkflowStorage(sessionDir, "session", "wf"); storage.saveWorkflowRunMetadata(metadata); assert.deepEqual(storage.loadWorkflowRunMetadata(), metadata); const running = { ...metadata, status: "running" as const, startedAt: 2, updatedAt: 2 }; storage.saveWorkflowRunMetadata(running); assert.throws(() => storage.saveWorkflowRunMetadata({ ...running, cwd: join(dir, "other") }));
+    assert.equal(Object.isFrozen(WORKFLOW_TEMPLATES), true); assert.equal(WORKFLOW_TEMPLATES.build.allowedTools.includes("bash"), false); assert.deepEqual(WORKFLOW_TEMPLATES.build.denyGlobs, ["package-lock.json", "**/package-lock.json"]); assert.equal(WORKFLOW_TEMPLATES.review.model, "openai-codex/gpt-5.6-sol"); const mapped = mapGeneratedNodeIdsToHostPolicy("research", ["constructor", "node"]); assert.equal(Object.getPrototypeOf(mapped), null); assert.equal(mapped.node, WORKFLOW_TEMPLATES.research);
+    const target = join(dir, "target"); mkdirSync(target); const link = join(dir, "linked-root"); symlinkSync(target, link); assert.throws(() => resolveWorkflowWorktreeRoot({ cwd, sessionId: "session", workflowId: "other", env: { PI_WORKFLOW_WORKTREE_ROOT: link }, home }), /symlink/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("exclusive plan locking never removes a lock owned by another planner", () => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "workflow-plan-lock-"))); try { const storage = createWorkflowStorage(dir, "sess-1", "wf-1"); mkdirSync(storage.rootDir, { recursive: true }); const lock = join(storage.rootDir, "plan.lock"); const fd = openSync(lock, "wx", 0o600); try { const metadata = { version: 1 as const, runId: "run", workflowId: "wf-1", sessionId: "sess-1", cwd: dir, workflowIntegrity: "a".repeat(64), template: "research" as const, status: "pending" as const, updatedAt: 1 }; assert.throws(() => storage.createWorkflowPlan(workflow, metadata)); assert.equal(existsSync(lock), true); assert.throws(() => storage.loadWorkflowRunMetadata(), /incomplete/); assert.equal(existsSync(join(storage.rootDir, "workflow.json")), false); } finally { closeSync(fd); unlinkSync(lock); }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test("runtime result/state relations and atomic bounded storage are enforced", () => {
   const dir = mkdtempSync(join(tmpdir(), "workflow-contract-"));
   try {

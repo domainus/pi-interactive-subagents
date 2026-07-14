@@ -1,10 +1,10 @@
 import { createHash } from "node:crypto";
-import { isAbsolute, resolve } from "node:path";
+import { isAbsolute, relative, resolve } from "node:path";
 import { Type, type TSchema } from "@sinclair/typebox";
 import { Value } from "@sinclair/typebox/value";
 import { DEFAULT_CAPABILITY_CATALOG, type CapabilityCatalog } from "./capabilities.ts";
 import { resolveCombinedModelPolicy } from "./kernels.ts";
-import { WORKFLOW_MODELS, WORKFLOW_VERSION, type AgentResultEnvelope, type GateResult, type NodeAttempt, type TaskNode, type TaskResult, type WorkflowSpec, type WorkflowState, type WorktreeEvidence, type WorktreeMetadata, type ValidationIssue, type ValidationResult } from "./types.ts";
+import { WORKFLOW_MODELS, WORKFLOW_VERSION, type AgentResultEnvelope, type GateResult, type NodeAttempt, type TaskNode, type TaskResult, type WorkflowRunMetadata, type WorkflowRunStatus, type WorkflowSpec, type WorkflowState, type WorktreeEvidence, type WorktreeMetadata, type ValidationIssue, type ValidationResult } from "./types.ts";
 
 const Id = Type.String({ minLength: 1, maxLength: 128, pattern: "^[A-Za-z0-9][A-Za-z0-9._-]*$" });
 const Digest = Type.String({ pattern: "^[a-f0-9]{64}$" });
@@ -28,12 +28,15 @@ const Kernel = Type.Union([Type.Literal("readonly"), Type.Literal("builder"), Ty
 const Thinking = Type.Union(["off", "minimal", "low", "medium", "high", "xhigh", "max"].map(Type.Literal));
 const NodeStatusSchema = Type.Union(["pending", "running", "retrying", "succeeded", "failed", "blocked", "cancelled"].map(Type.Literal));
 const GateKindSchema = Type.Union(["result-schema", "dependency-success", "diff-scope", "command"].map(Type.Literal));
+const WorkflowRunStatusSchema = Type.Union(["pending", "running", "cancelling", "cancelled", "completed", "failed", "recovered"].map(Type.Literal));
+const WorkflowRunTemplateSchema = Type.Union(["research", "build", "review"].map(Type.Literal));
 export const ModelRequestSchema = Type.Object({ tier: Type.Union([Type.Literal("luna"), Type.Literal("sol")]), risk: Type.Optional(Type.Union([Type.Literal("low"), Type.Literal("medium"), Type.Literal("high"), Type.Literal("critical")])) }, { additionalProperties: false });
 export const GateSchema = Type.Object({ version: Type.Literal(WORKFLOW_VERSION), kind: GateKindSchema, dependsOn: Type.Optional(Type.Array(Id, { minItems: 1, maxItems: 256, uniqueItems: true })), reason: Type.Optional(Type.String({ maxLength: 1024 })), argv: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 4096 }), { minItems: 1, maxItems: 64 })), allowGlobs: Type.Optional(Type.Array(RelativeGlob, { minItems: 1, maxItems: 128, uniqueItems: true })), denyGlobs: Type.Optional(Type.Array(RelativeGlob, { maxItems: 128, uniqueItems: true })) }, { additionalProperties: false });
 export const WorkflowBoundsSchema = Type.Object({ maxNodes: Type.Optional(Type.Integer({ minimum: 1, maximum: 256 })), maxConcurrency: Type.Optional(Type.Integer({ minimum: 1, maximum: 64 })), maxRetries: Type.Optional(Type.Integer({ minimum: 0, maximum: 10 })), maxDepth: Type.Optional(Type.Integer({ minimum: 1, maximum: 32 })), maxRuntimeMs: Type.Optional(Type.Integer({ minimum: 1_000, maximum: 86_400_000 })) }, { additionalProperties: false });
 export const WorkflowPolicySchema = Type.Object({ model: Type.Optional(Type.Union(WORKFLOW_MODELS.map(Type.Literal))), thinking: Type.Optional(Thinking), maxOutputBytes: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_SERIALIZED_PAYLOAD_BYTES })) }, { additionalProperties: false });
 export const TaskNodeSchema = Type.Object({ version: Type.Literal(WORKFLOW_VERSION), id: Id, kernel: Kernel, objective: SafeText, expertise: Type.Array(ShortText, { maxItems: 32 }), capabilities: Type.Array(ShortText, { maxItems: 64 }), mode: Type.Union([Type.Literal("read-only"), Type.Literal("mutating")]), requiresWorktree: Type.Boolean(), workspaceRoot: Type.Optional(RelativePath), allowGlobs: Type.Optional(Type.Array(RelativeGlob, { minItems: 1, maxItems: 128, uniqueItems: true })), denyGlobs: Type.Optional(Type.Array(RelativeGlob, { maxItems: 128, uniqueItems: true })), dependsOn: Type.Optional(Type.Array(Id, { maxItems: 256, uniqueItems: true })), gate: Type.Optional(GateSchema), sourceNodeId: Type.Optional(Id), input: Type.Optional(Type.Unknown()), model: Type.Optional(ModelRequestSchema), retries: Type.Optional(Type.Integer({ minimum: 0, maximum: 10 })), depth: Type.Optional(Type.Integer({ minimum: 1, maximum: 32 })) }, { additionalProperties: false });
 export const WorkflowSpecSchema = Type.Object({ version: Type.Literal(WORKFLOW_VERSION), id: Id, sessionId: Id, objective: SafeText, expertise: Type.Optional(Type.Array(ShortText, { maxItems: 32 })), capabilities: Type.Optional(Type.Array(ShortText, { maxItems: 64, uniqueItems: true })), nodes: Type.Array(TaskNodeSchema, { minItems: 1, maxItems: 256 }), bounds: Type.Optional(WorkflowBoundsSchema), policy: Type.Optional(WorkflowPolicySchema) }, { additionalProperties: false });
+export const WorkflowRunMetadataSchema = Type.Object({ version: Type.Literal(WORKFLOW_VERSION), runId: Id, workflowId: Id, sessionId: Id, cwd: AbsolutePath, worktreeRoot: Type.Optional(AbsolutePath), workflowIntegrity: Digest, template: WorkflowRunTemplateSchema, status: WorkflowRunStatusSchema, startedAt: Type.Optional(Type.Integer({ minimum: 0 })), updatedAt: Type.Optional(Type.Integer({ minimum: 0 })), finishedAt: Type.Optional(Type.Integer({ minimum: 0 })) }, { additionalProperties: false });
 export const AgentResultEnvelopeSchema = Type.Object({ version: Type.Literal(WORKFLOW_VERSION), status: Type.Union([Type.Literal("succeeded"), Type.Literal("failed"), Type.Literal("blocked")]), output: Type.Optional(Type.Unknown()), error: Type.Optional(Type.Union([Type.String({ maxLength: 4096 }), Type.Null()])), retryable: Type.Optional(Type.Boolean()) }, { additionalProperties: false });
 export const TaskResultSchema = Type.Object({ version: Type.Literal(WORKFLOW_VERSION), workflowId: Id, nodeId: Id, status: Type.Union([Type.Literal("succeeded"), Type.Literal("failed"), Type.Literal("blocked"), Type.Literal("cancelled")]), output: Type.Optional(Type.Unknown()), error: Type.Optional(Type.String({ minLength: 1, maxLength: 4096 })), startedAt: Type.Optional(Type.Integer({ minimum: 0 })), finishedAt: Type.Integer({ minimum: 0 }), attempt: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })), rawEnvelope: Type.Optional(AgentResultEnvelopeSchema), rawEnvelopeDigest: Type.Optional(Digest) }, { additionalProperties: false });
 export const NodeAttemptSchema = Type.Object({ version: Type.Literal(WORKFLOW_VERSION), workflowId: Id, nodeId: Id, attempt: Type.Integer({ minimum: 1, maximum: 100 }), status: NodeStatusSchema, startedAt: Type.Optional(Type.Integer({ minimum: 0 })), finishedAt: Type.Optional(Type.Integer({ minimum: 0 })), error: Type.Optional(Type.String({ minLength: 1, maxLength: 4096 })), classification: Type.Optional(Type.Union([Type.Literal("retryable"), Type.Literal("permanent"), Type.Literal("cancelled"), Type.Literal("malformed")])) }, { additionalProperties: false });
@@ -42,7 +45,7 @@ const WorktreeEvidenceFields = { version: Type.Literal(WORKFLOW_VERSION), workfl
 export const WorktreeEvidenceSchema = Type.Object(WorktreeEvidenceFields, { additionalProperties: false });
 export const WorktreeMetadataSchema = Type.Object({ ...WorktreeEvidenceFields, status: Type.String({ maxLength: 65_536 }), diff: Type.String({ maxLength: 4_194_304 }) }, { additionalProperties: false });
 export const WorkflowStateSchema = Type.Object({ version: Type.Literal(WORKFLOW_VERSION), workflowId: Id, sessionId: Id, status: Type.Union(["pending", "running", "paused", "retrying", "gated", "completed", "succeeded", "failed", "cancelled", "recovered"].map(Type.Literal)), nodes: Type.Record(Id, NodeStatusSchema), results: Type.Optional(Type.Record(Id, TaskResultSchema)), attempts: Type.Optional(Type.Record(Id, Type.Array(NodeAttemptSchema, { maxItems: 100 }))), gates: Type.Optional(Type.Record(Id, Type.Array(GateResultSchema, { maxItems: 64 }))), worktrees: Type.Optional(Type.Record(Type.String({ pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}:[1-9][0-9]{0,2}$" }), WorktreeEvidenceSchema)), updatedAt: Type.Integer({ minimum: 0 }) }, { additionalProperties: false });
-export const schemas = { WorkflowSpecSchema, TaskNodeSchema, GateSchema, AgentResultEnvelopeSchema, TaskResultSchema, NodeAttemptSchema, GateResultSchema, WorktreeEvidenceSchema, WorktreeMetadataSchema, WorkflowStateSchema, ModelRequestSchema, WorkflowBoundsSchema, WorkflowPolicySchema } as const;
+export const schemas = { WorkflowSpecSchema, WorkflowRunMetadataSchema, TaskNodeSchema, GateSchema, AgentResultEnvelopeSchema, TaskResultSchema, NodeAttemptSchema, GateResultSchema, WorktreeEvidenceSchema, WorktreeMetadataSchema, WorkflowStateSchema, ModelRequestSchema, WorkflowBoundsSchema, WorkflowPolicySchema } as const;
 
 function schemaIssues(schema: TSchema, value: unknown): ValidationIssue[] { if (Value.Check(schema, value)) return []; return [...Value.Errors(schema, value)].slice(0, 64).map((e) => ({ path: e.path || "$", message: e.message })); }
 const issue = (path: string, message: string): ValidationIssue => ({ path, message });
@@ -108,6 +111,44 @@ export function computeWorkflowDepths(nodes: readonly TaskNode[]): Readonly<Reco
   const depth = (id: string): number => { const cached = memo.get(id); if (cached !== undefined) return cached; if (active.has(id)) throw new Error("workflow dependency cycle detected"); active.add(id); const node = byId.get(id); if (!node) throw new Error(`unknown dependency: ${id}`); const deps = [...new Set([...(node.dependsOn ?? []), ...(node.gate?.dependsOn ?? [])])]; const value = deps.length ? Math.max(...deps.map(depth)) + 1 : 1; active.delete(id); memo.set(id, value); return value; };
   for (const node of nodes) depth(node.id); return Object.freeze(Object.fromEntries(memo));
 }
+const RUN_TERMINAL_STATUSES = new Set<WorkflowRunStatus>(["cancelled", "completed", "failed"]);
+const RUN_STATUS_TRANSITIONS: Readonly<Record<WorkflowRunStatus, readonly WorkflowRunStatus[]>> = Object.freeze({
+  pending: Object.freeze(["pending", "running", "cancelling", "cancelled", "failed"]),
+  running: Object.freeze(["running", "cancelling", "cancelled", "completed", "failed", "recovered"]),
+  cancelling: Object.freeze(["cancelling", "cancelled", "completed", "failed", "recovered"]),
+  recovered: Object.freeze(["recovered", "running", "cancelling", "cancelled", "completed", "failed"]),
+  cancelled: Object.freeze(["cancelled"]),
+  completed: Object.freeze(["completed"]),
+  failed: Object.freeze(["failed"]),
+});
+export function isLegalWorkflowRunStatusTransition(previous: WorkflowRunStatus, next: WorkflowRunStatus): boolean {
+  return Object.prototype.hasOwnProperty.call(RUN_STATUS_TRANSITIONS, previous) && RUN_STATUS_TRANSITIONS[previous].includes(next);
+}
+export function validateWorkflowRunMetadata(value: unknown, ownership?: { readonly runId?: string; readonly workflowId?: string; readonly sessionId?: string }): ValidationResult<WorkflowRunMetadata> {
+  const issues = schemaIssues(WorkflowRunMetadataSchema, value); if (issues.length) return { ok: false, issues };
+  const metadata = value as WorkflowRunMetadata;
+  if (ownership?.runId !== undefined && metadata.runId !== ownership.runId) issues.push(issue("/runId", "artifact ownership mismatch"));
+  if (ownership?.workflowId !== undefined && metadata.workflowId !== ownership.workflowId) issues.push(issue("/workflowId", "artifact ownership mismatch"));
+  if (ownership?.sessionId !== undefined && metadata.sessionId !== ownership.sessionId) issues.push(issue("/sessionId", "artifact ownership mismatch"));
+  if (!isAbsolute(metadata.cwd) || resolve(metadata.cwd) !== metadata.cwd || metadata.cwd.includes("\0")) issues.push(issue("/cwd", "cwd must be absolute and normalized"));
+  if (metadata.worktreeRoot !== undefined && (!isAbsolute(metadata.worktreeRoot) || resolve(metadata.worktreeRoot) !== metadata.worktreeRoot || metadata.worktreeRoot.includes("\0"))) issues.push(issue("/worktreeRoot", "worktree root must be absolute and normalized"));
+  if (metadata.worktreeRoot !== undefined) { const rel = relative(metadata.worktreeRoot, metadata.cwd); if (!rel || (!rel.startsWith("..") && !isAbsolute(rel)) || (!relative(metadata.cwd, metadata.worktreeRoot).startsWith("..") && !isAbsolute(relative(metadata.cwd, metadata.worktreeRoot)))) issues.push(issue("/worktreeRoot", "worktree root must be disjoint from cwd")); }
+  if (metadata.template === "build" && metadata.worktreeRoot === undefined) issues.push(issue("/worktreeRoot", "build runs require an external worktree root"));
+  const times = [metadata.startedAt, metadata.updatedAt, metadata.finishedAt];
+  if (times.some((time) => time !== undefined && (!Number.isSafeInteger(time) || time < 0))) issues.push(issue("/", "timestamps must be non-negative safe integers"));
+  if (metadata.startedAt !== undefined && metadata.updatedAt !== undefined && metadata.updatedAt < metadata.startedAt) issues.push(issue("/updatedAt", "updatedAt cannot precede startedAt"));
+  if (metadata.finishedAt !== undefined && metadata.startedAt !== undefined && metadata.finishedAt < metadata.startedAt) issues.push(issue("/finishedAt", "finishedAt cannot precede startedAt"));
+  if (metadata.finishedAt !== undefined && metadata.updatedAt !== undefined && metadata.updatedAt > metadata.finishedAt) issues.push(issue("/updatedAt", "updatedAt cannot follow finishedAt"));
+  if (metadata.status === "pending" && (metadata.startedAt !== undefined || metadata.finishedAt !== undefined)) issues.push(issue("/status", "pending runs cannot have started or finished timestamps"));
+  if (["running", "cancelling", "recovered"].includes(metadata.status) && (metadata.startedAt === undefined || metadata.finishedAt !== undefined)) issues.push(issue("/status", "active runs require startedAt and cannot have finishedAt"));
+  if (RUN_TERMINAL_STATUSES.has(metadata.status) && (metadata.startedAt === undefined || metadata.finishedAt === undefined)) issues.push(issue("/status", "terminal runs require startedAt and finishedAt"));
+  return issues.length ? { ok: false, issues } : { ok: true, value: metadata };
+}
+
+export const validateRunMetadata = validateWorkflowRunMetadata;
+export const validateWorkflowRun = validateWorkflowRunMetadata;
+export const WorkflowRunSchema = WorkflowRunMetadataSchema;
+
 export function validateWorkflowSpec(value: unknown, catalog: CapabilityCatalog = DEFAULT_CAPABILITY_CATALOG): ValidationResult<WorkflowSpec> {
   const issues = schemaIssues(WorkflowSpecSchema, value); if (issues.length) return { ok: false, issues }; const spec = value as WorkflowSpec; const ids = new Set(spec.nodes.map((node) => node.id));
   if (!withinSerializedBytes(spec, MAX_JSON_ARTIFACT_BYTES)) issues.push(issue("$", "serialized workflow specification exceeds artifact bound"));

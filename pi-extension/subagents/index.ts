@@ -2,7 +2,7 @@ import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-age
 import { keyHint } from "@mariozechner/pi-coding-agent";
 import { Type, type Static } from "@sinclair/typebox";
 import { Box, Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { randomBytes } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import {
@@ -64,6 +64,9 @@ import {
   type ModelTier,
   type ResolvedLaunchModel,
 } from "./model-selection.ts";
+import { createWorkflowNodeAdapter, type WorkflowAdapterParentContext } from "./workflow/adapter.ts";
+import type { WorkflowNodeLauncher } from "./workflow/executor.ts";
+import { registerWorkflowUI } from "./workflow/ui.ts";
 
 /** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
 const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
@@ -285,8 +288,14 @@ function resolveDenyTools(agentDefs: AgentDefaults | null): Set<string> {
 
 /** Resolve the global agent config directory, respecting PI_CODING_AGENT_DIR. */
 function getAgentConfigDir(): string {
-  return process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
+  const configured = process.env.PI_CODING_AGENT_DIR;
+  if (!configured) return join(homedir(), ".pi", "agent");
+  if (configured === "~") return homedir();
+  if (configured.startsWith("~/")) return join(homedir(), configured.slice(2));
+  return configured;
 }
+
+function getTrustedWorkflowAgentDir(): string { return resolve(getAgentConfigDir()); }
 
 function getBundledAgentsDir(): string {
   return join(SUBAGENTS_DIR, "../../agents");
@@ -809,7 +818,7 @@ function resolveResultPresentation(
 /**
  * Result from running a single subagent.
  */
-interface SubagentResult {
+export interface SubagentResult {
   name: string;
   task: string;
   summary: string;
@@ -828,7 +837,7 @@ interface SubagentResult {
  */
 type TerminalClaim = "watcher" | "remediation" | "shutdown";
 
-interface RunningSubagent {
+export interface RunningSubagent {
   id: string;
   /** Extension/session generation that launched and owns this watcher. */
   owner: symbol;
@@ -857,6 +866,8 @@ interface RunningSubagent {
    * subagent's pane (e.g. planner).
    */
   interactive: boolean;
+  /** Workflow-owned children settle through the adapter and never deliver legacy messages. */
+  workflowOwned?: boolean;
   /** One local path may close/remove/deliver a terminal result. */
   terminalClaim?: TerminalClaim;
   /** Last bounded arbitration error reported during status supervision. */
@@ -868,7 +879,7 @@ interface RunningSubagent {
 /** All currently running subagents, keyed by id. */
 const runningSubagents = new Map<string, RunningSubagent>();
 
-type WatchOutcome =
+export type WatchOutcome =
   | { kind: "delivered"; result: SubagentResult }
   | { kind: "suppressed" };
 
@@ -995,7 +1006,7 @@ function deliverSpawnWatchOutcome(
   outcome: WatchOutcome,
 ): void {
   safeUpdateWidget();
-  if (outcome.kind === "suppressed") return;
+  if (running.workflowOwned || outcome.kind === "suppressed") return;
   if (outcome.result.ping) {
     sendSubagentPing(pi, running, outcome.result);
     return;
@@ -1043,7 +1054,7 @@ function remediateBrokenSubagent(
   snapshot: StatusSnapshot,
   dependencies: RemediationDependencies = {},
 ): { kind: "remediated" | "skipped" | "defer" | "error" } {
-  if (running.interactive || running.statusState.phase === "done" || running.terminalClaim) {
+  if (running.workflowOwned || running.interactive || running.statusState.phase === "done" || running.terminalClaim) {
     return { kind: "skipped" };
   }
 
@@ -1433,7 +1444,7 @@ function refreshSubagentStatuses(pi: Pick<ExtensionAPI, "sendMessage">, now = Da
 
     // Broken autonomous children are handled only after iteration. This avoids
     // mutating the Map while observing it and keeps interactive/done runs open.
-    if (snapshot.kind === "broken" && !running.interactive) {
+    if (snapshot.kind === "broken" && !running.interactive && !running.workflowOwned) {
       remediationCandidates.push({ running, snapshot });
       continue;
     }
@@ -1546,6 +1557,7 @@ export const __test__ = {
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
   withOwnedLaunchSurface,
+  getTrustedWorkflowAgentDir,
   activatePollAbortOwner,
   getOwnedModuleAbortSignal,
   abortPollAbortOwner,
@@ -1592,6 +1604,14 @@ async function launchSubagent(
     agentDefs: AgentDefaults | null;
     effectiveThinking: ThinkingLevel | undefined;
     modelResolution: ResolvedLaunchModel | null;
+    /** Explicit overrides are used only by the workflow adapter; absent means legacy behavior. */
+    resolvedModel?: string;
+    effectiveTools?: string;
+    systemPrompt?: string;
+    autoExit?: boolean;
+    workflowOwned?: boolean;
+    policyTransport?: { artifactPath: string; secretPath: string; workflowId: string; nodeId: string; attempt: number; cwd: string; worktreeRoot?: string; allowedTools: readonly string[] };
+    sessionMode?: "lineage-only" | "fork";
     surface?: string;
   },
 ): Promise<RunningSubagent> {
@@ -1599,19 +1619,26 @@ async function launchSubagent(
   const id = newRunningChildId();
 
   const { agentDefs, effectiveThinking, modelResolution } = options;
-  const effectiveModel = agentDefs?.cli === "claude"
+  const effectiveModel = options.resolvedModel ?? (agentDefs?.cli === "claude"
     ? params.model ?? agentDefs?.model
-    : modelResolution?.effectiveModel;
-  const effectiveTools = params.tools ?? agentDefs?.tools;
-  const effectiveSkills = params.skills ?? agentDefs?.skills;
-  const effectiveInteractive = resolveEffectiveInteractive(params, agentDefs);
+    : modelResolution?.effectiveModel);
+  const effectiveTools = options.effectiveTools ?? (params.tools ?? agentDefs?.tools);
+  const effectiveSkills = options.workflowOwned ? undefined : (params.skills ?? agentDefs?.skills);
+  const effectiveAutoExit = options.autoExit ?? agentDefs?.autoExit;
+  const effectiveInteractive = options.workflowOwned ? false : resolveEffectiveInteractive(params, agentDefs);
 
   const sessionFile = ctx.sessionManager.getSessionFile();
   if (!sessionFile) throw new Error("No session file");
   const sessionId = ctx.sessionManager.getSessionId();
   const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
 
-  const { effectiveCwd, localAgentDir, effectiveAgentDir } = resolveSubagentPaths(params, agentDefs);
+  const resolvedPaths = resolveSubagentPaths(params, agentDefs);
+  const effectiveCwd = resolvedPaths.effectiveCwd;
+  // Workflow children must use the exact parent-trusted config/model registry
+  // root, never a generated worktree's repository-controlled .pi/agent.
+  const trustedAgentDir = getTrustedWorkflowAgentDir();
+  const localAgentDir = options.workflowOwned ? null : resolvedPaths.localAgentDir;
+  const effectiveAgentDir = options.workflowOwned ? trustedAgentDir : resolvedPaths.effectiveAgentDir;
   const targetCwdForSession = effectiveCwd ?? ctx.cwd;
   const sessionDir = getDefaultSessionDirFor(targetCwdForSession, effectiveAgentDir);
 
@@ -1639,7 +1666,9 @@ async function launchSubagent(
         await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
       }
 
-      const launchBehavior = resolveLaunchBehavior(params, agentDefs);
+      const launchBehavior = options.sessionMode
+        ? { sessionMode: options.sessionMode, seededSessionMode: options.sessionMode, inheritsConversationContext: options.sessionMode === "fork", taskDelivery: options.sessionMode === "fork" ? "direct" as const : "artifact" as const }
+        : resolveLaunchBehavior(params, agentDefs);
 
   if (launchBehavior.seededSessionMode) {
     seedSubagentSessionFile({
@@ -1657,15 +1686,15 @@ async function launchSubagent(
   // Build the task message
   // Only full-context fork mode inherits prior conversation state.
   // Blank-session modes need the wrapper instructions and artifact-backed handoff.
-  const modeHint = agentDefs?.autoExit
+  const modeHint = effectiveAutoExit
     ? "Complete your task autonomously."
     : "Complete your task. When finished, call the subagent_done tool. The user can interact with you at any time.";
-  const summaryInstruction = agentDefs?.autoExit
+  const summaryInstruction = effectiveAutoExit
     ? "Your FINAL assistant message should summarize what you accomplished."
     : "Your FINAL assistant message (before calling subagent_done or before the user exits) should summarize what you accomplished.";
   const denySet = resolveDenyTools(agentDefs);
-  const identity = agentDefs?.body ?? params.systemPrompt ?? null;
-  const systemPromptMode = agentDefs?.systemPromptMode;
+  const identity = options.systemPrompt ?? agentDefs?.body ?? params.systemPrompt ?? null;
+  const systemPromptMode = options.systemPrompt ? "append" : agentDefs?.systemPromptMode;
   const identityInSystemPrompt = systemPromptMode && identity;
   const roleBlock = identity && !identityInSystemPrompt ? `\n\n${identity}` : "";
   const fullTask = inheritsConversationContext
@@ -1735,6 +1764,7 @@ async function launchSubagent(
       cli: "claude",
       sentinelFile,
       interactive: effectiveInteractive,
+      workflowOwned: options.workflowOwned,
       statusState: createStatusState({
         source: "claude",
         startTimeMs: startTime,
@@ -1749,6 +1779,7 @@ async function launchSubagent(
 
   // Build pi command
   const parts: string[] = ["pi"];
+  if (options.workflowOwned) parts.push("--no-extensions");
   parts.push("--session", shellEscape(subagentSessionFile));
 
   const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
@@ -1779,7 +1810,9 @@ async function launchSubagent(
     parts.push(flag, shellEscape(syspromptPath));
   }
 
-  const toolAllowlist = buildSubagentToolAllowlist(effectiveTools);
+  const toolAllowlist = options.workflowOwned
+    ? (effectiveTools ? effectiveTools.split(",").map((tool) => tool.trim()).filter(Boolean).join(",") : null)
+    : buildSubagentToolAllowlist(effectiveTools);
   if (toolAllowlist) {
     parts.push("--tools", shellEscape(toolAllowlist));
   }
@@ -1789,7 +1822,9 @@ async function launchSubagent(
 
   // If the target cwd has its own .pi/agent/, use that as the config root.
   // Otherwise propagate the current/global agent dir.
-  if (localAgentDir && existsSync(localAgentDir)) {
+  if (options.workflowOwned) {
+    envParts.push(`PI_CODING_AGENT_DIR=${shellEscape(trustedAgentDir)}`);
+  } else if (localAgentDir && existsSync(localAgentDir)) {
     envParts.push(`PI_CODING_AGENT_DIR=${shellEscape(localAgentDir)}`);
   } else if (process.env.PI_CODING_AGENT_DIR) {
     envParts.push(`PI_CODING_AGENT_DIR=${shellEscape(process.env.PI_CODING_AGENT_DIR)}`);
@@ -1802,8 +1837,21 @@ async function launchSubagent(
   if (params.agent) {
     envParts.push(`PI_SUBAGENT_AGENT=${shellEscape(params.agent)}`);
   }
-  if (agentDefs?.autoExit) {
+  if (effectiveAutoExit) {
     envParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
+  }
+  if (options.workflowOwned) {
+    envParts.push("PI_WORKFLOW_OWNED=1");
+    const transport = options.policyTransport;
+    if (!transport) throw new Error("workflow policy transport is required");
+    envParts.push(`PI_WORKFLOW_POLICY_ARTIFACT=${shellEscape(transport.artifactPath)}`);
+    envParts.push(`PI_WORKFLOW_POLICY_SECRET=${shellEscape(transport.secretPath)}`);
+    envParts.push(`PI_WORKFLOW_ID=${shellEscape(transport.workflowId)}`);
+    envParts.push(`PI_WORKFLOW_NODE_ID=${shellEscape(transport.nodeId)}`);
+    envParts.push(`PI_WORKFLOW_ATTEMPT=${shellEscape(String(transport.attempt))}`);
+    envParts.push(`PI_WORKFLOW_CWD=${shellEscape(transport.cwd)}`);
+    if (transport.worktreeRoot) envParts.push(`PI_WORKFLOW_ROOT=${shellEscape(transport.worktreeRoot)}`);
+    envParts.push(`PI_WORKFLOW_TOOLS=${shellEscape(transport.allowedTools.join(","))}`);
   }
   envParts.push(`PI_SUBAGENT_SESSION=${shellEscape(subagentSessionFile)}`);
   envParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
@@ -1876,6 +1924,7 @@ async function launchSubagent(
     launchScriptFile,
     activityFile,
     interactive: effectiveInteractive,
+    workflowOwned: options.workflowOwned,
     statusState: createStatusState({
       source: "pi",
       startTimeMs: startTime,
@@ -1932,7 +1981,7 @@ function createCompletionPollOptions(running: RunningSubagent) {
   };
 }
 
-async function watchSubagent(
+export async function watchSubagent(
   running: RunningSubagent,
   signal: AbortSignal,
   moduleSignal: AbortSignal,
@@ -2025,21 +2074,34 @@ async function watchSubagent(
   }
 }
 
+/** Public Phase 3 workflow seam. It reuses the private launch/watch lifecycle. */
+export function createWorkflowNodeLauncher(parent: WorkflowAdapterParentContext, extensionOwner: symbol = MODULE_POLL_OWNER, moduleSignal?: AbortSignal): WorkflowNodeLauncher {
+  return createWorkflowNodeAdapter({
+    parent,
+    owner: extensionOwner,
+    moduleSignal: moduleSignal ?? getOwnedModuleAbortSignal(extensionOwner),
+    launch: launchSubagent as any,
+    watch: watchSubagent as any,
+  });
+}
+
 export default function subagentsExtension(pi: ExtensionAPI) {
   // Pi documents shutdown-before-start ordering for replacements. Keep a unique
   // owner anyway so a delayed shutdown callback from an old binding cannot abort
   // watchers launched by a newer binding of this module.
   const extensionOwner = Symbol("pi-subagents/extension-session-generation");
   let moduleAbortSignal = activatePollAbortOwner(extensionOwner);
-
   // Capture the UI context for widget updates
   pi.on("session_start", (_event, ctx) => {
     latestCtx = ctx;
     moduleAbortSignal = getOwnedModuleAbortSignal(extensionOwner);
   });
 
-  // Clean up on session shutdown
-  pi.on("session_shutdown", (_event, _ctx) => {
+  let workflowUIShutdown: () => Promise<void> = async () => {};
+  // Clean up on session shutdown. Cancel workflow controllers before retiring
+  // their shared child watcher signal so executor settlement remains ordered.
+  pi.on("session_shutdown", async (_event, _ctx) => {
+    const workflowShutdown = workflowUIShutdown();
     if (widgetInterval?.owner === extensionOwner) {
       const interval = widgetInterval;
       widgetInterval = null;
@@ -2057,7 +2119,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       try { agent.abortController?.abort(); } catch {}
       deleteRunningIdentitySafe(agent);
     }
+    await workflowShutdown;
   });
+
+  workflowUIShutdown = registerWorkflowUI(pi, {
+    owner: extensionOwner,
+    moduleSignal: moduleAbortSignal,
+    launcher: (parent, owner, signal) => createWorkflowNodeLauncher(parent, owner, signal),
+  }).shutdown;
 
   // Tools denied via PI_DENY_TOOLS env var (set by parent agent based on frontmatter)
   const deniedTools = new Set(
@@ -2495,7 +2564,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           launch: async () => {
             await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
 
-        // Build pi resume command
+        // Legacy resumes retain their configured extensions. Trusted workflow
+        // children use the dedicated launcher path above and are never resumed
+        // through this user-facing command.
         const parts = ["pi", "--session", shellEscape(params.sessionPath)];
         for (const arg of buildThinkingArgs(params.thinking)) {
           parts.push(shellEscape(arg));
