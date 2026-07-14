@@ -24,6 +24,15 @@ test("strict versioned schemas reject unknown fields, unknown capabilities, and 
   assert.equal(validateTaskNode({ ...node, allowGlobs: ["/absolute"] }).ok, false);
   assert.equal(validateTaskNode({ ...node, allowGlobs: ["safe/\0bad"] }).ok, false);
 });
+test("serialized payload bounds apply consistently at schema boundaries", () => {
+  const boundary = "x".repeat(65_000);
+  assert.equal(validateTaskNode({ ...node, input: boundary }).ok, true);
+  assert.equal(validateTaskNode({ ...node, input: "x".repeat(65_537) }).ok, false);
+  assert.equal(validateAgentResultEnvelope({ version: 1, status: "succeeded", output: "x".repeat(65_537) }).ok, false);
+  const result = { version: 1 as const, workflowId: "wf-1", nodeId: "build", status: "succeeded" as const, finishedAt: 1, output: "x".repeat(65_537) };
+  assert.equal(validateTaskResult(result).ok, false);
+  assert.equal(validateWorkflowState({ version: 1, workflowId: "wf-1", sessionId: "sess-1", status: "running", nodes: { build: "pending" }, results: { build: result }, updatedAt: 1 }).ok, false);
+});
 test("ownership modes and dependency/gate invariants are host-safe", () => {
   assert.equal(validateTaskNode({ ...node, mode: "mutating", kernel: "validator", requiresWorktree: true }).ok, false);
   assert.equal(validateTaskNode({ ...node, mode: "mutating", requiresWorktree: false }).ok, false);
