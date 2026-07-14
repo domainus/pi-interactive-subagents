@@ -19,6 +19,7 @@ import { createHostPolicyArtifact } from "../pi-extension/subagents/workflow/cap
 import { cleanupWorkflowPolicySecret, guardWorkflowToolPath, loadWorkflowPolicyTransport, verifyWorkflowActiveTools, verifyWorkflowChildPolicy, writeWorkflowPolicyTransport } from "../pi-extension/subagents/workflow/child-policy.ts";
 import { formatWorkflowStatus, workflowStatusDetails } from "../pi-extension/subagents/workflow/status.ts";
 import { registerWorkflowUI, WORKFLOW_CONFIRMATION_OPERATIONS } from "../pi-extension/subagents/workflow/ui.ts";
+import { sanitizeDisplayText, stripTerminalControls } from "../pi-extension/subagents/display-safety.ts";
 
 import {
   getLeafId,
@@ -5393,5 +5394,178 @@ describe("workflow UI registration", () => {
   it("bounds status text and exposes aggregate counts only", () => {
     const metadata = { version: 1 as const, runId: "r12345678", workflowId: "wf", sessionId: "s", cwd: "/tmp", workflowIntegrity: "a".repeat(64), template: "research" as const, status: "running" as const, startedAt: 1, updatedAt: 1 };
     const snapshot = { metadata, nodes: { a: "running" as const, b: "succeeded" as const } }; assert.ok(formatWorkflowStatus(snapshot, 24).length <= 24); const details = workflowStatusDetails(snapshot); assert.deepEqual(details.nodeCounts, { total: 2, running: 1, succeeded: 1 }); assert.equal("a" in details.nodeCounts, false);
+  });
+  it("tracks two detached workflows, refreshes persisted progress, and delivers one result each", async () => {
+    const { api, registeredTools, registeredMessageRenderers, sentMessages } = createMockExtensionApi();
+    const widgetCalls: any[] = [];
+    const lifecycle: Record<string, "running" | "completed"> = { alpha: "running", beta: "running" };
+    const progress: Record<string, "running" | "succeeded"> = { alpha: "running", beta: "running" };
+    const finishers = new Map<string, (value: any) => void>();
+    let refreshCallback!: () => void;
+    let refreshDelay = 0;
+    let clearCalls = 0;
+    const originalSetInterval = globalThis.setInterval;
+    const originalClearInterval = globalThis.clearInterval;
+    (globalThis as any).setInterval = (callback: () => void, delay: number) => { refreshCallback = callback; refreshDelay = delay; return { unref() {} }; };
+    (globalThis as any).clearInterval = () => { clearCalls += 1; };
+    const metadata = (id: string) => ({ version: 1 as const, runId: `run-${id}`, workflowId: id, sessionId: "s", cwd: "/tmp", workflowIntegrity: "a".repeat(64), template: "research" as const, status: lifecycle[id], startedAt: Date.now() - 1000, updatedAt: Date.now() });
+    const host = {
+      run: (id: string) => new Promise((resolve) => { finishers.set(id, (value) => { lifecycle[id] = "completed"; progress[id] = "succeeded"; resolve(value); }); }),
+      statusSnapshot: (id: string) => ({ metadata: metadata(id), nodes: { task: progress[id] === "succeeded" ? "succeeded" as const : "running" as const } }),
+      shutdown: async () => {},
+    };
+    try {
+      registerWorkflowUI(api as any, { owner: Symbol("widget-test"), launcher: () => ({}) as any, moduleSignal: new AbortController().signal, hostFactory: () => host as any });
+      const ctx = { cwd: "/tmp", modelRegistry: {}, hasUI: true, sessionManager: { getSessionId: () => "s", getSessionDir: () => "/tmp/session" }, ui: { setWidget: (...args: any[]) => widgetCalls.push(args), notify() {}, confirm: async () => true } } as any;
+      const runTool = registeredTools.find((entry) => entry.name === "workflow_run");
+      await runTool.execute("alpha-run", { workflowId: "alpha" }, undefined, undefined, ctx);
+      await runTool.execute("beta-run", { workflowId: "beta" }, undefined, undefined, ctx);
+      await registeredTools.find((entry) => entry.name === "workflow_status").execute("alpha-status", { workflowId: "alpha" }, undefined, undefined, ctx);
+      assert.equal(refreshDelay, 1000);
+      assert.equal(clearCalls, 0);
+      const widget = widgetCalls.at(-1)[1](null, null);
+      for (const width of [1, 8, 24, 80]) for (const line of widget.render(width)) assert.ok(visibleWidth(line) <= width, `${width}: ${JSON.stringify(line)}`);
+      assert.equal(widget.render(80).filter((line: string) => line.includes("alpha")).length, 1);
+      assert.equal(widget.render(80).filter((line: string) => line.includes("beta")).length, 1);
+      progress.alpha = "succeeded";
+      const beforeRefresh = widgetCalls.length;
+      refreshCallback();
+      assert.ok(widgetCalls.length > beforeRefresh, "persisted refresh should update widget");
+      const refreshed = widgetCalls.at(-1)[1](null, null).render(80).join("\n");
+      assert.match(refreshed, /1\/1/);
+      finishers.get("alpha")!({ state: { status: "completed", nodes: { task: "succeeded" } } });
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(sentMessages.length, 1, "status refresh must preserve the start binding and terminal delivery");
+      assert.equal(clearCalls, 0, "timer remains while beta is active");
+      assert.notEqual(widgetCalls.at(-1)[1], undefined, "timer/widget remain while beta is active");
+      finishers.get("beta")!({ state: { status: "completed", nodes: { task: "succeeded" } } });
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(sentMessages.length, 2);
+      assert.equal(sentMessages.filter((entry) => entry.message.customType === "workflow_result").length, 2);
+      assert.equal(clearCalls, 1, "owned refresh timer clears exactly once after all workflows finish");
+      assert.equal(widgetCalls.at(-1)[1], undefined, "widget clears after both terminal results");
+      const resultRenderer = registeredMessageRenderers.find((entry) => entry.name === "workflow_result").renderer;
+      const theme = { fg: (_c: string, text: string) => text, bg: (_c: string, text: string) => text, bold: (text: string) => text };
+      for (const message of sentMessages) {
+        const collapsed = resultRenderer({ details: message.message.details, content: "Workflow completed" }, { expanded: false }, theme);
+        for (const width of [1, 8, 24, 80]) for (const line of collapsed.render(width)) assert.ok(visibleWidth(line) <= width, `${width}: ${JSON.stringify(line)}`);
+        const expanded = resultRenderer({ details: message.message.details, content: "Workflow completed" }, { expanded: true }, theme).render(80).join("\n");
+        assert.match(expanded, /run run-/);
+        assert.match(expanded, /nodes: succeeded 1/);
+      }
+    } finally {
+      globalThis.setInterval = originalSetInterval;
+      globalThis.clearInterval = originalClearInterval;
+    }
+  });
+  it("retires old session generations and suppresses stale same-ID completion", async () => {
+    const { api, registeredTools, eventHandlers, sentMessages } = createMockExtensionApi();
+    const widgetCalls: any[] = [];
+    const deferred: Record<string, (value: any) => void> = {};
+    const hosts = new Map<string, any>();
+    let settleOldShutdown!: () => void;
+    const oldShutdown = new Promise<void>((resolve) => { settleOldShutdown = resolve; });
+    const makeHost = (sessionId: string) => {
+      const metadata = { version: 1 as const, runId: `run-${sessionId}`, workflowId: "same-id", sessionId, cwd: "/tmp", workflowIntegrity: "a".repeat(64), template: "research" as const, status: "running" as const, startedAt: Date.now(), updatedAt: Date.now() };
+      const host = { run: () => new Promise((resolve) => { deferred[sessionId] = resolve; }), statusSnapshot: () => ({ metadata, nodes: { task: "running" as const } }), shutdown: () => sessionId === "old-session" ? oldShutdown : Promise.resolve() };
+      hosts.set(sessionId, host); return host;
+    };
+    const oldHost = makeHost("old-session");
+    makeHost("new-session");
+    const factorySessions: string[] = [];
+    const registration = registerWorkflowUI(api as any, { owner: Symbol("generation-test"), launcher: () => ({}) as any, moduleSignal: new AbortController().signal, hostFactory: (parent: any) => { factorySessions.push(parent.parent.sessionId); return hosts.get(parent.parent.sessionId) ?? oldHost; } });
+    const context = (sessionId: string) => ({ cwd: "/tmp", modelRegistry: {}, hasUI: true, sessionManager: { getSessionId: () => sessionId, getSessionDir: () => `/tmp/${sessionId}` }, ui: { setWidget: (...args: any[]) => widgetCalls.push(args), notify() {}, confirm: async () => true } } as any);
+    const oldCtx = context("old-session");
+    await registeredTools.find((entry) => entry.name === "workflow_run").execute("old", { workflowId: "same-id" }, undefined, undefined, oldCtx);
+    const sessionStart = eventHandlers.get("session_start")![0];
+    const newCtx = context("new-session");
+    const switchPromise = sessionStart({}, newCtx);
+    await Promise.resolve();
+    assert.deepEqual(factorySessions, ["old-session"], "replacement host must wait for prior owner shutdown");
+    settleOldShutdown();
+    await switchPromise;
+    assert.deepEqual(factorySessions, ["old-session", "new-session"]);
+    await registeredTools.find((entry) => entry.name === "workflow_run").execute("new", { workflowId: "same-id" }, undefined, undefined, newCtx);
+    deferred["old-session"]({ state: { status: "completed", nodes: { task: "succeeded" } } });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(sentMessages.length, 0);
+    assert.notEqual(widgetCalls.at(-1)[1], undefined);
+    deferred["new-session"]({ state: { status: "completed", nodes: { task: "succeeded" } } });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(sentMessages.length, 1);
+    assert.equal(sentMessages[0].message.details.workflowId, "same-id");
+    await registration.shutdown();
+  });
+  it("shutdown clears active workflow widget and refresh timer", async () => {
+    const { api, registeredTools, sentMessages } = createMockExtensionApi();
+    const widgetCalls: any[] = [];
+    let resolveRun!: (value: any) => void;
+    const metadata = { version: 1 as const, runId: "run", workflowId: "wf-shutdown", sessionId: "s", cwd: "/tmp", workflowIntegrity: "a".repeat(64), template: "research" as const, status: "running" as const, startedAt: Date.now(), updatedAt: Date.now() };
+    const host = { run: () => new Promise((resolve) => { resolveRun = resolve; }), statusSnapshot: () => ({ metadata, nodes: { task: "running" as const } }), shutdown: async () => {} };
+    const registration = registerWorkflowUI(api as any, { owner: Symbol("shutdown-test"), launcher: () => ({}) as any, moduleSignal: new AbortController().signal, hostFactory: () => host as any });
+    const ctx = { cwd: "/tmp", modelRegistry: {}, hasUI: true, sessionManager: { getSessionId: () => "s", getSessionDir: () => "/tmp/session" }, ui: { setWidget: (...args: any[]) => widgetCalls.push(args), notify() {}, confirm: async () => true } } as any;
+    await registeredTools.find((entry) => entry.name === "workflow_run").execute("run", { workflowId: "wf-shutdown" }, undefined, undefined, ctx);
+    await registration.shutdown();
+    assert.equal(widgetCalls.at(-1)[1], undefined);
+    resolveRun({ state: { status: "completed", nodes: { task: "succeeded" } } });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(sentMessages.length, 0, "post-shutdown completion must not enter the transcript");
+  });
+  it("redacts terminal controls and credential-shaped workflow errors before delivery and rendering", async () => {
+    const { api, registeredTools, registeredMessageRenderers, sentMessages } = createMockExtensionApi();
+    const dangerous = "\u001b[31mBearer super-secret\u001b]0;token=ghp_123456789abcdef\u0007 https://user:pass@example.com/x?access_token=query-secret {\"client_secret\":\"two word secret\"} Authorization: Basic dXNlcjpwYXNz; Proxy-Authorization=Digest username=admin,response=deadbeef; AKIA1234567890ABCDEF jwt eyJaaaaaaaaaa.eyJbbbbbbbbbb.sigcccccccccc\u001b[";
+    const sanitized = sanitizeDisplayText(dangerous);
+    assert.doesNotMatch(sanitized, /[\x00-\x1f\x7f-\x9f]|Bearer super-secret|ghp_|user:pass|query-secret|two word secret|dXNlcjpwYXNz|username=admin|deadbeef|AKIA123|eyJaaaaaaaaaa/);
+    assert.equal(stripTerminalControls("ok\u001b]unterminated payload"), "ok");
+    const metadata = (id: string) => ({ version: 1 as const, runId: `run-${id}`, workflowId: id, sessionId: "s", cwd: "/tmp", workflowIntegrity: "a".repeat(64), template: "research" as const, status: "running" as const, startedAt: Date.now(), updatedAt: Date.now() });
+    const host = {
+      run: (id: string) => id === "reject" ? Promise.reject(new Error(dangerous)) : Promise.resolve({ state: { status: "completed", nodes: { task: "failed" }, results: { task: { error: dangerous } } } }),
+      statusSnapshot: (id: string) => ({ metadata: metadata(id), nodes: { task: "running" as const } }),
+      shutdown: async () => {},
+    };
+    registerWorkflowUI(api as any, { owner: Symbol("redaction-test"), launcher: () => ({}) as any, moduleSignal: new AbortController().signal, hostFactory: () => host as any });
+    const ctx = { cwd: "/tmp", modelRegistry: {}, hasUI: false, sessionManager: { getSessionId: () => "s", getSessionDir: () => "/tmp/session" }, ui: { setWidget() {}, notify() {}, confirm: async () => true } } as any;
+    const runTool = registeredTools.find((entry) => entry.name === "workflow_run");
+    await runTool.execute("reject", { workflowId: "reject" }, undefined, undefined, ctx);
+    await runTool.execute("node-error", { workflowId: "node-error" }, undefined, undefined, ctx);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(sentMessages.length, 2);
+    for (const sent of sentMessages) {
+      const serialized = JSON.stringify(sent.message);
+      assert.doesNotMatch(serialized, /\\u001b|super-secret|ghp_|user:pass|query-secret|two word secret|dXNlcjpwYXNz|username=admin|deadbeef|AKIA123|eyJaaaaaaaaaa/);
+    }
+    const theme = { fg: (_c: string, text: string) => text, bg: (_c: string, text: string) => text, bold: (text: string) => text };
+    for (const name of ["workflow_result", "workflow_status"]) {
+      const renderer = registeredMessageRenderers.find((entry) => entry.name === name).renderer;
+      for (const expanded of [false, true]) {
+        const rendered = renderer({ details: { workflowId: "wf", status: "failed", error: dangerous, errors: { task: dangerous }, nodeCounts: { total: 1, failed: 1 } }, content: dangerous }, { expanded }, theme);
+        for (const width of [0, 1, 8, 24, 80]) for (const line of rendered.render(width)) {
+          assert.ok(visibleWidth(line) <= width, `${name}/${expanded}/${width}: ${JSON.stringify(line)}`);
+          const plain = stripTerminalControls(line);
+          assert.doesNotMatch(plain, /super-secret|ghp_|user:pass|query-secret|two word secret|dXNlcjpwYXNz|username=admin|deadbeef|AKIA123|eyJaaaaaaaaaa/);
+        }
+      }
+    }
+  });
+  it("renders operation-specific result cards from context args without exposing apply tokens", () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    registerWorkflowUI(api as any, { owner: Symbol("card-test"), launcher: () => ({}) as any, moduleSignal: new AbortController().signal, hostFactory: () => ({ shutdown: async () => {} }) as any });
+    const theme = { fg: (_c: string, text: string) => text, bold: (text: string) => text };
+    const apply = registeredTools.find((entry) => entry.name === "workflow_apply");
+    const call = apply.renderCall({ workflowId: "wf", nodeId: "task", token: "c".repeat(64) }, theme).render(80).join("\n");
+    assert.match(call, /wf/); assert.match(call, /task/); assert.doesNotMatch(call, /c{64}/);
+    const cases = [
+      ["workflow_plan", "planned"], ["workflow_run", "started"], ["workflow_status", "status: running"],
+      ["workflow_cancel", "cancelled"], ["workflow_resume", "resumed"], ["workflow_approve", "token issued"], ["workflow_apply", "applied"],
+    ] as const;
+    for (const [name, label] of cases) {
+      const tool = registeredTools.find((entry) => entry.name === name);
+      const args = { workflowId: "target", nodeId: "node", attempt: 2, token: "c".repeat(64), ...(name === "workflow_status" ? { status: "running" } : {}) };
+      const output = tool.renderResult({ details: {}, content: [{ type: "text", text: "ok" }] }, {}, theme, { args }).render(120).join("\n");
+      assert.match(output, new RegExp(label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), name);
+      assert.match(output, /target/); assert.doesNotMatch(output, /c{64}/);
+    }
+    const failed = apply.renderResult({ details: { error: "bad token" }, content: [{ type: "text", text: "failed" }] }, {}, theme, { args: { workflowId: "target", nodeId: "node" } }).render(120).join("\n");
+    assert.match(failed, /target/); assert.match(failed, /failed/); assert.match(failed, /✗/);
   });
 });

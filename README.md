@@ -99,7 +99,7 @@ The external Claude CLI path is retained for legacy custom profiles. The hidden 
 - Node.js 22+
 - A supported multiplexer: Herdr, cmux, tmux, zellij, or WezTerm
 
-Run Pi inside the mux, or set `PI_SUBAGENT_MUX=herdr|cmux|tmux|zellij|wezterm` to force a backend. Slow shell startup can be accommodated with `PI_SUBAGENT_SHELL_READY_DELAY_MS` (default `500`). The workflow widget is separate from the legacy subagent activity widget and remains bounded in narrow terminals.
+Run Pi inside the mux, or set `PI_SUBAGENT_MUX=herdr|cmux|tmux|zellij|wezterm` to force a backend. Slow shell startup can be accommodated with `PI_SUBAGENT_SHELL_READY_DELAY_MS` (default `500`). Active detached workflows use the legacy bordered widget language (one row per workflow, refreshed from persisted state); the workflow widget remains separate from the legacy subagent activity widget and bounded in narrow terminals. Completion is rendered as a boxed `workflow_result`; status tools/commands use semantic tool cards and notifications, while the boxed `workflow_status` renderer is retained for existing transcript records rather than emitted for every status query.
 
 ## Development
 
