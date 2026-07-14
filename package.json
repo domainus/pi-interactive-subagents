@@ -1,19 +1,24 @@
 {
   "name": "pi-interactive-subagents",
   "version": "3.7.2",
-  "description": "Interactive subagents for pi across Herdr, cmux, tmux, Zellij, and WezTerm",
+  "description": "Policy-constrained dynamic DAG workflows and detached subagent compatibility adapters for pi",
   "keywords": [
-    "pi-package"
+    "pi-package",
+    "workflow",
+    "dag",
+    "policy",
+    "subagents",
+    "orchestration"
   ],
   "license": "MIT",
   "author": "HazAT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/HazAT/pi-interactive-subagents"
+    "url": "https://github.com/domainus/pi-interactive-subagents"
   },
   "type": "module",
   "scripts": {
-    "test": "node --test test/test.ts test/workflow-contracts.test.ts test/workflow-executor.test.ts test/workflow-host.test.ts",
+    "test": "node --test test/test.ts test/workflow-contracts.test.ts test/workflow-executor.test.ts test/workflow-host.test.ts test/identity-docs.test.ts",
     "test:integration": "node --test --test-concurrency=1 test/integration/*.test.ts"
   },
   "peerDependencies": {

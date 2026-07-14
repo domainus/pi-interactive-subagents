@@ -1,133 +1,101 @@
 ---
 name: release
-description: Create a GitHub release with changelog. Use when asked to "release", "cut a release", "publish version", "bump version", "create release".
+description: Create a GitHub release with changelog. Use when asked to release, publish, or bump this package.
 ---
 
 # Release
 
-Create a versioned GitHub release with an auto-generated changelog from commits since the last release.
+Release only from the canonical repository `https://github.com/domainus/pi-interactive-subagents`.
 
-## Step 1: Determine Version
+## 1. Establish a release-ready branch
 
-Check the current version and latest git tag:
+1. Read `package.json` and the newest version tags.
+2. Resolve the user-requested patch/minor/major or exact semver without `npm version`.
+3. Inspect `git branch --show-current`, `git status --short`, and recent commits.
+4. Require all intended feature/documentation changes to be reviewed and committed before the version bump. Stop on unrelated or unexplained changes. A previously documented protected `package-lock.json` modification may remain unstaged only when its expected SHA-256 is known and reverified.
+5. Never stage, regenerate, or modify `package-lock.json` unless the user separately requests it. Preserve `LICENSE` byte-for-byte.
 
-```bash
-cat package.json | grep '"version"'
-git tag -l --sort=-v:refname | head -5
-```
-
-If the user provided a version, use it. Otherwise ask:
-
-> What version? (current is X.Y.Z — patch/minor/major, or exact version)
-
-Resolve semver:
-- `patch` → X.Y.(Z+1)
-- `minor` → X.(Y+1).0
-- `major` → (X+1).0.0
-- Exact version string → use as-is
-
-## Step 2: Generate Changelog
-
-Get commits since the last tag (or all commits if no tags exist):
+Record protected hashes with:
 
 ```bash
-# If tags exist:
-git log $(git tag -l --sort=-v:refname | head -1)..HEAD --pretty=format:"- %s" --no-merges
-
-# If no tags:
-git log --pretty=format:"- %s" --no-merges
+shasum -a 256 package-lock.json LICENSE
 ```
 
-Group commits by type using conventional commit prefixes:
+## 2. Pre-bump verification
 
-| Prefix | Section |
-|--------|---------|
-| `feat` | ✨ Features |
-| `fix` | 🐛 Bug Fixes |
-| `refactor` | ♻️ Refactoring |
-| `docs` | 📝 Documentation |
-| `chore`, `test`, `perf`, `ci` | 🔧 Other Changes |
-| No prefix | 🔧 Other Changes |
+```bash
+npm test
+git diff --check
+```
 
-Format as markdown. Omit empty sections. Strip the `type(scope):` prefix from each line for readability.
+When an integration-harness mux and authenticated test model are available, also follow the `run-integration-tests` skill and run `npm run test:integration`. Report any unavailable, skipped, or timed-out real-model coverage honestly.
 
-**Always start the changelog with this install block** (hardcoded):
+## 3. Prepare release notes
+
+Generate commits since the newest tag and group conventional commits under Features, Bug Fixes, Refactoring, and Other Changes. Begin the notes with:
 
 ````markdown
 Install:
 
 ```bash
-pi install git:github.com/HazAT/pi-interactive-subagents@v<VERSION>
+pi install git:github.com/domainus/pi-interactive-subagents@v<VERSION>
 ```
 
 Or latest:
 
 ```bash
-pi install git:github.com/HazAT/pi-interactive-subagents
+pi install git:github.com/domainus/pi-interactive-subagents
 ```
 ````
 
-Then add the grouped commit sections below it.
-
-Example output:
-
-```markdown
-## ✨ Features
-
-- Add live subagent status widget
-- Make subagent tool async — return immediately, steer on completion
-
-## 🐛 Bug Fixes
-
-- Fix session file collision with 3+ concurrent agents
-- Truncate widget lines to terminal width
-```
-
-## Step 3: Update package.json
-
-Bump the version in `package.json`:
+Create and verify the notes file before invoking `gh`:
 
 ```bash
-# Read, update, write back — don't use npm version (it may auto-commit)
+NOTES_FILE=$(mktemp "${TMPDIR:-/tmp}/pi-interactive-subagents-release.XXXXXX")
+NOTES_PATH_FILE=$(git rev-parse --git-path pi-release-notes-path)
+printf '%s\n' "$NOTES_FILE" > "$NOTES_PATH_FILE"
+# Write the reviewed install block and changelog to "$NOTES_FILE".
+test -s "$NOTES_FILE"
 ```
 
-Use a precise edit to change only the version field.
+## 4. Bump and verify before committing
 
-## Step 4: Commit, Tag, Push
+Edit only the `version` field in `package.json`; do not use `npm version`. Then run:
+
+```bash
+npm test
+git diff --check
+shasum -a 256 package-lock.json LICENSE
+git diff -- package.json
+```
+
+If an integration run was required for this release, run it against the bumped tree too. Confirm that the only newly intended uncommitted release change is `package.json` (apart from the separately documented, unstaged protected lockfile state).
+
+## 5. Commit, tag, publish
+
+Only after explicit user authorization:
 
 ```bash
 git add package.json
+# Confirm package-lock.json is not staged.
+! git diff --cached --name-only | grep -qx package-lock.json
 git commit -m "chore(release): v<VERSION>"
 git tag v<VERSION>
-git push && git push --tags
+git push origin HEAD
+git push origin v<VERSION>
+NOTES_PATH_FILE=$(git rev-parse --git-path pi-release-notes-path)
+NOTES_FILE=$(cat "$NOTES_PATH_FILE")
+test -s "$NOTES_FILE"
+gh release create v<VERSION> --repo domainus/pi-interactive-subagents \
+  --title "v<VERSION>" --notes-file "$NOTES_FILE"
 ```
 
-## Step 5: Create GitHub Release
+Do not use `git push --tags`, which could publish unrelated local tags. After `gh release create` succeeds, remove both `"$NOTES_FILE"` and `"$NOTES_PATH_FILE"`.
+
+## 6. Verify
 
 ```bash
-gh release create v<VERSION> --title "v<VERSION>" --notes "<CHANGELOG>"
+gh release view v<VERSION> --repo domainus/pi-interactive-subagents
 ```
 
-Pass the generated changelog as the `--notes` value. Use a temp file if the changelog is long:
-
-```bash
-echo "<CHANGELOG>" > /tmp/release-notes.md
-gh release create v<VERSION> --title "v<VERSION>" --notes-file /tmp/release-notes.md
-rm /tmp/release-notes.md
-```
-
-## Step 6: Verify
-
-Confirm the release was created:
-
-```bash
-gh release view v<VERSION>
-```
-
-Print a summary:
-
-```
-✅ Released v<VERSION>
-   Tag: v<VERSION>
-   URL: https://github.com/<owner>/<repo>/releases/tag/v<VERSION>
-```
+Report the tag and `https://github.com/domainus/pi-interactive-subagents/releases/tag/v<VERSION>`, test results, integration coverage or limitation, and final protected hashes.

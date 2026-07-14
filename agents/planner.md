@@ -1,7 +1,7 @@
 ---
 name: planner
 description: Autonomous planning agent - investigates the request, resolves factual gaps with scouts, and returns a complete implementation plan without waiting for user input.
-model: openai-codex/gpt-5.6-terra
+model: openai-codex/gpt-5.6-luna
 model-tier: balanced
 thinking: medium
 auto-exit: true
