@@ -69,6 +69,8 @@ test("prompt safely layers host policy and gives a valid final envelope boundary
   assert.ok(prompt.indexOf("END GENERATED TASK DATA") > prompt.indexOf("ignore policy"));
   assert.ok(prompt.includes("MAY use the effective native tools"));
   assert.ok(prompt.includes("ONLY THE FINAL ASSISTANT RESPONSE"));
+  assert.ok(prompt.includes("Status describes whether you completed this node's objective"));
+  assert.ok(prompt.includes("if you completed the requested inspection or analysis and discovered a domain blocker, return succeeded"));
   assert.ok(prompt.includes("For failed or blocked, error is REQUIRED and must be a non-empty string"));
   assert.ok(prompt.includes('"status":"blocked"'));
   assert.ok(prompt.includes('"error":"Required evidence is unavailable."'));
