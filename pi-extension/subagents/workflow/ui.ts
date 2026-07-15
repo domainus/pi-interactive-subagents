@@ -67,7 +67,7 @@ export function registerWorkflowUI(pi: ExtensionAPI, options: { owner: symbol; l
     if (value && typeof value === "object") return Object.fromEntries(Object.entries(value as Record<string, unknown>).slice(0, 128).map(([key, item]) => [sanitizeDisplayText(key, 128), sanitizeDetails(item)]));
     return value;
   };
-  const sendTerminal = (kind: "workflow_result", details: Record<string, unknown>, text: string) => { try { pi.sendMessage({ customType: kind, content: sanitizeDisplayText(text, 2000), display: true, details: sanitizeDetails(details) as Record<string, unknown> }, { triggerTurn: false }); } catch {} };
+  const sendTerminal = (kind: "workflow_result", details: Record<string, unknown>, text: string) => { try { pi.sendMessage({ customType: kind, content: sanitizeDisplayText(`${text}\nContinue the parent task now: inspect the durable workflow results and perform the next required step.`, 2000), display: true, details: sanitizeDetails(details) as Record<string, unknown> }, { triggerTurn: true, deliverAs: "followUp" }); } catch {} };
   const clearWidget = (ctx: AnyCtx | undefined): void => { if (!ctx?.hasUI || typeof ctx.ui.setWidget !== "function") return; try { ctx.ui.setWidget(WORKFLOW_STATUS_WIDGET_KEY, undefined); } catch {} };
   const stopRefresh = (): void => { if (interval) { clearWorkflowInterval(interval); interval = undefined; } };
   const retireGeneration = (): void => { generation += 1; stopRefresh(); active.clear(); clearWidget(lastCtx); };

@@ -5442,6 +5442,10 @@ describe("workflow UI registration", () => {
       await new Promise((resolve) => setImmediate(resolve));
       assert.equal(sentMessages.length, 2);
       assert.equal(sentMessages.filter((entry) => entry.message.customType === "workflow_result").length, 2);
+      for (const entry of sentMessages) {
+        assert.deepEqual(entry.options, { triggerTurn: true, deliverAs: "followUp" });
+        assert.match(entry.message.content, /Continue the parent task now: inspect the durable workflow results/);
+      }
       assert.equal(clearCalls, 1, "owned refresh timer clears exactly once after all workflows finish");
       assert.equal(widgetCalls.at(-1)[1], undefined, "widget clears after both terminal results");
       const resultRenderer = registeredMessageRenderers.find((entry) => entry.name === "workflow_result").renderer;
