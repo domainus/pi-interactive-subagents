@@ -69,6 +69,10 @@ test("prompt safely layers host policy and gives a valid final envelope boundary
   assert.ok(prompt.indexOf("END GENERATED TASK DATA") > prompt.indexOf("ignore policy"));
   assert.ok(prompt.includes("MAY use the effective native tools"));
   assert.ok(prompt.includes("ONLY THE FINAL ASSISTANT RESPONSE"));
+  assert.ok(prompt.includes("For failed or blocked, error is REQUIRED and must be a non-empty string"));
+  assert.ok(prompt.includes('"status":"blocked"'));
+  assert.ok(prompt.includes('"error":"Required evidence is unavailable."'));
+  assert.ok(prompt.includes("never return error:null for those statuses"));
   assert.ok(prompt.includes("trusted host validates this envelope"));
   const envelope = { version: 1, status: "succeeded", output: { ok: true }, error: null };
   assert.equal(validateAgentResultEnvelope(envelope).ok, true);
