@@ -98,6 +98,34 @@ export function workflowBorderBottom(width: number): string {
   return `${ACCENT}╰${"─".repeat(Math.max(0, width - 2))}╯${RST}`;
 }
 
+/** A stable, visually distinct icon for every node lifecycle state. */
+export function workflowNodeStatusIcon(status: NodeStatus): string {
+  switch (status) {
+    case "pending": return "○";
+    case "running": return "●";
+    case "retrying": return "↻";
+    case "succeeded": return "✓";
+    case "failed": return "✗";
+    case "blocked": return "⊘";
+    case "cancelled": return "■";
+  }
+}
+
+/**
+ * Return bounded, display-only node rows. This deliberately includes only the
+ * node identity and lifecycle state; results, prompts, paths, and credentials
+ * never cross this presentation boundary.
+ */
+const NODE_ACTION_PRIORITY: Readonly<Record<NodeStatus, number>> = Object.freeze({ failed: 0, blocked: 1, retrying: 2, running: 3, pending: 4, succeeded: 5, cancelled: 6 });
+
+export function workflowNodeRows(snapshot: WorkflowStatusSnapshot, maxNodes = 32): ReadonlyArray<{ nodeId: string; status: NodeStatus; icon: string }> {
+  const limit = Math.max(0, Math.min(128, Math.floor(Number.isFinite(maxNodes) ? maxNodes : 32)));
+  return Object.entries(snapshot.nodes ?? {})
+    .sort(([a, aStatus], [b, bStatus]) => NODE_ACTION_PRIORITY[aStatus] - NODE_ACTION_PRIORITY[bStatus] || a.localeCompare(b))
+    .slice(0, limit)
+    .map(([nodeId, status]) => ({ nodeId, status, icon: workflowNodeStatusIcon(status) }));
+}
+
 export function workflowWidgetRight(snapshot: WorkflowStatusSnapshot): string {
   const counts = workflowNodeCounts(snapshot);
   const total = counts.total;

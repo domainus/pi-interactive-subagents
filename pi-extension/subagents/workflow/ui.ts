@@ -4,7 +4,7 @@ import { keyHint } from "@mariozechner/pi-coding-agent";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { createWorkflowHost, type WorkflowHost } from "./host.ts";
 import type { WorkflowRunTemplate, WorkflowRunStatus } from "./types.ts";
-import { formatWorkflowStatus, workflowBorderBottom, workflowBorderLine, workflowBorderTop, workflowElapsed, workflowIsActive, workflowStatusDetails, workflowWidgetRight, WORKFLOW_STATUS_WIDGET_KEY, type WorkflowStatusSnapshot } from "./status.ts";
+import { formatWorkflowStatus, workflowBorderBottom, workflowBorderLine, workflowBorderTop, workflowElapsed, workflowIsActive, workflowNodeRows, workflowStatusDetails, workflowWidgetRight, WORKFLOW_STATUS_WIDGET_KEY, type WorkflowStatusSnapshot } from "./status.ts";
 import type { WorkflowNodeLauncher } from "./executor.ts";
 import type { WorkflowModelRegistry } from "./models.ts";
 import { sanitizeDisplayText } from "../display-safety.ts";
@@ -31,6 +31,9 @@ async function waitForCancellation(operation: Promise<void>, signal?: AbortSigna
 function parseJsonArgs(args: string): any { const raw = args.trim(); if (!raw || raw.length > MAX_JSON) throw new Error("workflow JSON is empty or oversized"); const value = JSON.parse(raw); if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("workflow JSON must be an object"); return value; }
 
 const WORKFLOW_INTERVAL_KEY = Symbol.for("pi-subagents/workflow-status-interval");
+// Keep widget height bounded even when many detached workflows contain large DAGs.
+const WORKFLOW_NODE_ROW_BUDGET = 24;
+const WORKFLOW_NODE_ROWS_PER_WORKFLOW = 8;
 type WorkflowIntervalOwner = { owner: symbol; timer: ReturnType<typeof setInterval> };
 function clearWorkflowInterval(value: WorkflowIntervalOwner | ReturnType<typeof setInterval> | undefined): void { if (!value) return; const timer = typeof value === "object" && "timer" in value ? value.timer : value; clearInterval(timer); if ((globalThis as any)[WORKFLOW_INTERVAL_KEY] === value) (globalThis as any)[WORKFLOW_INTERVAL_KEY] = undefined; }
 function visibleLines(lines: string[], width: number): string[] { const limit = Math.max(0, Number.isFinite(width) ? Math.floor(width) : 0); return lines.map((line) => truncateToWidth(line, limit)); }
@@ -87,11 +90,35 @@ export function registerWorkflowUI(pi: ExtensionAPI, options: { owner: symbol; l
   const renderWidget = (width: number): string[] => {
     const rows = [...active.values()].sort((a, b) => a.snapshot.metadata.workflowId.localeCompare(b.snapshot.metadata.workflowId));
     const lines = [workflowBorderTop("Workflows", `${rows.length} active`, width)];
+    const priority: Readonly<Record<string, number>> = { failed: 0, blocked: 1, retrying: 2, running: 3, pending: 4, succeeded: 5, cancelled: 6 };
+    const candidates = rows.flatMap((entry) => workflowNodeRows(entry.snapshot, WORKFLOW_NODE_ROWS_PER_WORKFLOW).map((node) => ({ ...node, workflowId: entry.snapshot.metadata.workflowId })));
+    const selected = new Set(candidates
+      .slice().sort((a, b) => priority[a.status] - priority[b.status] || a.workflowId.localeCompare(b.workflowId) || a.nodeId.localeCompare(b.nodeId))
+      .slice(0, WORKFLOW_NODE_ROW_BUDGET));
+    const globallyOmitted = Math.max(0, candidates.length - selected.size);
     for (const entry of rows) {
       const snapshot = entry.snapshot;
       const left = ` ${workflowElapsed(snapshot)}  ${snapshot.metadata.workflowId} (${snapshot.metadata.template}) `;
+      // Keep every workflow summary visible, then show only bounded,
+      // actionable, display-safe node identity/state rows. Never render node
+      // output, prompts, paths, or credentials in this detached widget.
       lines.push(workflowBorderLine(left, ` ${workflowWidgetRight(snapshot)} `, width));
+      const nodeCount = Object.keys(snapshot.nodes ?? {}).length;
+      const perWorkflowLimit = Math.min(WORKFLOW_NODE_ROWS_PER_WORKFLOW, nodeCount);
+      const nodeRows = candidates.filter((node) => node.workflowId === snapshot.metadata.workflowId && selected.has(node));
+      for (const node of nodeRows) {
+        const sanitizedNodeId = sanitizeDisplayText(node.nodeId, 128);
+        // Durable schemas constrain IDs, but treat persisted/runtime snapshots
+        // defensively too: malformed IDs must not become a data exfiltration
+        // channel for paths, prompts, or credential-shaped values.
+        const nodeId = /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(sanitizedNodeId) ? sanitizedNodeId : "[REDACTED]";
+        const nodeLabel = `   ${node.icon} ${nodeId}`;
+        lines.push(workflowBorderLine(nodeLabel, ` ${node.status} `, width));
+      }
+      const perWorkflowOmitted = Math.max(0, nodeCount - perWorkflowLimit);
+      if (perWorkflowOmitted) lines.push(workflowBorderLine(`   … +${perWorkflowOmitted} node rows`, " omitted ", width));
     }
+    if (globallyOmitted) lines.push(workflowBorderLine(`   … +${globallyOmitted} node rows`, " omitted globally ", width));
     lines.push(workflowBorderBottom(width));
     return lines;
   };

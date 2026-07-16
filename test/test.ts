@@ -5395,6 +5395,35 @@ describe("workflow UI registration", () => {
     const metadata = { version: 1 as const, runId: "r12345678", workflowId: "wf", sessionId: "s", cwd: "/tmp", workflowIntegrity: "a".repeat(64), template: "research" as const, status: "running" as const, startedAt: 1, updatedAt: 1 };
     const snapshot = { metadata, nodes: { a: "running" as const, b: "succeeded" as const } }; assert.ok(formatWorkflowStatus(snapshot, 24).length <= 24); const details = workflowStatusDetails(snapshot); assert.deepEqual(details.nodeCounts, { total: 2, running: 1, succeeded: 1 }); assert.equal("a" in details.nodeCounts, false);
   });
+  it("bounds global node rows, preserves summaries, prioritizes actionable states, and redacts node ids", async () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    const widgetCalls: any[] = [];
+    const deferred: Array<(value: any) => void> = [];
+    const metadata = (id: string) => ({ version: 1 as const, runId: `run-${id}`, workflowId: id, sessionId: "s", cwd: "/tmp", workflowIntegrity: "a".repeat(64), template: "research" as const, status: "running" as const, startedAt: Date.now(), updatedAt: Date.now() });
+    const nodes = () => Object.fromEntries([
+      ["pending", "pending"], ["success", "succeeded"], ["running", "running"], ["retry", "retrying"], ["blocked", "blocked"], ["failed", "failed"],
+      ...Array.from({ length: 26 }, (_, i) => [`task-${i}`, "pending"]), ["token=super-secret", "failed"], ["/private/path", "blocked"], ["output secret", "succeeded"],
+    ]);
+    const host = { run: () => new Promise((resolve) => deferred.push(resolve)), statusSnapshot: (id: string) => ({ metadata: metadata(id), nodes: nodes() }), shutdown: async () => {} };
+    const registration = registerWorkflowUI(api as any, { owner: Symbol("budget-test"), launcher: () => ({}) as any, moduleSignal: new AbortController().signal, hostFactory: () => host as any });
+    const ctx = { cwd: "/tmp", modelRegistry: {}, hasUI: true, sessionManager: { getSessionId: () => "s", getSessionDir: () => "/tmp/session" }, ui: { setWidget: (...args: any[]) => widgetCalls.push(args), notify() {}, confirm: async () => true } } as any;
+    try {
+      const runTool = registeredTools.find((entry) => entry.name === "workflow_run")!;
+      await runTool.execute("one", { workflowId: "one" }, undefined, undefined, ctx);
+      await runTool.execute("two", { workflowId: "two" }, undefined, undefined, ctx);
+      await runTool.execute("three", { workflowId: "three" }, undefined, undefined, ctx);
+      await runTool.execute("four", { workflowId: "four" }, undefined, undefined, ctx);
+      const widget = widgetCalls.at(-1)[1](null, null);
+      for (const width of [1, 8, 24, 80]) for (const line of widget.render(width)) assert.ok(visibleWidth(line) <= width, `${width}: ${JSON.stringify(line)}`);
+      const rendered = widget.render(80).join("\n");
+      assert.match(rendered, /one/); assert.match(rendered, /two/); assert.match(rendered, /three/); assert.match(rendered, /four/);
+      assert.match(rendered, /failed/); assert.match(rendered, /blocked/); assert.match(rendered, /retrying/);
+      assert.match(rendered, /omitted globally/); assert.ok(widget.render(80).length <= 40, "global widget height must remain bounded");
+      assert.doesNotMatch(rendered, /super-secret|\/private\/path|output secret/);
+      assert.match(rendered, /token=\[REDACTED\]|\[REDACTED\]/);
+    } finally { await registration.shutdown(); deferred.forEach((resolve) => resolve({ state: { status: "cancelled", nodes: {} } })); }
+  });
+
   it("tracks two detached workflows, refreshes persisted progress, and delivers one result each", async () => {
     const { api, registeredTools, registeredMessageRenderers, sentMessages } = createMockExtensionApi();
     const widgetCalls: any[] = [];
@@ -5425,14 +5454,20 @@ describe("workflow UI registration", () => {
       assert.equal(clearCalls, 0);
       const widget = widgetCalls.at(-1)[1](null, null);
       for (const width of [1, 8, 24, 80]) for (const line of widget.render(width)) assert.ok(visibleWidth(line) <= width, `${width}: ${JSON.stringify(line)}`);
-      assert.equal(widget.render(80).filter((line: string) => line.includes("alpha")).length, 1);
-      assert.equal(widget.render(80).filter((line: string) => line.includes("beta")).length, 1);
+      const initialWidget = widget.render(80).join("\n");
+      assert.equal(initialWidget.split("\n").filter((line) => line.includes("alpha")).length, 1);
+      assert.equal(initialWidget.split("\n").filter((line) => line.includes("beta")).length, 1);
+      assert.match(initialWidget, /task/);
+      assert.match(initialWidget, /running/);
+      assert.doesNotMatch(initialWidget, /secret output|\/private\/path|Bearer|token=/i);
       progress.alpha = "succeeded";
       const beforeRefresh = widgetCalls.length;
       refreshCallback();
       assert.ok(widgetCalls.length > beforeRefresh, "persisted refresh should update widget");
       const refreshed = widgetCalls.at(-1)[1](null, null).render(80).join("\n");
       assert.match(refreshed, /1\/1/);
+      assert.match(refreshed, /task/);
+      assert.match(refreshed, /succeeded/);
       finishers.get("alpha")!({ state: { status: "completed", nodes: { task: "succeeded" } } });
       await new Promise((resolve) => setImmediate(resolve));
       assert.equal(sentMessages.length, 1, "status refresh must preserve the start binding and terminal delivery");

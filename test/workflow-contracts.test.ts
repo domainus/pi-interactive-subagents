@@ -8,6 +8,7 @@ import { WORKFLOW_MODELS } from "../pi-extension/subagents/workflow/types.ts";
 import { validateAgentResultEnvelope, validateTaskNode, validateTaskResult, validateWorkflowRunMetadata, validateWorkflowSpec, validateWorkflowState, WorkflowSpecSchema } from "../pi-extension/subagents/workflow/schema.ts";
 import { DEFAULT_CAPABILITY_CATALOG, effectiveKernelTools, resolveEffectiveTools } from "../pi-extension/subagents/workflow/capabilities.ts";
 import { resolveCombinedModelPolicy, resolveWorkflowModel } from "../pi-extension/subagents/workflow/kernels.ts";
+import { workflowBorderLine, workflowNodeRows, workflowNodeStatusIcon } from "../pi-extension/subagents/workflow/status.ts";
 import { composeTaskPrompt } from "../pi-extension/subagents/workflow/prompt.ts";
 import { createWorkflowStorage, WorkflowStorageError } from "../pi-extension/subagents/workflow/storage.ts";
 import { WORKFLOW_TEMPLATES, mapGeneratedNodeIdsToHostPolicy } from "../pi-extension/subagents/workflow/templates.ts";
@@ -15,6 +16,27 @@ import { isHashedWorkflowWorktreeRoot, resolveWorkflowWorktreeRoot } from "../pi
 
 const node = { version: 1 as const, id: "build", kernel: "builder" as const, objective: "compile", expertise: ["typescript"], capabilities: ["read-files"], mode: "read-only" as const, requiresWorktree: false, dependsOn: [] };
 const workflow = { version: 1 as const, id: "wf-1", sessionId: "sess-1", objective: "do work", nodes: [node], capabilities: ["read-files"] };
+
+test("workflow widget exposes bounded node lifecycle rows without task data", () => {
+  const snapshot = { metadata: { version: 1 as const, runId: "run", workflowId: "wf", sessionId: "session", cwd: "/safe", workflowIntegrity: "a".repeat(64), template: "research" as const, status: "running" as const }, nodes: {
+    zeta: "cancelled" as const, alpha: "pending" as const, retry: "retrying" as const, active: "running" as const,
+    done: "succeeded" as const, bad: "failed" as const, gated: "blocked" as const,
+  } };
+  assert.deepEqual(workflowNodeRows(snapshot), [
+    { nodeId: "bad", status: "failed", icon: "✗" }, { nodeId: "gated", status: "blocked", icon: "⊘" },
+    { nodeId: "retry", status: "retrying", icon: "↻" }, { nodeId: "active", status: "running", icon: "●" },
+    { nodeId: "alpha", status: "pending", icon: "○" }, { nodeId: "done", status: "succeeded", icon: "✓" }, { nodeId: "zeta", status: "cancelled", icon: "■" },
+  ]);
+  assert.equal(new Set(Object.values(snapshot.nodes).map(workflowNodeStatusIcon)).size, 7);
+  assert.equal(workflowNodeRows({ ...snapshot, nodes: Object.fromEntries(Array.from({ length: 200 }, (_, i) => [`node-${i}`, "pending"])) }, 32).length, 32);
+  const prioritized = workflowNodeRows({ ...snapshot, nodes: { pending: "pending", failed: "failed", running: "running", succeeded: "succeeded" } }, 2);
+  assert.deepEqual(prioritized.map(({ nodeId }) => nodeId), ["failed", "running"]);
+  assert.ok(workflowBorderLine("   ✓ node", " succeeded ", 12).length > 0);
+  assert.ok(workflowBorderLine("   ✓ node", " succeeded ", 1).length > 0);
+  const rendered = JSON.stringify(workflowNodeRows(snapshot));
+  assert.equal(rendered.includes("secret output"), false);
+  assert.equal(rendered.includes("/private/path"), false);
+});
 
 test("strict versioned schemas reject unknown fields, unknown capabilities, and invalid ownership", () => {
   assert.equal(validateWorkflowSpec(workflow).ok, true);
