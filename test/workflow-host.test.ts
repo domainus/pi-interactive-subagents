@@ -19,11 +19,34 @@ function hostFor(paths: ReturnType<typeof parent>, launcher: WorkflowNodeLaunche
   return createWorkflowHost({ parent: { sessionId: "session", cwd: paths.cwd, sessionDir: paths.sessionDir }, launcher, modelRegistry, home: paths.home, owner: Symbol("test-owner") });
 }
 
-test("workflow host strips generated policy and runs an authenticated read-only plan", async () => {
-  const paths = parent(); try { let launched = 0; let seenModel = ""; const host = hostFor(paths, { launch: (context) => { launched++; seenModel = context.resolvedModel.model; assert.equal(context.node.kernel, "readonly"); assert.equal(context.node.mode, "read-only"); assert.equal(context.node.gate, undefined); assert.equal(context.policyArtifact.allowedTools.includes("bash"), false); return done({ version: 1, status: "succeeded", output: "ok" }); } });
-    const plan = host.plan({ workflowId: "wf", template: "research", generated: generated({ kernel: "builder", mode: "mutating", allowGlobs: ["../**"], model: { tier: "sol" }, gate: { kind: "command", argv: ["sh"] } }) });
-    assert.equal(plan.workflow.nodes[0].kernel, "readonly"); assert.equal(plan.workflow.nodes[0].mode, "read-only"); assert.equal(plan.workflow.nodes[0].gate, undefined); assert.equal(plan.workflow.nodes[0].model?.tier, "luna"); assert.equal(plan.metadata.status, "pending");
+test("workflow host rejects generated policy-shaped fields and runs a strict read-only plan", async () => {
+  const paths = parent(); try { let launched = 0; let seenModel = ""; const host = hostFor(paths, { launch: (context) => { launched++; seenModel = context.resolvedModel.model; assert.equal(context.node.kernel, "readonly"); assert.equal(context.node.mode, "read-only"); assert.equal(context.policyArtifact.allowedTools.includes("bash"), false); return done({ version: 1, status: "succeeded", output: "ok" }); } });
+    assert.throws(() => host.plan({ workflowId: "bad", template: "research", generated: generated({ kernel: "builder", mode: "mutating", allowGlobs: ["../**"], model: { tier: "sol" }, gate: { kind: "command", argv: ["sh"] } }) }), /unknown field/);
+    const plan = host.plan({ workflowId: "wf", template: "research", generated: generated() });
+    assert.equal(plan.workflow.nodes[0].kernel, "readonly"); assert.equal(plan.workflow.nodes[0].mode, "read-only"); assert.equal(plan.workflow.nodes[0].model?.tier, "luna"); assert.equal(plan.metadata.status, "pending");
     const outcome = await host.run("wf"); assert.equal(outcome.state.status, "completed"); assert.equal(host.status("wf").status, "completed"); assert.equal(launched, 1); assert.equal(seenModel, luna); assert.throws(() => host.resume("wf"), /not resumable/);
+  } finally { rmSync(paths.root, { recursive: true, force: true }); }
+});
+
+test("trusted recipe plans launch with bounded upstream evidence and validate structured output", async () => {
+  const paths = parent(); try {
+    const launched: string[] = [];
+    const host = hostFor(paths, { launch: ({ node, upstreamResults }) => { launched.push(node.id); if (node.id.startsWith("recipe.")) { assert.ok(upstreamResults?.task); return done({ version: 1, status: "succeeded", output: { findings: [{ severity: "warning", title: "bounded", detail: "real finding" }] } }); } return done({ version: 1, status: "succeeded", output: { evidence: "source" } }); } });
+    const plan = host.plan({ workflowId: "recipe", template: "research", generated: generated(), recipeId: "adversarial-review" });
+    assert.equal(plan.workflow.nodes.find((node) => node.id === "recipe.adversarial-review")?.sourceNodeId, undefined);
+    const outcome = await host.run("recipe"); assert.equal(outcome.state.status, "completed"); assert.deepEqual(launched, ["task", "recipe.adversarial-review"]); assert.deepEqual(outcome.state.results?.["recipe.adversarial-review"]?.output, { findings: [{ severity: "warning", title: "bounded", detail: "real finding" }] });
+  } finally { rmSync(paths.root, { recursive: true, force: true }); }
+});
+
+test("revision run loads exact imported read-only results and launches only changed nodes", async () => {
+  const paths = parent(); try {
+    const launched: string[] = [];
+    const host = hostFor(paths, { launch: ({ node }) => { launched.push(node.id); return done({ version: 1, status: "succeeded", output: { node: node.id, run: launched.length } }); } });
+    host.plan({ workflowId: "parent", template: "research", generated: { objective: "parent", nodes: [{ id: "source", objective: "old" }, { id: "stable", objective: "unchanged" }] } });
+    await host.run("parent"); launched.length = 0;
+    const revised = host.revise({ workflowId: "parent", newWorkflowId: "revision", generated: { objective: "parent", nodes: [{ id: "source", objective: "changed" }, { id: "stable", objective: "unchanged" }] } });
+    assert.equal(revised.metadata.status, "pending");
+    const outcome = await host.run("revision"); assert.equal(outcome.state.status, "completed"); assert.deepEqual(launched, ["source"]); assert.equal(outcome.state.results?.stable?.output && (outcome.state.results.stable.output as any).node, "stable");
   } finally { rmSync(paths.root, { recursive: true, force: true }); }
 });
 

@@ -8,7 +8,10 @@ export type KernelName = "readonly" | "builder" | "validator" | "adjudicator" | 
 export type NodeStatus = "pending" | "running" | "retrying" | "succeeded" | "failed" | "blocked" | "cancelled";
 export type WorkflowStatus = "pending" | "running" | "paused" | "retrying" | "gated" | "completed" | "succeeded" | "failed" | "cancelled" | "recovered";
 /** Durable run lifecycle. This deliberately does not include adapter-specific states. */
-export type WorkflowRunStatus = "pending" | "running" | "cancelling" | "cancelled" | "completed" | "failed" | "recovered";
+export type WorkflowRunStatus = "pending" | "running" | "cancelling" | "paused" | "cancelled" | "completed" | "failed" | "recovered";
+export type WorkflowPauseReason = "usage-limit" | "provider-unavailable" | "manual";
+export interface WorkflowPauseInfo { readonly reason: WorkflowPauseReason; readonly message: string; readonly resetAt?: number; readonly retryAfterMs?: number; readonly callbackId?: string; readonly hintDigest: string; readonly pausedAt: number; }
+export interface WorkflowTopologySummary { readonly nodeCount: number; readonly edgeCount: number; readonly maxDepth: number; readonly order: readonly string[]; readonly nodeDigests: Readonly<Record<string, string>>; readonly topologyDigest: string; }
 export type WorkflowRunTemplate = "research" | "build" | "review";
 export type GateKind = "result-schema" | "dependency-success" | "diff-scope" | "command";
 export type NodeMode = "read-only" | "mutating";
@@ -75,6 +78,13 @@ export interface WorkflowRunMetadata {
   readonly startedAt?: number;
   readonly updatedAt?: number;
   readonly finishedAt?: number;
+  readonly topology?: WorkflowTopologySummary;
+  readonly pause?: WorkflowPauseInfo;
+  readonly revision?: number;
+  readonly parentWorkflowId?: string;
+  readonly parentRunId?: string;
+  readonly parentIntegrity?: string;
+  readonly invalidatedNodeIds?: readonly string[];
 }
 export interface AgentResultEnvelope { readonly version: typeof WORKFLOW_VERSION; readonly status: "succeeded" | "failed" | "blocked"; readonly output?: unknown; readonly error?: string | null; readonly retryable?: boolean; }
 export interface HostPolicyArtifact {
@@ -82,6 +92,9 @@ export interface HostPolicyArtifact {
   readonly workflowId: string;
   readonly nodeId: string;
   readonly attempt: number;
+  /** Required on executor-created artifacts; binds child policy to the immutable compiled plan. */
+  readonly workflowIntegrity?: string;
+  readonly topologyDigest?: string;
   readonly kernel: KernelName;
   readonly mode: NodeMode;
   readonly cwd: string;
@@ -95,16 +108,16 @@ export interface HostPolicyArtifact {
 }
 export interface NodeAttempt {
   readonly version: typeof WORKFLOW_VERSION; readonly workflowId: string; readonly nodeId: string; readonly attempt: number; readonly status: NodeStatus;
-  readonly startedAt?: number; readonly finishedAt?: number; readonly error?: string; readonly classification?: "retryable" | "permanent" | "cancelled" | "malformed";
+  readonly startedAt?: number; readonly finishedAt?: number; readonly error?: string; readonly classification?: "retryable" | "permanent" | "cancelled" | "malformed" | "usage-limit" | "imported";
 }
 export interface GateResult {
-  readonly version: typeof WORKFLOW_VERSION; readonly workflowId: string; readonly nodeId: string; readonly kind: GateKind; readonly passed: boolean; readonly checkedAt: number;
+  readonly version: typeof WORKFLOW_VERSION; readonly workflowId: string; readonly nodeId: string; readonly workflowIntegrity?: string; readonly topologyDigest?: string; readonly kind: GateKind; readonly passed: boolean; readonly checkedAt: number;
   readonly sourceNodeId?: string; readonly attempt?: number; readonly evidenceDigest?: string; readonly rawEnvelopeDigest?: string;
   /** Stable identity of the gate inputs, used for idempotent crash recovery. */
   readonly evaluationId: string; readonly gateDigest: string; readonly error?: string;
 }
 export interface WorktreeEvidence {
-  readonly version: typeof WORKFLOW_VERSION; readonly workflowId: string; readonly nodeId: string; readonly attempt: number; readonly mode: NodeMode; readonly cwd: string; readonly path?: string;
+  readonly version: typeof WORKFLOW_VERSION; readonly workflowId: string; readonly nodeId: string; readonly workflowIntegrity?: string; readonly topologyDigest?: string; readonly attempt: number; readonly mode: NodeMode; readonly cwd: string; readonly path?: string;
   readonly base: string; readonly head: string; readonly diffHash: string; readonly changedFiles: readonly string[]; readonly evidenceDigest: string;
   readonly capturedAt: number; readonly preserved: boolean;
 }
@@ -120,16 +133,21 @@ export interface ApplyApprovalRecord {
   readonly signature: string;
 }
 export interface TaskResult {
-  readonly version: typeof WORKFLOW_VERSION; readonly workflowId: string; readonly nodeId: string; readonly status: Exclude<NodeStatus, "pending" | "running" | "retrying">;
+  readonly version: typeof WORKFLOW_VERSION; readonly workflowId: string; readonly nodeId: string; readonly workflowIntegrity?: string; readonly topologyDigest?: string; readonly status: Exclude<NodeStatus, "pending" | "running" | "retrying">;
   readonly output?: unknown; readonly error?: string; readonly startedAt?: number; readonly finishedAt: number; readonly attempt?: number;
   /** The exact parsed host-boundary envelope, never reconstructed from TaskResult. */
   readonly rawEnvelope?: AgentResultEnvelope; readonly rawEnvelopeDigest?: string;
 }
 export interface WorkflowState {
-  readonly version: typeof WORKFLOW_VERSION; readonly workflowId: string; readonly sessionId: string; readonly status: WorkflowStatus; readonly nodes: Readonly<Record<string, NodeStatus>>;
+  readonly version: typeof WORKFLOW_VERSION; readonly workflowId: string; readonly sessionId: string; readonly runId?: string; readonly status: WorkflowStatus; readonly nodes: Readonly<Record<string, NodeStatus>>;
   readonly results?: Readonly<Record<string, TaskResult>>; readonly attempts?: Readonly<Record<string, readonly NodeAttempt[]>>; readonly gates?: Readonly<Record<string, readonly GateResult[]>>;
   /** Keyed by `${nodeId}:${attempt}`; full diffs remain in bounded sidecars. */
-  readonly worktrees?: Readonly<Record<string, WorktreeEvidence>>; readonly updatedAt: number;
+  readonly worktrees?: Readonly<Record<string, WorktreeEvidence>>; readonly pause?: WorkflowPauseInfo;
+  readonly telemetry?: readonly WorkflowTelemetryRecord[];
+  readonly provenance?: readonly WorkflowArtifactProvenance[];
+  readonly updatedAt: number;
 }
+export interface WorkflowTelemetryRecord { readonly version: typeof WORKFLOW_VERSION; readonly workflowId: string; readonly runId: string; readonly workflowIntegrity: string; readonly topologyDigest: string; readonly nodeId: string; readonly attempt: number; readonly model: WorkflowModel; readonly requestId: string; readonly inputTokens: number; readonly outputTokens: number; readonly costUsd?: number; readonly runtimeMs: number; readonly capturedAt: number; readonly providerSignature: string; readonly recordDigest: string; }
+export interface WorkflowArtifactProvenance { readonly version: typeof WORKFLOW_VERSION; readonly workflowId: string; readonly runId: string; readonly workflowIntegrity: string; readonly topologyDigest: string; readonly kind: "result" | "gate" | "worktree" | "telemetry" | "manifest"; readonly nodeId?: string; readonly attempt?: number; readonly artifactId: string; readonly artifactDigest: string; readonly capturedAt: number; readonly importedFromWorkflowId?: string; readonly importedFromRunId?: string; readonly importedFromArtifactDigest?: string; }
 export type ValidationIssue = { readonly path: string; readonly message: string };
-export type ValidationResult<T> = { readonly ok: true; readonly value: T } | { readonly ok: false; readonly issues: readonly ValidationIssue[] };
+export type ValidationResult<T> = { readonly ok: true; readonly value: T; readonly issues?: readonly ValidationIssue[] } | { readonly ok: false; readonly issues: readonly ValidationIssue[] };

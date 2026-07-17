@@ -10,7 +10,7 @@ export const MAX_WORKFLOW_POLICY_BYTES = 64 * 1024;
 export const MAX_WORKFLOW_SECRET_BYTES = 4096;
 const FILE_TOOLS = new Set(["read", "edit", "write", "grep", "find", "ls"]);
 const MUTATING_TOOLS = new Set(["edit", "write"]);
-export interface WorkflowPolicyIdentity { readonly workflowId: string; readonly nodeId: string; readonly attempt: number; readonly cwd: string; readonly worktreeRoot?: string; readonly allowedTools: readonly string[]; }
+export interface WorkflowPolicyIdentity { readonly workflowId: string; readonly nodeId: string; readonly attempt: number; readonly cwd: string; readonly worktreeRoot?: string; readonly workflowIntegrity?: string; readonly topologyDigest?: string; readonly allowedTools: readonly string[]; }
 export interface WorkflowPolicyTransport { readonly artifactPath: string; readonly secretPath: string; readonly identity: WorkflowPolicyIdentity; }
 export type WorkflowPolicyVerification = { readonly ok: true; readonly artifact: HostPolicyArtifact; readonly secret: Buffer } | { readonly ok: false; readonly error: string };
 const safePath = (value: string): boolean => isAbsolute(value) && resolve(value) === value && !value.includes("\0");
@@ -31,7 +31,7 @@ export function verifyWorkflowChildPolicy(artifact: unknown, secret: string | Ui
   if (!safePath(expected.cwd) || (expected.worktreeRoot !== undefined && !safePath(expected.worktreeRoot))) return { ok: false, error: "workflow child identity is invalid" };
   if (!Number.isInteger(expected.attempt) || expected.attempt < 1 || !boundedText(expected.workflowId, 128) || !boundedText(expected.nodeId, 128)) return { ok: false, error: "workflow child identity is invalid" };
   const item = artifact as HostPolicyArtifact;
-  if (!validateHostPolicyArtifact(item, secret, { workflowId: expected.workflowId, nodeId: expected.nodeId, attempt: expected.attempt, cwd: expected.cwd, worktreeRoot: expected.worktreeRoot })) return { ok: false, error: "workflow child policy signature or identity mismatch" };
+  if (!validateHostPolicyArtifact(item, secret, { workflowId: expected.workflowId, nodeId: expected.nodeId, attempt: expected.attempt, cwd: expected.cwd, worktreeRoot: expected.worktreeRoot, workflowIntegrity: expected.workflowIntegrity, topologyDigest: expected.topologyDigest })) return { ok: false, error: "workflow child policy signature or identity mismatch" };
   if (canonicalTools(item.allowedTools).join(",") !== canonicalTools(expected.allowedTools).join(",")) return { ok: false, error: "workflow child policy tools mismatch" };
   if (actualCliTools !== undefined && canonicalTools(actualCliTools).join(",") !== canonicalTools(item.allowedTools).join(",")) return { ok: false, error: "workflow child CLI tools widened or narrowed" };
   return { ok: true, artifact: item, secret: Buffer.isBuffer(secret) ? secret : Buffer.from(secret) };
@@ -72,7 +72,7 @@ function atomicPrivateFile(path: string, content: string): void {
 }
 export function writeWorkflowPolicyTransport(params: { readonly root: string; readonly artifact: HostPolicyArtifact; readonly secret: Uint8Array; readonly identity: WorkflowPolicyIdentity; readonly id?: string }): WorkflowPolicyTransport {
   if (!safePath(params.root)) throw new Error("workflow policy root must be absolute and normalized"); if (params.secret.byteLength < 32 || params.secret.byteLength > MAX_WORKFLOW_SECRET_BYTES) throw new Error("workflow policy secret is invalid");
-  if (!validateHostPolicyArtifact(params.artifact, params.secret, { workflowId: params.identity.workflowId, nodeId: params.identity.nodeId, attempt: params.identity.attempt, cwd: params.identity.cwd, worktreeRoot: params.identity.worktreeRoot })) throw new Error("workflow policy artifact is invalid");
+  if (!validateHostPolicyArtifact(params.artifact, params.secret, { workflowId: params.identity.workflowId, nodeId: params.identity.nodeId, attempt: params.identity.attempt, cwd: params.identity.cwd, worktreeRoot: params.identity.worktreeRoot, workflowIntegrity: params.identity.workflowIntegrity, topologyDigest: params.identity.topologyDigest })) throw new Error("workflow policy artifact is invalid");
   const suffix = params.id ?? `${params.identity.nodeId}-${params.identity.attempt}`; if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$/.test(suffix)) throw new Error("workflow policy transport ID is unsafe");
   const artifactPath = resolve(params.root, `.workflow-policy-${suffix}.json`); const secretPath = resolve(params.root, `.workflow-policy-${suffix}.secret`); const json = JSON.stringify(params.artifact); if (Buffer.byteLength(json) > MAX_WORKFLOW_POLICY_BYTES) throw new Error("workflow policy artifact is too large");
   let artifactWritten = false; const secretCopy = Buffer.from(params.secret); try { atomicPrivateFile(artifactPath, json); artifactWritten = true; atomicPrivateFile(secretPath, secretCopy.toString("base64")); chmodSync(artifactPath, 0o600); chmodSync(secretPath, 0o600); } catch (error) { if (artifactWritten) try { unlinkSync(artifactPath); } catch {} try { unlinkSync(secretPath); } catch {} throw error; } finally { secretCopy.fill(0); }

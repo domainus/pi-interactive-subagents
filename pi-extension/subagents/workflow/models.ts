@@ -25,7 +25,7 @@ const reference = (value: unknown): string | undefined => {
 };
 function available(registry: WorkflowModelRegistry): string[] {
   if ("getAvailable" in registry && typeof registry.getAvailable === "function") return registry.getAvailable().map(reference).filter((x): x is string => Boolean(x));
-  return registry.models.map(reference).filter((x): x is string => Boolean(x));
+  return ("models" in registry ? registry.models : []).map(reference).filter((x): x is string => Boolean(x));
 }
 function configured(registry: WorkflowModelRegistry, model: WorkflowModel, refs: readonly string[]): boolean {
   const parsed = model.indexOf("/"); const provider = model.slice(0, parsed); const id = model.slice(parsed + 1);

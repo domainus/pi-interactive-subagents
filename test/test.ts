@@ -5064,6 +5064,28 @@ describe("configured launch model", () => {
     });
   });
 
+  it("orders the identity handshake, effective cwd, and exec in the real launch command", async () => {
+    await withTempDirAsync(async (dir) => {
+      const childCwd = realpathSync(mkdtempSync(join(dir, "effective-cwd-")));
+      const selected = model("OpenAI", "gpt-cwd");
+      await withRegisteredSpawn(dir, { name: "Effective cwd", task: "run", cwd: childCwd, model: "OpenAI/gpt-cwd" }, registry([selected], ["openai/gpt-cwd"]), (result) => {
+        const command = readFileSync(result.details.launchScriptFile, "utf8");
+        assert.equal(command.includes(`&& cd '${childCwd}' && exec env `), true);
+        assert.doesNotMatch(command, /exec cd /);
+        assert.doesNotMatch(command, /exec PI_[A-Z_]+=/);
+      });
+    });
+  });
+
+  it("never confirms post-delivery death from a missing identity handshake", () => {
+    const dir = createTestDir();
+    try {
+      assert.equal(testApi.confirmedPostDeliveryDeath(undefined, join(dir, "missing.identity"), "nonce", "absent-surface"), false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("unavailable explicit model returns alternatives before pane, artifact, or map entries", async () => {
     await withTempDirAsync(async (dir) => {
       const available = model("oauth", "luna");

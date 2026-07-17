@@ -1,0 +1,19 @@
+{
+  "compilerOptions": {
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "target": "ES2022",
+    "skipLibCheck": true,
+    "strict": false,
+    "types": ["node"]
+  },
+  "include": [
+    "pi-extension/subagents/**/*.ts",
+    "test/workflow-contracts.test.ts",
+    "test/workflow-executor.test.ts",
+    "test/workflow-host.test.ts",
+    "test/workflow-security-seams.test.ts"
+  ]
+}

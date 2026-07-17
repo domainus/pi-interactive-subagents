@@ -36,7 +36,8 @@ test("compiler inserts three deterministic evidence gates, revalidates IDs, and 
 
 test("generated specifications cannot select policy and supplied depth cannot bypass computed bounds", () => {
   const generated = { objective: "generated", bounds: { maxNodes: 999 }, policy: { model: "other" }, nodes: [{ id: "task", objective: "do it", kernel: "builder", mode: "mutating", requiresWorktree: true, capabilities: ["run-commands"], allowGlobs: ["**"], model: { tier: "sol" }, gate: { kind: "command", argv: ["sh"] } }] };
-  const compiled = compileGeneratedWorkflow(generated, { id: "wf", sessionId: "s", capabilities: ["read-files"], bounds: { maxNodes: 4 }, defaultNode: { kernel: "readonly", mode: "read-only", requiresWorktree: false, capabilities: ["read-files"], allowGlobs: ["src/**"], model: { tier: "luna" } } });
+  assert.throws(() => compileGeneratedWorkflow(generated, { id: "wf", sessionId: "s", capabilities: ["read-files"], bounds: { maxNodes: 4 }, defaultNode: { kernel: "readonly", mode: "read-only", requiresWorktree: false, capabilities: ["read-files"], allowGlobs: ["src/**"], model: { tier: "luna" } } }), /unknown field/);
+  const compiled = compileGeneratedWorkflow({ objective: "generated", nodes: [{ id: "task", objective: "do it" }] }, { id: "wf", sessionId: "s", capabilities: ["read-files"], bounds: { maxNodes: 4 }, defaultNode: { kernel: "readonly", mode: "read-only", requiresWorktree: false, capabilities: ["read-files"], allowGlobs: ["src/**"], model: { tier: "luna" } } });
   const task = compiled.nodes[0]; assert.equal(task.kernel, "readonly"); assert.equal(task.mode, "read-only"); assert.deepEqual(task.allowGlobs, ["src/**"]); assert.equal(task.model?.tier, "luna"); assert.equal(task.gate, undefined); assert.deepEqual(compiled.bounds, { maxNodes: 4 });
   assert.throws(() => compileGeneratedWorkflow({ objective: "x".repeat(1_048_576), nodes: [] }, { id: "wf", sessionId: "s", capabilities: ["read-files"], defaultNode: { kernel: "readonly", mode: "read-only", requiresWorktree: false, capabilities: ["read-files"] } }), /serialized bound/);
   const chain = [base("a", { depth: 1 }), base("b", { dependsOn: ["a"], depth: 1 }), base("c", { dependsOn: ["b"], depth: 1 })];
@@ -94,6 +95,16 @@ test("storage-backed execution persists two retryable failures before a third at
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test("usage-limit pause resumes the same attempt without stale terminal fields", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "wf-usage-pause-")); try {
+    const workflow = compileWorkflow(spec([base("a")]) as any, { addValidationGates: false }); const storage = createWorkflowStorage(dir, "s", "wf"); storage.saveWorkflowSpec(persistedSpec(workflow));
+    const paused = await executeWorkflow(workflow, { storage, runId: "run-1", launcher: { launch: () => { const result = Promise.reject(new WorkflowLaunchError("quota", "usage-limit", { retryAfterMs: 1 })); return { result, cancel() {}, settled: result.then(() => undefined, () => undefined) }; } } });
+    assert.equal(paused.state.status, "paused"); assert.equal(paused.state.nodes.a, "pending"); assert.deepEqual(paused.state.attempts?.a.map((item) => item.status), ["cancelled"]); assert.equal(paused.state.attempts?.a[0].classification, "usage-limit");
+    const resumed = await executeWorkflow(workflow, { storage, recoveredState: paused.state, runId: "run-1", launcher: { launch: () => done({ version: 1, status: "succeeded", output: "ok" }) } });
+    assert.equal(resumed.state.status, "completed"); assert.equal(resumed.state.results?.a?.attempt, 1); assert.deepEqual(resumed.state.attempts?.a.map((item) => item.status), ["succeeded"]); assert.equal(resumed.state.attempts?.a[0].finishedAt !== undefined, true); assert.equal(resumed.state.attempts?.a[0].classification, undefined); assert.equal(resumed.state.attempts?.a[0].error, undefined);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test("external cancellation awaits an ignored launch settlement and maps to cancelled", async () => {
   const workflow = compileWorkflow(spec([base("a")]) as any, { addValidationGates: false }); const controller = new AbortController(); let lateMutation = false; const start = Date.now();
   const execution = executeWorkflow(workflow, { signal: controller.signal, launcher: { launch: () => { const result = new Promise((resolveResult) => setTimeout(() => { lateMutation = true; resolveResult({ version: 1, status: "succeeded" }); }, 35)); return { result, cancel() { /* deliberately ignored */ }, settled: result.then(() => undefined) }; } } });
@@ -135,6 +146,12 @@ test("executor enforces raw output byte limit and numeric overrides", async () =
   const outcome = await executeWorkflow(workflow, { launcher: { launch: () => done({ version: 1, status: "succeeded", output: "x".repeat(100) }) } }); assert.match(outcome.state.results?.a.error ?? "", /maxOutputBytes/);
   await assert.rejects(executeWorkflow(workflow, { maxConcurrency: Number.NaN, launcher: { launch: () => done({ version: 1, status: "succeeded" }) } }), /finite integer/);
   await assert.rejects(executeWorkflow(workflow, { maxOutputBytes: 81, launcher: { launch: () => done({ version: 1, status: "succeeded" }) } }), /finite integer/);
+});
+
+test("executor fails closed before launching when upstream evidence exceeds its bound", async () => {
+  const ids = ["a", "c", "d", "e"]; const workflow = compileWorkflow(spec([...ids.map((id) => base(id)), base("b", { dependsOn: ids })]) as any, { addValidationGates: false }); let launchedB = false;
+  const outcome = await executeWorkflow(workflow, { launcher: { launch: ({ node }) => ids.includes(node.id) ? done({ version: 1, status: "succeeded", output: "x".repeat(64_000) }) : (launchedB = true, done({ version: 1, status: "succeeded" })) } });
+  assert.equal(launchedB, false); assert.equal(outcome.state.nodes.b, "failed"); assert.match(outcome.state.results?.b?.error ?? "", /upstream evidence/);
 });
 
 test("recovery reuses completed results and never duplicates task-result persistence", async () => {

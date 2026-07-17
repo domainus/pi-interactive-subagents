@@ -1294,6 +1294,19 @@ export async function readScreenAsync(surface: string, lines = 50): Promise<stri
 /**
  * Close a pane.
  */
+export type SurfaceProbeResult = "present" | "absent" | "unknown";
+/** Independent mux identity probe; screen-read failures must not be treated as absence. */
+export function probeSurface(surface: string): SurfaceProbeResult {
+  try {
+    const backend = requireMuxBackend();
+    if (backend === "tmux") { execFileSync("tmux", ["display-message", "-p", "-t", surface, "#{pane_id}"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }); return "present"; }
+    if (backend === "wezterm") { const value = JSON.parse(execFileSync("wezterm", ["cli", "list", "--format", "json"], { encoding: "utf8" })) as unknown; return Array.isArray(value) && value.some((item) => String((item as any)?.pane_id) === surface) ? "present" : "absent"; }
+    if (backend === "zellij") { const value = JSON.parse(zellijActionSync(["list-panes", "--json", "--state", "--tab"])); const id = Number(zellijPaneId(surface)); return Array.isArray(value) && value.some((item) => Number((item as any)?.id) === id) ? "present" : "absent"; }
+    if (backend === "cmux") { execFileSync("cmux", ["identify", "--surface", surface], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }); return "present"; }
+    execFileSync("herdr", herdrPaneArgs.read(surface, 1), { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }); return "present";
+  } catch (error) { const code = (error as NodeJS.ErrnoException)?.code; return code === "ENOENT" ? "unknown" : "unknown"; }
+}
+
 export function closeSurface(surface: string): void {
   const backend = requireMuxBackend();
 
@@ -1333,6 +1346,8 @@ export interface PollResult {
   ping?: { name: string; message: string };
   /** Error message if reason is "error" (auto-retry exhausted, provider overload, etc.) */
   errorMessage?: string;
+  usageLimit?: { readonly message?: string; readonly resetAt?: number; readonly retryAfterMs?: number };
+  providerRequestId?: string;
 }
 
 /**
@@ -1353,9 +1368,13 @@ function interpretExitSidecar(data: any): PollResult {
       typeof data.errorMessage === "string" && data.errorMessage.trim() !== ""
         ? data.errorMessage
         : "Subagent exited with stopReason=error (no errorMessage in sidecar).";
-    return { reason: "error", exitCode: 1, errorMessage };
+    return { reason: "error", exitCode: 1, errorMessage,
+      ...(data?.usageLimit && typeof data.usageLimit === "object" ? { usageLimit: data.usageLimit } : {}),
+      ...(typeof data?.providerRequestId === "string" ? { providerRequestId: data.providerRequestId } : {}) };
   }
-  return { reason: "done", exitCode: 0 };
+  return { reason: "done", exitCode: 0,
+    ...(data?.usageLimit && typeof data.usageLimit === "object" ? { usageLimit: data.usageLimit } : {}),
+    ...(typeof data?.providerRequestId === "string" ? { providerRequestId: data.providerRequestId } : {}) };
 }
 
 export type PaneProbeObservation =

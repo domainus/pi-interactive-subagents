@@ -8,7 +8,8 @@ import { WORKFLOW_MODELS } from "../pi-extension/subagents/workflow/types.ts";
 import { validateAgentResultEnvelope, validateTaskNode, validateTaskResult, validateWorkflowRunMetadata, validateWorkflowSpec, validateWorkflowState, WorkflowSpecSchema } from "../pi-extension/subagents/workflow/schema.ts";
 import { DEFAULT_CAPABILITY_CATALOG, effectiveKernelTools, resolveEffectiveTools } from "../pi-extension/subagents/workflow/capabilities.ts";
 import { resolveCombinedModelPolicy, resolveWorkflowModel } from "../pi-extension/subagents/workflow/kernels.ts";
-import { workflowBorderLine, workflowNodeRows, workflowNodeStatusIcon } from "../pi-extension/subagents/workflow/status.ts";
+import { visibleWidth } from "@mariozechner/pi-tui";
+import { workflowBorderBottom, workflowBorderLine, workflowBorderTop, workflowNodeRows, workflowNodeStatusIcon } from "../pi-extension/subagents/workflow/status.ts";
 import { composeTaskPrompt } from "../pi-extension/subagents/workflow/prompt.ts";
 import { createWorkflowStorage, WorkflowStorageError } from "../pi-extension/subagents/workflow/storage.ts";
 import { WORKFLOW_TEMPLATES, mapGeneratedNodeIdsToHostPolicy } from "../pi-extension/subagents/workflow/templates.ts";
@@ -36,6 +37,15 @@ test("workflow widget exposes bounded node lifecycle rows without task data", ()
   const rendered = JSON.stringify(workflowNodeRows(snapshot));
   assert.equal(rendered.includes("secret output"), false);
   assert.equal(rendered.includes("/private/path"), false);
+});
+
+test("workflow framing accepts the active theme accent and remains bounded at tiny widths", () => {
+  const accent = (text: string) => `\u001b[35m${text}\u001b[0m`;
+  for (const width of [0, 1, 8, 24, 80]) {
+    const lines = [workflowBorderTop("Workflows", "1 active", width, accent), workflowBorderLine(" ✓ build", " succeeded ", width, accent), workflowBorderBottom(width, accent)];
+    assert.ok(lines.every((line) => visibleWidth(line) <= width), `width ${width}`);
+    if (width > 0) assert.ok(lines.some((line) => line.includes("\u001b[35m")), `themed accent at width ${width}`);
+  }
 });
 
 test("strict versioned schemas reject unknown fields, unknown capabilities, and invalid ownership", () => {

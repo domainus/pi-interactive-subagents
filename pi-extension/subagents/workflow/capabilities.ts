@@ -35,9 +35,9 @@ export interface EffectiveToolInput { readonly kernel: KernelName; readonly mode
 export function resolveEffectiveTools(input: EffectiveToolInput): string[] {
   const catalog = input.catalog ?? DEFAULT_CAPABILITY_CATALOG;
   const semantic = intersectSemanticCapabilities(input.requestedCapabilities, input.workflowCapabilities, input.hostApprovedCapabilities, catalog);
-  const native = new Set(input.nativeAllowlist); const kernel = new Set(getKernelPolicy(input.kernel).maxTools); const tools = new Set<string>();
+  const native = new Set<string>(input.nativeAllowlist); const kernel = new Set<string>(getKernelPolicy(input.kernel).maxTools as readonly string[]); const tools = new Set<string>();
   const readOnly = input.mode === "read-only";
-  for (const capability of semantic) for (const tool of catalog[capability]) if (native.has(tool) && kernel.has(tool) && !(readOnly && ["edit", "write", "bash"].includes(tool))) tools.add(tool);
+  for (const capability of semantic) for (const tool of ((catalog as Record<string, readonly string[]>)[capability] ?? [])) if (native.has(tool) && kernel.has(tool) && !(readOnly && ["edit", "write", "bash"].includes(tool))) tools.add(tool);
   return [...tools].sort();
 }
 export function intersectCapabilities(capabilities: readonly string[], nativeAllowlist: readonly string[], catalog: CapabilityCatalog = DEFAULT_CAPABILITY_CATALOG): string[] {
@@ -65,7 +65,7 @@ export function getKernelPolicy(kernel: KernelName): KernelPolicy { const value 
 export function effectiveKernelTools(kernel: KernelName, capabilities: readonly string[], nativeAllowlist: readonly string[], catalog: CapabilityCatalog = DEFAULT_CAPABILITY_CATALOG): string[] {
   return resolveEffectiveTools({ kernel, requestedCapabilities: capabilities, workflowCapabilities: capabilities, hostApprovedCapabilities: capabilities, nativeAllowlist, catalog });
 }
-const ARTIFACT_KEYS = new Set(["version", "workflowId", "nodeId", "attempt", "kernel", "mode", "cwd", "worktreeRoot", "allowGlobs", "denyGlobs", "allowedTools", "allowedArgv", "signature"]);
+const ARTIFACT_KEYS = new Set(["version", "workflowId", "nodeId", "attempt", "workflowIntegrity", "topologyDigest", "kernel", "mode", "cwd", "worktreeRoot", "allowGlobs", "denyGlobs", "allowedTools", "allowedArgv", "signature"]);
 const artifactCanonical = (value: unknown): string => { if (value === null || typeof value !== "object") return JSON.stringify(value); if (Array.isArray(value)) return `[${value.map(artifactCanonical).join(",")}]`; return `{${Object.keys(value as object).sort().map((key) => `${JSON.stringify(key)}:${artifactCanonical((value as Record<string, unknown>)[key])}`).join(",")}}`; };
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const safeAbsolute = (path: unknown): path is string => { if (typeof path !== "string" || path.length < 1 || path.length > 4096 || path.includes("\0") || !isAbsolute(path) || resolve(path) !== path) return false; try { return realpathSync(path) === path; } catch { return false; } };
@@ -74,11 +74,11 @@ const safeArgv = (argv: unknown): argv is readonly string[] => Array.isArray(arg
 const secretBytes = (secret: string | Uint8Array): Uint8Array => { const bytes = typeof secret === "string" ? Buffer.from(secret, "utf8") : secret; if (bytes.byteLength < 32) throw new Error("host policy signing secret must contain at least 32 bytes"); return bytes; };
 const sign = (body: Omit<HostPolicyArtifact, "signature">, secret: string | Uint8Array): string => createHmac("sha256", secretBytes(secret)).update(artifactCanonical(body)).digest("hex");
 const deepFreeze = <T>(value: T): T => { if (value && typeof value === "object" && !Object.isFrozen(value)) { Object.freeze(value); for (const child of Object.values(value as Record<string, unknown>)) deepFreeze(child); } return value; };
-export interface HostPolicyExpectation { readonly workflowId: string; readonly nodeId: string; readonly attempt: number; readonly cwd: string; readonly worktreeRoot?: string; }
+export interface HostPolicyExpectation { readonly workflowId: string; readonly nodeId: string; readonly attempt: number; readonly cwd: string; readonly worktreeRoot?: string; readonly workflowIntegrity?: string; readonly topologyDigest?: string; }
 /** Create a child-verifiable policy. The HMAC secret must travel out-of-band (env/fd), never inside the artifact. */
-export function createHostPolicyArtifact(input: { readonly workflow: Pick<WorkflowSpec, "id" | "capabilities">; readonly node: TaskNode; readonly attempt: number; readonly cwd: string; readonly worktreeRoot?: string; readonly hostApprovedCapabilities: readonly string[]; readonly nativeAllowlist: readonly string[]; readonly allowedArgv?: readonly (readonly string[])[]; readonly signingSecret: string | Uint8Array; readonly catalog?: CapabilityCatalog; }): HostPolicyArtifact {
+export function createHostPolicyArtifact(input: { readonly workflow: Pick<WorkflowSpec, "id" | "capabilities"> & { readonly integrity?: string; readonly topology?: { readonly topologyDigest: string } }; readonly node: TaskNode; readonly attempt: number; readonly cwd: string; readonly worktreeRoot?: string; readonly hostApprovedCapabilities: readonly string[]; readonly nativeAllowlist: readonly string[]; readonly allowedArgv?: readonly (readonly string[])[]; readonly signingSecret: string | Uint8Array; readonly catalog?: CapabilityCatalog; }): HostPolicyArtifact {
   const tools = resolveEffectiveTools({ kernel: input.node.kernel, mode: input.node.mode, requestedCapabilities: input.node.capabilities, workflowCapabilities: input.workflow.capabilities ?? [], hostApprovedCapabilities: input.hostApprovedCapabilities, nativeAllowlist: input.nativeAllowlist, catalog: input.catalog });
-  const body: Omit<HostPolicyArtifact, "signature"> = { version: 1, workflowId: input.workflow.id, nodeId: input.node.id, attempt: input.attempt, kernel: input.node.kernel, mode: input.node.mode, cwd: input.cwd, ...(input.worktreeRoot ? { worktreeRoot: input.worktreeRoot } : {}), allowGlobs: [...(input.node.allowGlobs ?? ["**"])], denyGlobs: [...(input.node.denyGlobs ?? [])], allowedTools: tools, allowedArgv: (input.allowedArgv ?? []).map((x) => [...x]) };
+  const body: Omit<HostPolicyArtifact, "signature"> = { version: 1, workflowId: input.workflow.id, nodeId: input.node.id, attempt: input.attempt, ...(input.workflow.integrity ? { workflowIntegrity: input.workflow.integrity } : {}), ...(input.workflow.topology?.topologyDigest ? { topologyDigest: input.workflow.topology.topologyDigest } : {}), kernel: input.node.kernel, mode: input.node.mode, cwd: input.cwd, ...(input.worktreeRoot ? { worktreeRoot: input.worktreeRoot } : {}), allowGlobs: [...(input.node.allowGlobs ?? ["**"])], denyGlobs: [...(input.node.denyGlobs ?? [])], allowedTools: tools, allowedArgv: (input.allowedArgv ?? []).map((x) => [...x]) };
   const artifact: HostPolicyArtifact = { ...body, signature: sign(body, input.signingSecret) };
   if (!validateHostPolicyArtifact(artifact, input.signingSecret, { workflowId: body.workflowId, nodeId: body.nodeId, attempt: body.attempt, cwd: body.cwd, worktreeRoot: body.worktreeRoot })) throw new Error("invalid host policy artifact");
   return deepFreeze(artifact);
@@ -87,7 +87,7 @@ export function validateHostPolicyArtifactStructure(value: unknown): value is Ho
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const item = value as Record<string, unknown>; const keys = Object.keys(item);
   if (keys.some((key) => !ARTIFACT_KEYS.has(key)) || keys.some((key) => item[key] === undefined)) return false;
-  if (item.version !== 1 || typeof item.workflowId !== "string" || !SAFE_ID.test(item.workflowId) || typeof item.nodeId !== "string" || !SAFE_ID.test(item.nodeId) || !Number.isInteger(item.attempt) || (item.attempt as number) < 1 || (item.attempt as number) > 100 || !Object.prototype.hasOwnProperty.call(KERNEL_POLICIES, item.kernel as string) || (item.mode !== "read-only" && item.mode !== "mutating") || !safeAbsolute(item.cwd) || typeof item.signature !== "string" || !/^[a-f0-9]{64}$/.test(item.signature)) return false;
+  if (item.version !== 1 || typeof item.workflowId !== "string" || !SAFE_ID.test(item.workflowId) || typeof item.nodeId !== "string" || !SAFE_ID.test(item.nodeId) || !Number.isInteger(item.attempt) || (item.attempt as number) < 1 || (item.attempt as number) > 100 || (item.workflowIntegrity !== undefined && (typeof item.workflowIntegrity !== "string" || !/^[a-f0-9]{64}$/.test(item.workflowIntegrity))) || (item.topologyDigest !== undefined && (typeof item.topologyDigest !== "string" || !/^[a-f0-9]{64}$/.test(item.topologyDigest))) || !Object.prototype.hasOwnProperty.call(KERNEL_POLICIES, item.kernel as string) || (item.mode !== "read-only" && item.mode !== "mutating") || !safeAbsolute(item.cwd) || typeof item.signature !== "string" || !/^[a-f0-9]{64}$/.test(item.signature)) return false;
   if (item.mode === "mutating" && item.worktreeRoot === undefined) return false;
   if (item.worktreeRoot !== undefined) { if (!safeAbsolute(item.worktreeRoot)) return false; const rel = relative(item.worktreeRoot, item.cwd as string); if (!rel || rel.startsWith("..") || isAbsolute(rel)) return false; }
   if (!Array.isArray(item.allowGlobs) || item.allowGlobs.length < 1 || item.allowGlobs.length > 128 || !item.allowGlobs.every(safeGlob)) return false;
@@ -100,7 +100,7 @@ export function validateHostPolicyArtifactStructure(value: unknown): value is Ho
 /** Cross-process verifier: structural validation is insufficient without the separately delivered secret. */
 export function validateHostPolicyArtifact(value: unknown, secret: string | Uint8Array, expected?: HostPolicyExpectation): value is HostPolicyArtifact {
   if (!validateHostPolicyArtifactStructure(value)) return false;
-  if (expected && (value.workflowId !== expected.workflowId || value.nodeId !== expected.nodeId || value.attempt !== expected.attempt || value.cwd !== expected.cwd || value.worktreeRoot !== expected.worktreeRoot)) return false;
+  if (expected && (value.workflowId !== expected.workflowId || value.nodeId !== expected.nodeId || value.attempt !== expected.attempt || value.cwd !== expected.cwd || value.worktreeRoot !== expected.worktreeRoot || expected.workflowIntegrity !== undefined && value.workflowIntegrity !== expected.workflowIntegrity || expected.topologyDigest !== undefined && value.topologyDigest !== expected.topologyDigest)) return false;
   const { signature, ...body } = value; let actual: Buffer; let wanted: Buffer;
   try { actual = Buffer.from(signature, "hex"); wanted = Buffer.from(sign(body, secret), "hex"); } catch { return false; }
   return actual.length === wanted.length && timingSafeEqual(actual, wanted);

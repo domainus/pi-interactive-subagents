@@ -114,7 +114,7 @@ export function createFileApprovalStore(directory: string): ApprovalStore {
     },
   };
 }
-export interface WorktreeManagerOptions { readonly cwd: string; readonly root: string; readonly rejectDirtyParent?: boolean; readonly workflowId: string; readonly approvalStore?: ApprovalStore; readonly approvalSigningSecret?: string | Uint8Array; readonly approvalMaxAgeMs?: number; readonly now?: () => number; }
+export interface WorktreeManagerOptions { readonly cwd: string; readonly root: string; readonly rejectDirtyParent?: boolean; readonly workflowId: string; readonly approvalStore?: ApprovalStore; readonly approvalSigningSecret?: string | Uint8Array; readonly approvalMaxAgeMs?: number; readonly now?: () => number; readonly fence?: () => void; }
 
 export class GitWorktreeManager {
   readonly cwd: string;
@@ -135,12 +135,13 @@ export class GitWorktreeManager {
   private readonly now: () => number;
   private readonly approvalSecret: Uint8Array;
   private readonly applyLockPath: string;
+  private fence: (() => void) | undefined;
 
   constructor(options: WorktreeManagerOptions) {
     if (!options || !isAbsolute(options.cwd) || resolve(options.cwd) !== options.cwd || options.cwd.includes("\0")) throw new Error("trusted cwd must be an absolute normalized path");
     if (realpathSync(options.cwd) !== options.cwd) throw new Error("trusted cwd must not be a symlink");
     if (!options.workflowId) throw new Error("workflow ID is required");
-    this.workflowId = safeId(options.workflowId); this.rejectDirtyParent = options.rejectDirtyParent !== false; this.now = options.now ?? Date.now;
+    this.workflowId = safeId(options.workflowId); this.rejectDirtyParent = options.rejectDirtyParent !== false; this.now = options.now ?? Date.now; this.fence = options.fence;
     this.approvalSecret = typeof options.approvalSigningSecret === "string" ? Buffer.from(options.approvalSigningSecret) : options.approvalSigningSecret ? Buffer.from(options.approvalSigningSecret) : randomBytes(32); if (this.approvalSecret.byteLength < 32) throw new Error("approval signing secret must contain at least 32 bytes");
     this.approvalMaxAgeMs = options.approvalMaxAgeMs ?? 900_000; if (!Number.isInteger(this.approvalMaxAgeMs) || this.approvalMaxAgeMs < 1 || this.approvalMaxAgeMs > 86_400_000) throw new Error("invalid approval lifetime");
     let top: string; try { top = realpathSync(git(options.cwd, ["rev-parse", "--show-toplevel"]).trim()); } catch { throw new Error("not a git repository"); }
@@ -159,6 +160,10 @@ export class GitWorktreeManager {
     this.applyLockPath = join(this.commonGitDir, "pi-workflow.apply.lock");
   }
 
+  setFence(fence: (() => void) | undefined): void { this.fence = fence; }
+
+  private assertFence(): void { this.fence?.(); }
+
   registerWorkflow(workflow: CompiledWorkflow): void {
     assertCompiledWorkflowIntegrity(workflow);
     if (workflow.id !== this.workflowId || (this.registeredIntegrity !== undefined && this.registeredIntegrity !== workflow.integrity)) throw new Error("workflow registration mismatch");
@@ -174,6 +179,7 @@ export class GitWorktreeManager {
   }
 
   recordGateResult(result: GateResult): void {
+    this.assertFence();
     const expected = this.expectedGates.get(result.nodeId); const { gateDigest: _digest, ...body } = result;
     if (!expected || result.workflowId !== this.workflowId || result.sourceNodeId !== expected.sourceNodeId || result.kind !== expected.kind || computeGateResultDigest(body) !== result.gateDigest) throw new Error("untrusted gate result");
     this.trustedGates.set(result.gateDigest, Object.freeze({ ...result }));
@@ -197,7 +203,7 @@ export class GitWorktreeManager {
   }
 
   prepare(node: TaskNode, attempt = 1): WorktreeHandle {
-    safeId(node.id); if (!Number.isInteger(attempt) || attempt < 1 || attempt > 100) throw new Error("invalid worktree attempt");
+    this.assertFence(); safeId(node.id); if (!Number.isInteger(attempt) || attempt < 1 || attempt > 100) throw new Error("invalid worktree attempt");
     if (this.registeredNodes.get(node.id) !== nodeCanonical(node)) throw new Error("node is not registered in the compiled workflow");
     const base = git(this.cwd, ["rev-parse", "HEAD"]).trim(); let handle: WorktreeHandle;
     if (node.mode === "read-only") handle = Object.freeze({ workflowId: this.workflowId, nodeId: node.id, attempt, mode: node.mode, cwd: this.cwd, base, preserved: false });
@@ -232,14 +238,14 @@ export class GitWorktreeManager {
   }
 
   capture(handle: WorktreeHandle, node: TaskNode): WorktreeMetadata {
-    this.assertRegisteredHandle(handle, node); this.verifyLiveIdentity(handle);
+    this.assertFence(); this.assertRegisteredHandle(handle, node); this.verifyLiveIdentity(handle);
     const head = git(handle.cwd, ["rev-parse", "HEAD"]).trim(); const captured = captureDiff(handle.cwd, handle.base); const capturedAt = this.now();
     const draft = { version: 1 as const, workflowId: this.workflowId, nodeId: node.id, attempt: handle.attempt, mode: handle.mode, cwd: handle.cwd, ...(handle.path ? { path: handle.path } : {}), base: handle.base, head, ...captured, capturedAt, preserved: handle.preserved };
     return Object.freeze({ ...draft, changedFiles: Object.freeze(captured.changedFiles), evidenceDigest: computeWorktreeEvidenceDigest(draft) });
   }
 
   issueApproval(handle: WorktreeHandle, evidence: WorktreeMetadata, gates: readonly GateResult[], node: TaskNode): ApplyApprovalRecord {
-    this.assertRegisteredHandle(handle, node);
+    this.assertFence(); this.assertRegisteredHandle(handle, node);
     if (handle.mode !== "mutating" || !handle.path || evidence.workflowId !== this.workflowId || evidence.nodeId !== node.id || evidence.attempt !== handle.attempt) throw new Error("approval ownership mismatch");
     const current = this.capture(handle, node); if (current.evidenceDigest !== evidence.evidenceDigest || current.diffHash !== evidence.diffHash) throw new Error("evidence is stale");
     const required = new Set(["result-schema", "dependency-success", "diff-scope"]); const accepted: GateResult[] = [];
@@ -329,10 +335,12 @@ export class GitWorktreeManager {
     finally { if (fd !== undefined) { try { closeSync(fd); } catch {} try { unlinkSync(this.applyLockPath); } catch {} } }
   }
   apply(handle: WorktreeHandle, approval: ApplyApprovalRecord, node: TaskNode): void {
+    this.assertFence();
     this.withApplyLock(() => this.applyUnlocked(handle, approval, node));
   }
 
   cleanup(handle: WorktreeHandle, explicit = false): void {
+    this.assertFence();
     if (!explicit) throw new Error("cleanup requires explicit request");
     this.assertRegisteredHandle(handle);
     if (handle.mode !== "mutating" || !handle.path || handle.path !== handle.cwd || !isWithin(this.root, handle.path)) throw new Error("cleanup requires an exact mutating handle inside the trusted root");

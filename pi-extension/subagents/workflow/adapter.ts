@@ -21,7 +21,7 @@ export interface WorkflowAdapterRunning {
 }
 export interface WorkflowAdapterWatchResult {
   readonly kind: "delivered" | "suppressed";
-  readonly result?: { readonly summary: string; readonly exitCode: number; readonly elapsed: number; readonly error?: string; readonly errorMessage?: string; readonly sessionFile?: string };
+  readonly result?: { readonly summary: string; readonly exitCode: number; readonly elapsed: number; readonly error?: string; readonly errorMessage?: string; readonly usageLimit?: { readonly message?: string; readonly resetAt?: number; readonly retryAfterMs?: number }; readonly providerRequestId?: string; readonly sessionFile?: string };
 }
 export interface WorkflowAdapterLaunchOptions {
   readonly agentDefs: null;
@@ -32,7 +32,8 @@ export interface WorkflowAdapterLaunchOptions {
   readonly systemPrompt: string;
   readonly autoExit: true;
   readonly workflowOwned: true;
-  readonly policyTransport: WorkflowPolicyTransport & { readonly workflowId: string; readonly nodeId: string; readonly attempt: number; readonly cwd: string; readonly worktreeRoot?: string; readonly allowedTools: readonly string[] };
+  readonly upstreamResults?: Readonly<Record<string, unknown>>;
+  readonly policyTransport: WorkflowPolicyTransport & { readonly workflowId: string; readonly nodeId: string; readonly attempt: number; readonly cwd: string; readonly worktreeRoot?: string; readonly allowedTools: readonly string[]; readonly workflowIntegrity: string; readonly topologyDigest: string };
   readonly sessionMode: "lineage-only" | "fork";
 }
 export interface WorkflowAdapterRuntime {
@@ -71,6 +72,8 @@ export function createWorkflowNodeAdapter(runtime: WorkflowAdapterRuntime): Work
             workflowId: context.workflow.id,
             nodeId: context.node.id,
             attempt: context.attempt,
+            workflowIntegrity: context.workflow.integrity,
+            topologyDigest: context.workflow.topology.topologyDigest,
             cwd: context.cwd,
             ...(context.policyArtifact.worktreeRoot ? { worktreeRoot: context.policyArtifact.worktreeRoot } : {}),
             allowedTools,
@@ -86,6 +89,7 @@ export function createWorkflowNodeAdapter(runtime: WorkflowAdapterRuntime): Work
           node: context.node,
           nativeTools: allowedTools,
           approvedCapabilities: context.workflow.capabilities ?? context.node.capabilities,
+          upstreamResults: context.upstreamResults,
         });
         running = runtime.launch(
         { name: `workflow-${context.node.id}`, task, cwd: context.cwd },
@@ -101,7 +105,7 @@ export function createWorkflowNodeAdapter(runtime: WorkflowAdapterRuntime): Work
           autoExit: true,
           workflowOwned: true,
           sessionMode: "lineage-only",
-          policyTransport: { ...transport, workflowId: context.workflow.id, nodeId: context.node.id, attempt: context.attempt, cwd: context.cwd, ...(context.policyArtifact.worktreeRoot ? { worktreeRoot: context.policyArtifact.worktreeRoot } : {}), allowedTools },
+          policyTransport: { ...transport, workflowId: context.workflow.id, nodeId: context.node.id, attempt: context.attempt, cwd: context.cwd, ...(context.policyArtifact.worktreeRoot ? { worktreeRoot: context.policyArtifact.worktreeRoot } : {}), allowedTools, workflowIntegrity: context.workflow.integrity, topologyDigest: context.workflow.topology.topologyDigest },
         },
         );
       } catch (error) {
@@ -124,10 +128,13 @@ export function createWorkflowNodeAdapter(runtime: WorkflowAdapterRuntime): Work
         return watchPromise;
       };
       const settled = startWatch().then(() => undefined, () => undefined);
+      let providerRequestId: string | undefined;
       const result = startWatch().then((outcome) => {
         if (outcome.kind === "suppressed" || !outcome.result) throw new WorkflowLaunchError("workflow child watcher was suppressed", "permanent");
         const child = outcome.result;
+        providerRequestId = child.providerRequestId;
         if (child.error === "cancelled") throw new WorkflowLaunchError("workflow cancelled", "cancelled");
+        if (child.usageLimit) throw new WorkflowLaunchError(child.usageLimit.message ?? "provider usage limit reached", "usage-limit", child.usageLimit);
         if (child.errorMessage) {
           if (child.errorMessage === "workflow child policy rejected") throw new WorkflowLaunchError("workflow child policy rejected", "permanent");
           throw providerFailure(child.errorMessage);
@@ -148,7 +155,7 @@ export function createWorkflowNodeAdapter(runtime: WorkflowAdapterRuntime): Work
       // watcher here makes adapter cancellation wait for the existing watcher.
       if (context.signal.aborted) void cancel("workflow cancelled");
       else context.signal.addEventListener("abort", () => { void cancel("workflow cancelled"); }, { once: true });
-      return { result, cancel, settled };
+      return { result, cancel, settled, get providerRequestId() { return providerRequestId; } };
     },
   };
 }

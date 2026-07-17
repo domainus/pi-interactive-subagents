@@ -127,7 +127,7 @@ function publicMetadataKey(model: Model<any>, tier: ModelTier): string {
   const capacityFallback = tier === "fast" ? Number.POSITIVE_INFINITY : 0;
   const costs = model.cost as Partial<Model<any>["cost"]> | undefined;
   const input = Array.isArray(model.input)
-    ? model.input.filter((value): value is string => typeof value === "string").sort().join(",")
+    ? model.input.filter((value) => typeof value === "string").sort().join(",")
     : "";
   return [
     typeof model.name === "string" ? model.name : "",

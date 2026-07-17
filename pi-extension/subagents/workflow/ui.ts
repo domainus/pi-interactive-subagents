@@ -2,7 +2,7 @@ import { Type } from "@sinclair/typebox";
 import { Box, Text, truncateToWidth } from "@mariozechner/pi-tui";
 import { keyHint } from "@mariozechner/pi-coding-agent";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { createWorkflowHost, type WorkflowHost } from "./host.ts";
+import { createWorkflowHost, type WorkflowHost, type WorkflowPlan } from "./host.ts";
 import type { WorkflowRunTemplate, WorkflowRunStatus } from "./types.ts";
 import { formatWorkflowStatus, workflowBorderBottom, workflowBorderLine, workflowBorderTop, workflowElapsed, workflowIsActive, workflowNodeRows, workflowStatusDetails, workflowWidgetRight, WORKFLOW_STATUS_WIDGET_KEY, type WorkflowStatusSnapshot } from "./status.ts";
 import type { WorkflowNodeLauncher } from "./executor.ts";
@@ -12,9 +12,14 @@ import { sanitizeDisplayText } from "../display-safety.ts";
 const MAX_JSON = 64 * 1024;
 const templates = Type.Union([Type.Literal("research"), Type.Literal("build"), Type.Literal("review")]);
 const safeId = Type.String({ minLength: 1, maxLength: 128, pattern: "^[A-Za-z0-9][A-Za-z0-9._-]*$" });
-const planParams = Type.Object({ workflowId: safeId, template: templates, generated: Type.Record(Type.String(), Type.Unknown()) }, { additionalProperties: false });
+const planParams = Type.Object({ workflowId: safeId, template: templates, recipeId: Type.Optional(safeId), generated: Type.Record(Type.String(), Type.Unknown()) }, { additionalProperties: false });
+const reviseParams = Type.Object({ workflowId: safeId, newWorkflowId: safeId, template: Type.Optional(templates), recipeId: Type.Optional(safeId), generated: Type.Record(Type.String(), Type.Unknown()) }, { additionalProperties: false });
+const rerunParams = Type.Object({ workflowId: safeId, newWorkflowId: safeId, confirmMutation: Type.Optional(Type.Boolean()) }, { additionalProperties: false });
 const idParams = Type.Object({ workflowId: safeId }, { additionalProperties: false });
+const historyParams = Type.Object({ limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 128 })), cursor: Type.Optional(safeId) }, { additionalProperties: false });
 const nodeParams = Type.Object({ workflowId: safeId, nodeId: safeId, attempt: Type.Integer({ minimum: 1, maximum: 100 }) }, { additionalProperties: false });
+const expansionParams = Type.Object({ workflowId: safeId, newWorkflowId: Type.Optional(safeId), upstreamNodeId: safeId, upstreamPath: Type.String({ minLength: 2, maxLength: 512, pattern: "^\\$" }), recipeId: safeId, idPrefix: Type.Optional(safeId) }, { additionalProperties: false });
+const webResearchParams = Type.Object({ workflowId: safeId, requests: Type.Array(Type.Object({ url: Type.String({ minLength: 1, maxLength: 2048 }), purpose: Type.String({ minLength: 1, maxLength: 512 }) }, { additionalProperties: false }), { minItems: 1, maxItems: 32 }) }, { additionalProperties: false });
 const applyParams = Type.Object({ workflowId: safeId, nodeId: safeId, token: Type.String({ pattern: "^[a-f0-9]{64}$" }) }, { additionalProperties: false });
 
 type AnyCtx = ExtensionContext & { modelRegistry: WorkflowModelRegistry; cwd: string; sessionManager: any };
@@ -39,7 +44,7 @@ function clearWorkflowInterval(value: WorkflowIntervalOwner | ReturnType<typeof 
 function visibleLines(lines: string[], width: number): string[] { const limit = Math.max(0, Number.isFinite(width) ? Math.floor(width) : 0); return lines.map((line) => truncateToWidth(line, limit)); }
 function preview(text: unknown, width = 110): string { const value = typeof text === "string" ? text : ""; const first = value.split("\n").find((line) => line.trim()) ?? ""; return truncateToWidth(sanitizeDisplayText(first, width * 4), width); }
 function operationLabel(name: string): string { return name.replace(/^workflow_/, ""); }
-function workflowKeyHint(action: string, fallback: string): string { try { return keyHint(action, fallback); } catch { return fallback; } }
+function workflowKeyHint(action: string, fallback: string): string { try { return keyHint(action as any, fallback); } catch { return fallback; } }
 
 export function registerWorkflowUI(pi: ExtensionAPI, options: { owner: symbol; launcher: (parent: any, owner: symbol, signal: AbortSignal) => WorkflowNodeLauncher; moduleSignal: AbortSignal; hostFactory?: typeof createWorkflowHost }): { shutdown(): Promise<void> } {
   const previousInterval = (globalThis as any)[WORKFLOW_INTERVAL_KEY] as WorkflowIntervalOwner | ReturnType<typeof setInterval> | undefined;
@@ -87,9 +92,14 @@ export function registerWorkflowUI(pi: ExtensionAPI, options: { owner: symbol; l
     getHost(ctx);
   });
 
-  const renderWidget = (width: number): string[] => {
+  const renderWidget = (width: number, theme: any): string[] => {
+    const accent = (text: string) => theme?.fg ? theme.fg("accent", text) : text;
+    const statusColor = (status: string): string => {
+      const role = status === "succeeded" || status === "✓" ? "success" : status === "failed" || status === "blocked" || status === "✗" || status === "⊘" ? "error" : status === "running" || status === "retrying" || status === "●" || status === "↻" ? "accent" : "dim";
+      return theme?.fg ? theme.fg(role, status) : status;
+    };
     const rows = [...active.values()].sort((a, b) => a.snapshot.metadata.workflowId.localeCompare(b.snapshot.metadata.workflowId));
-    const lines = [workflowBorderTop("Workflows", `${rows.length} active`, width)];
+    const lines = [workflowBorderTop("Workflows", `${rows.length} active`, width, accent)];
     const priority: Readonly<Record<string, number>> = { failed: 0, blocked: 1, retrying: 2, running: 3, pending: 4, succeeded: 5, cancelled: 6 };
     const candidates = rows.flatMap((entry) => workflowNodeRows(entry.snapshot, WORKFLOW_NODE_ROWS_PER_WORKFLOW).map((node) => ({ ...node, workflowId: entry.snapshot.metadata.workflowId })));
     const selected = new Set(candidates
@@ -102,7 +112,7 @@ export function registerWorkflowUI(pi: ExtensionAPI, options: { owner: symbol; l
       // Keep every workflow summary visible, then show only bounded,
       // actionable, display-safe node identity/state rows. Never render node
       // output, prompts, paths, or credentials in this detached widget.
-      lines.push(workflowBorderLine(left, ` ${workflowWidgetRight(snapshot)} `, width));
+      lines.push(workflowBorderLine(left, ` ${workflowWidgetRight(snapshot)} `, width, accent));
       const nodeCount = Object.keys(snapshot.nodes ?? {}).length;
       const perWorkflowLimit = Math.min(WORKFLOW_NODE_ROWS_PER_WORKFLOW, nodeCount);
       const nodeRows = candidates.filter((node) => node.workflowId === snapshot.metadata.workflowId && selected.has(node));
@@ -112,20 +122,20 @@ export function registerWorkflowUI(pi: ExtensionAPI, options: { owner: symbol; l
         // defensively too: malformed IDs must not become a data exfiltration
         // channel for paths, prompts, or credential-shaped values.
         const nodeId = /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(sanitizedNodeId) ? sanitizedNodeId : "[REDACTED]";
-        const nodeLabel = `   ${node.icon} ${nodeId}`;
-        lines.push(workflowBorderLine(nodeLabel, ` ${node.status} `, width));
+        const nodeLabel = `   ${statusColor(node.status === "succeeded" ? "✓" : node.status === "failed" ? "✗" : node.status === "blocked" ? "⊘" : node.status === "running" ? "●" : node.status === "retrying" ? "↻" : node.status === "cancelled" ? "■" : "○")} ${nodeId}`;
+        lines.push(workflowBorderLine(nodeLabel, ` ${statusColor(node.status)} `, width, accent));
       }
       const perWorkflowOmitted = Math.max(0, nodeCount - perWorkflowLimit);
-      if (perWorkflowOmitted) lines.push(workflowBorderLine(`   … +${perWorkflowOmitted} node rows`, " omitted ", width));
+      if (perWorkflowOmitted) lines.push(workflowBorderLine(`   … +${perWorkflowOmitted} node rows`, " omitted ", width, accent));
     }
-    if (globallyOmitted) lines.push(workflowBorderLine(`   … +${globallyOmitted} node rows`, " omitted globally ", width));
-    lines.push(workflowBorderBottom(width));
+    if (globallyOmitted) lines.push(workflowBorderLine(`   … +${globallyOmitted} node rows`, " omitted globally ", width, accent));
+    lines.push(workflowBorderBottom(width, accent));
     return lines;
   };
   const updateWidget = (ctx: AnyCtx): void => {
     if (!ctx.hasUI || typeof ctx.ui.setWidget !== "function") return;
     if (active.size === 0) { ctx.ui.setWidget(WORKFLOW_STATUS_WIDGET_KEY, undefined); return; }
-    ctx.ui.setWidget(WORKFLOW_STATUS_WIDGET_KEY, (_tui: any, _theme: any) => ({ invalidate() {}, render(width: number) { return renderWidget(width); } }), { placement: "aboveEditor" });
+    ctx.ui.setWidget(WORKFLOW_STATUS_WIDGET_KEY, (_tui: any, theme: any) => ({ invalidate() {}, render(width: number) { return renderWidget(width, theme); } }), { placement: "aboveEditor" });
   };
   const forget = (binding: WorkflowBinding, ctx: AnyCtx = lastCtx as AnyCtx): void => {
     if (!isCurrentBinding(binding) || !entryMatches(binding)) return;
@@ -204,7 +214,9 @@ export function registerWorkflowUI(pi: ExtensionAPI, options: { owner: symbol; l
     });
     return textResult(`${resumeRun ? "Resumed" : "Started"} workflow ${id}.`, { workflowId: id, runId: runningSnapshot.metadata.runId, template: runningSnapshot.metadata.template, status: runningSnapshot.metadata.status });
   };
-  const plan = (ctx: AnyCtx, p: any): Result => { const build = p.template === "build"; const value = getHost(ctx).plan({ workflowId: p.workflowId, template: p.template as WorkflowRunTemplate, generated: p.generated, ...(build ? { confirmMutation: true } : {}) }); return textResult(`Planned ${p.workflowId} (${p.template}), ${value.workflow.nodes.length} nodes.`, { workflowId: p.workflowId, runId: value.metadata.runId, template: p.template, nodeCount: value.workflow.nodes.length, status: value.metadata.status, objective: value.workflow.objective }); };
+  const revise = (ctx: AnyCtx, p: any): Result => { const value = getHost(ctx).revise({ workflowId: p.workflowId, newWorkflowId: p.newWorkflowId, ...(p.template ? { template: p.template } : {}), ...(p.recipeId ? { recipeId: p.recipeId } : {}), generated: p.generated, confirmMutation: p.template === "build" }); return textResult(`Revised ${p.workflowId} as ${p.newWorkflowId}.`, { workflowId: value.metadata.workflowId, parentWorkflowId: value.metadata.parentWorkflowId, runId: value.metadata.runId, revision: value.metadata.revision, topology: { nodeCount: value.workflow.topology.nodeCount, edgeCount: value.workflow.topology.edgeCount, maxDepth: value.workflow.topology.maxDepth, topologyDigest: value.workflow.topology.topologyDigest } }); };
+  const rerun = (ctx: AnyCtx, p: any): Result => { const value = getHost(ctx).rerun({ workflowId: p.workflowId, newWorkflowId: p.newWorkflowId, confirmMutation: p.confirmMutation === true }); return textResult(`Rerun ${p.workflowId} as ${p.newWorkflowId}.`, { workflowId: value.metadata.workflowId, parentWorkflowId: value.metadata.parentWorkflowId, runId: value.metadata.runId, revision: value.metadata.revision, topology: { nodeCount: value.workflow.topology.nodeCount, topologyDigest: value.workflow.topology.topologyDigest } }); };
+  const plan = (ctx: AnyCtx, p: any): Result => { const build = p.template === "build"; const value = getHost(ctx).plan({ workflowId: p.workflowId, template: p.template as WorkflowRunTemplate, generated: p.generated, ...(p.recipeId ? { recipeId: p.recipeId } : {}), ...(build ? { confirmMutation: true } : {}) }); return textResult(`Planned ${p.workflowId} (${p.template}), ${value.workflow.nodes.length} nodes.`, { workflowId: p.workflowId, runId: value.metadata.runId, template: p.template, nodeCount: value.workflow.nodes.length, status: value.metadata.status, objective: value.workflow.objective, topology: { nodeCount: value.workflow.topology.nodeCount, edgeCount: value.workflow.topology.edgeCount, maxDepth: value.workflow.topology.maxDepth, topologyDigest: value.workflow.topology.topologyDigest } }); };
   const status = (ctx: AnyCtx, id: string): Result => { const snapshot = getHost(ctx).statusSnapshot(id); remember(ctx, snapshot); return textResult(formatWorkflowStatus(snapshot), { ...workflowStatusDetails(snapshot), template: snapshot.metadata.template, elapsed: workflowElapsed(snapshot) }); };
   const cancel = async (ctx: AnyCtx, id: string, signal?: AbortSignal): Promise<Result> => { const operation = getHost(ctx).cancel(id); await waitForCancellation(operation, signal); if (signal?.aborted) return errorResult(new Error("workflow cancellation wait aborted; cancellation remains active")); const snapshot = getHost(ctx).statusSnapshot(id); remember(ctx, snapshot); return textResult(`Cancelled ${id}.`, { ...workflowStatusDetails(snapshot), template: snapshot.metadata.template, elapsed: workflowElapsed(snapshot) }); };
   const resume = (ctx: AnyCtx, id: string): Result => start(ctx, id, true);
@@ -225,7 +237,7 @@ export function registerWorkflowUI(pi: ExtensionAPI, options: { owner: symbol; l
       default: return typeof result?.content?.[0]?.text === "string" ? "completed" : "completed";
     }
   };
-  const tool = (name: string, parameters: any, execute: (p: any, ctx: AnyCtx, signal?: AbortSignal) => Promise<Result> | Result) => pi.registerTool({ name, label: name, description: `Strict workflow operation: ${name}`, parameters, async execute(_id: string, p: any, signal: AbortSignal | undefined, _update: any, ctx: AnyCtx) { try { return await execute(p, ctx, signal); } catch (error) { return errorResult(error); } }, renderCall(args: any, theme: any) {
+  const tool = (name: string, parameters: any, execute: (p: any, ctx: AnyCtx, signal?: AbortSignal) => Promise<Result> | Result) => pi.registerTool(({ name, label: name, description: `Strict workflow operation: ${name}`, parameters, async execute(_id: string, p: any, signal: AbortSignal | undefined, _update: any, ctx: AnyCtx) { try { return await execute(p, ctx, signal); } catch (error) { return errorResult(error); } }, renderCall(args: any, theme: any) {
     const value = args as any ?? {};
     const id = typeof value.workflowId === "string" ? value.workflowId : "(workflow)";
     const op = operationLabel(name);
@@ -245,15 +257,21 @@ export function registerWorkflowUI(pi: ExtensionAPI, options: { owner: symbol; l
     const suffix = resultLabel(name, details, result, args);
     const info = [template, nodeId ? `${nodeId}${details.attempt ?? args.attempt ? ` #${details.attempt ?? args.attempt}` : ""}` : undefined].filter(Boolean).join(" / ");
     return new Text(`${icon} ${theme.fg("toolTitle", theme.bold(id))}${theme.fg(failed ? "error" : "dim", ` — ${suffix}`)}${info ? theme.fg("dim", ` (${info})`) : ""}`, 0, 0);
-  } });
-  tool("workflow_plan", planParams, (p, c, signal) => rejectPreAborted(signal) ?? plan(c, p)); tool("workflow_run", idParams, (p, c, signal) => rejectPreAborted(signal) ?? start(c, p.workflowId)); tool("workflow_status", idParams, (p, c) => status(c, p.workflowId)); tool("workflow_cancel", idParams, (p, c, signal) => cancel(c, p.workflowId, signal)); tool("workflow_resume", idParams, (p, c, signal) => rejectPreAborted(signal) ?? resume(c, p.workflowId)); tool("workflow_approve", nodeParams, (p, c, signal) => rejectPreAborted(signal) ?? approve(c, p)); tool("workflow_apply", applyParams, (p, c, signal) => apply(c, p, signal));
+  } } as any));
+  const history = (ctx: AnyCtx, id: string): Result => { const value = getHost(ctx).history(id); return textResult(`Workflow ${id}: ${value.status}`, { ...value }); };
+  const historyList = (ctx: AnyCtx, query: any): Result => { const value = getHost(ctx).historyList(query); return textResult(`Workflow history (${value.entries.length})`, { ...value }); };
+  const expand = (ctx: AnyCtx, p: any): Result => { const expanded: { readonly manifest: import("./expansion.ts").ExpansionManifest; readonly plan?: WorkflowPlan } = p.newWorkflowId ? getHost(ctx).expandAndPlan(p.workflowId, p.newWorkflowId, p.upstreamNodeId, p.upstreamPath, p.recipeId, p.idPrefix) : { manifest: getHost(ctx).expand(p.workflowId, p.upstreamNodeId, p.upstreamPath, p.recipeId, p.idPrefix) }; const value = expanded.manifest; return textResult(`Expanded ${p.workflowId} into ${value.items.length} items.`, { workflowId: p.workflowId, manifestId: value.manifestId, manifestDigest: value.manifestDigest, itemCount: value.items.length, totalBytes: value.totalBytes, recipeId: value.recipeId, upstreamNodeId: value.upstreamNodeId, ...(expanded.plan ? { newWorkflowId: expanded.plan.metadata.workflowId, newRunId: expanded.plan.metadata.runId } : {}) }); };
+  const research = async (ctx: AnyCtx, p: any): Promise<Result> => { const value = await getHost(ctx).research(p.workflowId, p.requests); return textResult(`Web research fetched ${value.provenance.length} bounded source(s).`, { workflowId: p.workflowId, provenance: value.provenance.map((item) => ({ provider: item.provider, domain: item.domain, status: item.status, bytes: item.bytes, contentDigest: item.contentDigest, provenanceDigest: item.provenanceDigest })) }); };
+  tool("workflow_plan", planParams, (p, c, signal) => rejectPreAborted(signal) ?? plan(c, p)); tool("workflow_web_research", webResearchParams, (p, c, signal) => rejectPreAborted(signal) ?? research(c, p)); tool("workflow_rerun", rerunParams, (p, c, signal) => rejectPreAborted(signal) ?? rerun(c, p)); tool("workflow_expand", expansionParams, (p, c, signal) => rejectPreAborted(signal) ?? expand(c, p)); tool("workflow_revise", reviseParams, (p, c, signal) => rejectPreAborted(signal) ?? revise(c, p)); tool("workflow_run", idParams, (p, c, signal) => rejectPreAborted(signal) ?? start(c, p.workflowId)); tool("workflow_status", idParams, (p, c) => status(c, p.workflowId)); tool("workflow_history", historyParams, (p, c) => historyList(c, p)); tool("workflow_detail", idParams, (p, c) => history(c, p.workflowId)); tool("workflow_cancel", idParams, (p, c, signal) => cancel(c, p.workflowId, signal)); tool("workflow_resume", idParams, (p, c, signal) => rejectPreAborted(signal) ?? resume(c, p.workflowId)); tool("workflow_approve", nodeParams, (p, c, signal) => rejectPreAborted(signal) ?? approve(c, p)); tool("workflow_apply", applyParams, (p, c, signal) => apply(c, p, signal));
 
   const notifyResult = (ctx: any, result: Result): void => { ctx.ui.notify(sanitizeDisplayText(result.content?.[0]?.text ?? "Workflow operation completed", 2000), result.details?.error ? "error" : "info"); };
   pi.registerCommand("workflow-plan", { description: "Plan workflow from strict JSON", handler: async (args, ctx) => { try { notifyResult(ctx, await plan(ctx as AnyCtx, parseJsonArgs(args))); } catch (e) { ctx.ui.notify(sanitizeDisplayText(e, 500), "error"); } } });
+  pi.registerCommand("workflow-revise", { description: "Create an immutable revised workflow from strict JSON", handler: async (args, ctx) => { try { notifyResult(ctx, await revise(ctx as AnyCtx, parseJsonArgs(args))); } catch (e) { ctx.ui.notify(sanitizeDisplayText(e, 500), "error"); } } });
+  pi.registerCommand("workflow-rerun", { description: "Create a fresh immutable rerun workflow from strict JSON", handler: async (args, ctx) => { try { notifyResult(ctx, await rerun(ctx as AnyCtx, parseJsonArgs(args))); } catch (e) { ctx.ui.notify(sanitizeDisplayText(e, 500), "error"); } } });
   const command = (name: string, fn: (ctx: AnyCtx, value: any) => Promise<Result> | Result, plainId = false) => pi.registerCommand(name, { description: `Workflow ${name}`, handler: async (args, ctx) => { try { const raw = args.trim(); const value = plainId && raw.length <= 128 && !raw.startsWith("{") ? { workflowId: raw } : parseJsonArgs(raw); notifyResult(ctx, await fn(ctx as AnyCtx, value)); } catch (e) { ctx.ui.notify(sanitizeDisplayText(e, 500), "error"); } } });
-  command("workflow-run", (c, p) => start(c, p.workflowId), true); command("workflow-status", (c, p) => status(c, p.workflowId), true); command("workflow-cancel", (c, p) => cancel(c, p.workflowId), true); command("workflow-resume", (c, p) => resume(c, p.workflowId), true); command("workflow-approve", approve); command("workflow-apply", apply);
+  command("workflow-run", (c, p) => start(c, p.workflowId), true); command("workflow-status", (c, p) => status(c, p.workflowId), true); command("workflow-history", (c, p) => historyList(c, p), false); command("workflow-detail", (c, p) => history(c, p.workflowId), true); command("workflow-cancel", (c, p) => cancel(c, p.workflowId), true); command("workflow-resume", (c, p) => resume(c, p.workflowId), true); command("workflow-approve", approve); command("workflow-apply", apply);
 
-  const boxRenderer = (message: any, options: any, theme: any, statusBox = false) => ({ render(width: number): string[] {
+  const boxRenderer = (message: any, options: any, theme: any, statusBox = false) => ({ invalidate() {}, render(width: number): string[] {
     const details = message.details ?? {};
     const failed = details.status === "failed" || details.status === "cancelled" || details.error === true || !!details.error;
     const id = sanitizeDisplayText(details.workflowId ?? "workflow", 128);
@@ -264,7 +282,7 @@ export function registerWorkflowUI(pi: ExtensionAPI, options: { owner: symbol; l
     const counts = details.nodeCounts ?? {};
     const activeCount = (counts.running ?? 0) + (counts.retrying ?? 0);
     const retrying = counts.retrying ?? 0;
-    const aggregate = counts.total != null ? `${counts.succeeded ?? 0}/${counts.total} nodes${activeCount ? `, ${activeCount} active` : ""}${retrying ? ` (${retrying} retrying)` : ""}${counts.failed || counts.blocked ? `, ${(counts.failed ?? 0) + (counts.blocked ?? 0)} failed` : ""}` : "";
+    const aggregate = counts.total != null ? `${counts.succeeded ?? 0}/${counts.total} nodes${activeCount ? ` · ${activeCount} active` : ""}${retrying ? ` · ${retrying} retrying` : ""}${counts.failed || counts.blocked ? ` · ${(counts.failed ?? 0) + (counts.blocked ?? 0)} failed` : ""}` : "";
     const lines = [`${icon} ${theme.fg("toolTitle", theme.bold(String(id)))} ${theme.fg("dim", `— ${status}`)}${template}${elapsed}`];
     if (aggregate) lines.push(theme.fg("dim", aggregate));
     const errors = details.errors && typeof details.errors === "object" ? Object.entries(details.errors).map(([node, error]) => `${sanitizeDisplayText(node, 128)}: ${sanitizeDisplayText(error, 300)}`) : [];
@@ -283,8 +301,8 @@ export function registerWorkflowUI(pi: ExtensionAPI, options: { owner: symbol; l
     box.addChild(new Text(lines.join("\n"), 0, 0));
     return ["", ...visibleLines(box.render(Math.max(0, width)), width)];
   } });
-  pi.registerMessageRenderer("workflow_result", (message: any, options: any, theme: any) => boxRenderer(message, options, theme, false));
-  pi.registerMessageRenderer("workflow_status", (message: any, options: any, theme: any) => boxRenderer(message, options, theme, true));
+  pi.registerMessageRenderer("workflow_result", (message: any, options: any, theme: any) => boxRenderer(message, options, theme, false) as any);
+  pi.registerMessageRenderer("workflow_status", (message: any, options: any, theme: any) => boxRenderer(message, options, theme, true) as any);
 
   return { async shutdown() {
     // Invalidate bindings before awaiting host shutdown: late detached completions

@@ -33,6 +33,9 @@ export interface RemediationTerminalRecord {
   type: "remediation";
   claimedAt: number;
   reason: "heartbeat-stale" | "pane-unavailable";
+  holderId?: string;
+  fencingToken?: number;
+  expiresAt?: number;
 }
 
 export type ReadOutcome =
@@ -67,13 +70,13 @@ export interface TerminalFilesystem {
 
 const nodeFilesystem: TerminalFilesystem = {
   openSync,
-  writeFileSync,
+  writeFileSync: (fd, data, encoding) => writeFileSync(fd, data, encoding as BufferEncoding | undefined),
   fsyncSync,
   closeSync,
   linkSync,
   unlinkSync,
   statSync,
-  readFileSync,
+  readFileSync: (path, encoding) => readFileSync(path, encoding as BufferEncoding | undefined),
 };
 
 function boundedError(error: unknown): string {
@@ -179,19 +182,27 @@ function parseRecord(
       (record.stopReason !== undefined && !validText(record.stopReason, MAX_STOP_REASON_TEXT))) {
       throw new Error("error terminal record has invalid bounded fields");
     }
+    const stopReason = typeof record.stopReason === "string" ? record.stopReason : undefined;
     return {
       version: 1,
       runningChildId: expectedRunningChildId,
       type: "error",
-      errorMessage: record.errorMessage,
-      ...(record.stopReason !== undefined ? { stopReason: record.stopReason } : {}),
+      errorMessage: String(record.errorMessage),
+      ...(stopReason !== undefined ? { stopReason } : {}),
     };
   }
   if (record.type === "remediation") {
-    rejectUnexpectedRecordKeys(record, ["version", "runningChildId", "type", "claimedAt", "reason"]);
+    rejectUnexpectedRecordKeys(record, ["version", "runningChildId", "type", "claimedAt", "reason", "holderId", "fencingToken", "expiresAt"]);
     const claimedAt = record.claimedAt;
     const reason = record.reason;
+    const holderId = typeof record.holderId === "string" ? record.holderId : undefined;
+    const fencingToken = typeof record.fencingToken === "number" ? record.fencingToken : undefined;
+    const expiresAt = typeof record.expiresAt === "number" ? record.expiresAt : undefined;
     if (typeof claimedAt !== "number" || !Number.isFinite(claimedAt) || claimedAt < 0 ||
+      record.holderId !== undefined && holderId === undefined ||
+      holderId !== undefined && !/^[A-Za-z0-9._:-]{1,128}$/.test(holderId) ||
+      fencingToken !== undefined && (!Number.isSafeInteger(fencingToken) || fencingToken < 1) ||
+      expiresAt !== undefined && (!Number.isSafeInteger(expiresAt) || expiresAt < claimedAt) ||
       (reason !== "heartbeat-stale" && reason !== "pane-unavailable")) {
       throw new Error("remediation terminal record has invalid fields");
     }
@@ -201,6 +212,9 @@ function parseRecord(
       type: "remediation",
       claimedAt,
       reason,
+      ...(holderId !== undefined ? { holderId } : {}),
+      ...(fencingToken !== undefined ? { fencingToken } : {}),
+      ...(expiresAt !== undefined ? { expiresAt } : {}),
     };
   }
   throw new Error("terminal record type is invalid");
@@ -352,7 +366,7 @@ export function publishGenerationTerminal(params: {
   const winner = readGenerationTerminal(params.sessionFile, params.runningChildId, fs);
   if (winner.kind === "child") return { kind: "existing" };
   if (winner.kind === "remediation") return { kind: "blocked" };
-  return { kind: "error", error: winner.error ?? "terminal record disappeared after EEXIST" };
+  return { kind: "error", error: winner.kind === "missing" ? "terminal record disappeared after EEXIST" : winner.error };
 }
 
 export function tryPublishRemediation(params: {
@@ -360,6 +374,9 @@ export function tryPublishRemediation(params: {
   runningChildId: string;
   reason: "heartbeat-stale" | "pane-unavailable";
   claimedAt?: number;
+  holderId?: string;
+  fencingToken?: number;
+  expiresAt?: number;
   fs?: TerminalFilesystem;
   random?: () => string;
 }): RemediationOutcome {
@@ -373,12 +390,18 @@ export function tryPublishRemediation(params: {
     }
     const claimedAt = params.claimedAt ?? Date.now();
     if (!Number.isFinite(claimedAt) || claimedAt < 0) throw new Error("remediation claimedAt is invalid");
+    if (params.holderId !== undefined && !/^[A-Za-z0-9._:-]{1,128}$/.test(params.holderId)) throw new Error("remediation holder identity is invalid");
+    if (params.fencingToken !== undefined && (!Number.isSafeInteger(params.fencingToken) || params.fencingToken < 1)) throw new Error("remediation fencing token is invalid");
+    if (params.expiresAt !== undefined && (!Number.isSafeInteger(params.expiresAt) || params.expiresAt < claimedAt)) throw new Error("remediation lease expiry is invalid");
     record = {
       version: 1,
       runningChildId: params.runningChildId,
       type: "remediation",
       claimedAt,
       reason: params.reason,
+      ...(params.holderId !== undefined ? { holderId: params.holderId } : {}),
+      ...(params.fencingToken !== undefined ? { fencingToken: params.fencingToken } : {}),
+      ...(params.expiresAt !== undefined ? { expiresAt: params.expiresAt } : {}),
     };
     finalFile = getGenerationExitFile(params.sessionFile, params.runningChildId);
   } catch (error) {
@@ -397,6 +420,9 @@ export function tryPublishRemediation(params: {
 
   const winner = readGenerationTerminal(params.sessionFile, params.runningChildId, fs);
   if (winner.kind === "child") return { kind: "defer" };
-  if (winner.kind === "remediation") return { kind: "acquired-existing" };
-  return { kind: "error", error: winner.error ?? "terminal record disappeared after EEXIST" };
+  if (winner.kind === "remediation") {
+    if (winner.record.holderId !== undefined && params.holderId !== undefined && winner.record.holderId !== params.holderId) return { kind: "defer" };
+    return { kind: "acquired-existing" };
+  }
+  return { kind: "error", error: winner.kind === "missing" ? "terminal record disappeared after EEXIST" : winner.error };
 }

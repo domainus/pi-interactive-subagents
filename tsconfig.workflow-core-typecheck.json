@@ -1,0 +1,28 @@
+{
+  "compilerOptions": {
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "target": "ES2022",
+    "skipLibCheck": true,
+    "strict": true,
+    // Existing Pi SDK declarations expose optional/null unions and legacy
+    // callback payloads; keep those two compatibility relaxations targeted.
+    "strictNullChecks": false,
+    "noImplicitAny": false,
+    "types": ["node"]
+  },
+  "include": [
+    "pi-extension/subagents/workflow/**/*.ts",
+    "pi-extension/subagents/cmux.ts",
+    "pi-extension/subagents/model-selection.ts",
+    "pi-extension/subagents/status.ts",
+    "pi-extension/subagents/sidecar-arbitration.ts",
+    "pi-extension/subagents/index.ts",
+    "test/workflow-contracts.test.ts",
+    "test/workflow-executor.test.ts",
+    "test/workflow-host.test.ts",
+    "test/workflow-security-seams.test.ts"
+  ]
+}

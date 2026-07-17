@@ -48,6 +48,24 @@ export type PaneProbeObservation =
   | { readable: true }
   | { readable: false; error?: string };
 
+/** Independent liveness evidence used by remediation callers. Heartbeat or
+ * semantic activity alone is deliberately never terminal. */
+export interface CorroboratedLivenessEvidence {
+  readonly heartbeatFresh?: boolean;
+  readonly paneReadable?: boolean;
+  readonly processReachable?: boolean;
+  readonly terminalRecord?: boolean;
+  readonly consecutiveFailures?: number;
+}
+export type CorroboratedLiveness = "healthy" | "suspect" | "dead";
+export function assessCorroboratedLiveness(evidence: CorroboratedLivenessEvidence): CorroboratedLiveness {
+  if (evidence.terminalRecord === true) return "dead";
+  if (evidence.paneReadable === true && evidence.processReachable !== false) return "healthy";
+  if (evidence.processReachable === true && evidence.paneReadable !== false) return "healthy";
+  if (evidence.paneReadable === false && evidence.processReachable === false && (evidence.consecutiveFailures ?? 0) >= PANE_BROKEN_AFTER_FAILURES) return "dead";
+  return "suspect";
+}
+
 export interface SubagentStatusState {
   source: SubagentStatusSource;
   startTimeMs: number;
@@ -322,7 +340,7 @@ export function observePaneProbe(
     ...state,
     consecutivePaneFailures: state.consecutivePaneFailures + 1,
     paneProblemSinceMs: state.paneProblemSinceMs ?? now,
-    paneError: observation.error?.replace(/\s+/g, " ").trim().slice(0, 200) || null,
+    paneError: (observation as { error?: string }).error?.replace(/\s+/g, " ").trim().slice(0, 200) || null,
   };
 }
 
@@ -409,17 +427,24 @@ export function classifyStatus(state: SubagentStatusState, now: number): StatusS
   let kind: SubagentStatusKind;
   let statusLabel: string | null = null;
 
-  if (state.consecutivePaneFailures >= PANE_BROKEN_AFTER_FAILURES) {
+  // A live active turn is evidence of progress even when the child cannot emit
+  // semantic events for a long provider/tool call. Heartbeat age is diagnostic
+  // only here; it must never turn a readable, active pane into remediation.
+  if (state.activeNow || state.phase === "active") {
+    kind = "active";
+  } else if (state.consecutivePaneFailures >= PANE_BROKEN_AFTER_FAILURES) {
     kind = "broken";
     statusLabel = "pane unavailable";
   } else if (heartbeatAgeMs >= HEARTBEAT_BROKEN_AFTER_MS) {
+    // Preserve the bounded diagnostic for idle legacy states, but remediation
+    // independently requires repeated pane/process failure (see index.ts).
     kind = "broken";
     statusLabel = `heartbeat ${heartbeatAgeText} ago`;
   } else if (heartbeatAgeMs >= HEARTBEAT_STALLED_AFTER_MS) {
     kind = "stalled";
     statusLabel = `heartbeat ${heartbeatAgeText} ago`;
   } else if (state.snapshotState === "present") {
-    if (state.phase === "active" || state.activeNow) {
+    if (state.activeNow) {
       kind = "active";
     } else if (state.phase === "waiting") {
       kind = "waiting";

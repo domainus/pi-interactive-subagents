@@ -3,6 +3,7 @@ import { keyHint } from "@mariozechner/pi-coding-agent";
 import { Type, type Static } from "@sinclair/typebox";
 import { Box, Text, truncateToWidth } from "@mariozechner/pi-tui";
 import { dirname, join, resolve } from "node:path";
+import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import {
@@ -13,6 +14,7 @@ import {
   mkdirSync,
   copyFileSync,
   unlinkSync,
+  realpathSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import {
@@ -28,6 +30,7 @@ import {
   renameCurrentTab,
   renameWorkspace,
   readScreen,
+  probeSurface,
   type PaneProbeObservation,
 } from "./cmux.ts";
 
@@ -43,6 +46,7 @@ import {
   advanceStatusState,
   capStatusLines,
   classifyStatus,
+  assessCorroboratedLiveness,
   createStatusState,
   forceStatusAfterInterrupt,
   formatStatusAggregate,
@@ -50,6 +54,7 @@ import {
   formatTransitionLine,
   observeStatus,
   loadStatusConfig,
+  PANE_BROKEN_AFTER_FAILURES,
 } from "./status.ts";
 import {
   getSubagentActivityFile,
@@ -69,6 +74,7 @@ import type { WorkflowNodeLauncher } from "./workflow/executor.ts";
 import { registerWorkflowUI } from "./workflow/ui.ts";
 import { formatWorkflowElapsed, workflowBorderBottom, workflowBorderLine, workflowBorderTop } from "./workflow/status.ts";
 import { sanitizeDisplayText } from "./display-safety.ts";
+import { CoordinationLeaseManager, processStartIdentity, type CoordinationLease } from "./workflow/coordination.ts";
 
 /** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
 const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
@@ -105,7 +111,7 @@ function retireGlobalInterval(
   interval: IntervalOwner | ReturnType<typeof setInterval>,
 ) {
   const timer = getIntervalTimer(interval);
-  if (timer) clearInterval(timer);
+  if (timer) clearInterval(timer as any);
   if ((globalThis as any)[key] === interval) {
     (globalThis as any)[key] = null;
   }
@@ -392,11 +398,12 @@ function resolveSubagentPaths(
   const rawCwd = params.cwd ?? agentDefs?.cwd ?? null;
   const cwdIsFromAgent = !params.cwd && agentDefs?.cwd != null;
   const cwdBase = cwdIsFromAgent ? getAgentConfigDir() : process.cwd();
-  const effectiveCwd = rawCwd
+  const requestedCwd = rawCwd
     ? rawCwd.startsWith("/")
       ? rawCwd
       : join(cwdBase, rawCwd)
     : null;
+  const effectiveCwd = requestedCwd && existsSync(requestedCwd) ? realpathSync(requestedCwd) : requestedCwd;
   const localAgentDir = effectiveCwd ? join(effectiveCwd, ".pi", "agent") : null;
   const effectiveAgentDir =
     localAgentDir && existsSync(localAgentDir) ? localAgentDir : getAgentConfigDir();
@@ -664,8 +671,8 @@ function listingModelResolution(
     return {
       unavailable: true,
       tier,
-      error: compactListingText(resolution.message, LISTING_DIAGNOSTIC_MAX_WIDTH),
-      alternatives: boundedListingAlternatives(resolution.alternatives),
+      error: compactListingText((resolution as any).message, LISTING_DIAGNOSTIC_MAX_WIDTH),
+      alternatives: boundedListingAlternatives((resolution as any).alternatives),
     };
   }
 
@@ -697,7 +704,7 @@ function projectListedAgentDetails(
 }
 
 function listingModelSummary(resolution: ListingModelResolution | unknown): string {
-  const value = resolution as Partial<ListingModelResolution> | null;
+  const value = resolution as any;
   if (value?.authType === "external") return "external auth";
   if (value && "unavailable" in value && value.unavailable === true) {
     const alternatives = boundedListingAlternatives(value.alternatives);
@@ -807,6 +814,8 @@ export interface SubagentResult {
   error?: string;
   /** Provider/agent error message when auto-retry exhausted (overload, rate limit, etc.). */
   errorMessage?: string;
+  usageLimit?: { readonly message?: string; readonly resetAt?: number; readonly retryAfterMs?: number };
+  providerRequestId?: string;
   ping?: { name: string; message: string };
 }
 
@@ -846,6 +855,19 @@ export interface RunningSubagent {
   interactive: boolean;
   /** Workflow-owned children settle through the adapter and never deliver legacy messages. */
   workflowOwned?: boolean;
+  /** Durable cross-process claim for legacy worker/editor mutations. */
+  coordinationLease?: CoordinationLease;
+  coordinationManager?: CoordinationLeaseManager;
+  coordinationLeaseTimer?: ReturnType<typeof setInterval>;
+  /** Watcher completion is deliberately distinct from child process settlement. */
+  watchPromise?: Promise<unknown>;
+  /** Independent wrapper/child death confirmation used for lease settlement. */
+  settledPromise?: Promise<boolean>;
+  leaseQuarantined?: boolean;
+  processIdentity?: { readonly pid: number; readonly start: number };
+  /** Parent-issued nonce and mux surface complete the wrapper identity handshake. */
+  processIdentityNonce?: string;
+  processIdentityFile?: string;
   /** One local path may close/remove/deliver a terminal result. */
   terminalClaim?: TerminalClaim;
   /** Last bounded arbitration error reported during status supervision. */
@@ -869,6 +891,73 @@ function claimTerminal(running: RunningSubagent, owner: TerminalClaim): boolean 
 
 function deleteRunningIdentitySafe(running: RunningSubagent): void {
   if (runningSubagents.get(running.id) === running) runningSubagents.delete(running.id);
+}
+function releaseCoordinationLease(running: RunningSubagent, confirmedDeath = false): void {
+  if (running.coordinationLeaseTimer) { clearInterval(running.coordinationLeaseTimer); running.coordinationLeaseTimer = undefined; }
+  if (!running.coordinationLease || !running.coordinationManager || running.leaseQuarantined && !confirmedDeath) return;
+  if (!confirmedDeath && childProcessLiveness(running) !== "dead") { running.leaseQuarantined = true; return; }
+  try { running.coordinationManager.release(running.coordinationLease); running.coordinationLease = undefined; running.leaseQuarantined = false; } catch { running.leaseQuarantined = true; }
+}
+function readProcessIdentityHandshake(running: RunningSubagent): { pid: number; start: number } | undefined {
+  if (!running.processIdentityFile || !running.processIdentityNonce) return undefined;
+  try {
+    const fields = readFileSync(running.processIdentityFile, "utf8").trim().split(/\s+/);
+    if (fields.length !== 4 || fields[2] !== running.processIdentityNonce || fields[3] !== running.surface) return undefined;
+    const pid = Number(fields[0]); const start = Number(fields[1]);
+    if (!Number.isSafeInteger(pid) || pid < 1 || !Number.isSafeInteger(start) || start < 0) return undefined;
+    return { pid, start };
+  } catch { return undefined; }
+}
+function childProcessLiveness(running: RunningSubagent): "alive" | "dead" | "unknown" {
+  const handshake = readProcessIdentityHandshake(running);
+  if (!handshake || running.processIdentity && (running.processIdentity.pid !== handshake.pid || running.processIdentity.start !== handshake.start)) return "unknown";
+  running.processIdentity = handshake;
+  const identity = handshake;
+  const current = processStartIdentity(identity.pid);
+  if (current === undefined) {
+    try { process.kill(identity.pid, 0); return "unknown"; }
+    catch (error) { return (error as NodeJS.ErrnoException)?.code === "ESRCH" ? "dead" : "unknown"; }
+  }
+  return current === identity.start ? "alive" : "dead";
+}
+
+function confirmedPostDeliveryDeath(running: RunningSubagent | undefined, identityFile: string, nonce: string, surface: string): boolean {
+  const identity = running ? readProcessIdentityHandshake(running) : (() => {
+    try { const fields = readFileSync(identityFile, "utf8").trim().split(/\s+/); if (fields.length !== 4 || fields[2] !== nonce || fields[3] !== surface) return undefined; const pid = Number(fields[0]); const start = Number(fields[1]); return Number.isSafeInteger(pid) && pid > 0 && Number.isSafeInteger(start) && start >= 0 ? { pid, start } : undefined; } catch { return undefined; }
+  })();
+  // A missing pane is not process identity evidence. Without the complete
+  // PID/start handshake, delivery remains quarantined indefinitely.
+  if (!identity) return false;
+  const current = processStartIdentity(identity.pid);
+  if (current !== undefined) return current !== identity.start;
+  try { process.kill(identity.pid, 0); }
+  catch (error) { if ((error as NodeJS.ErrnoException)?.code === "ESRCH") return true; }
+  return false;
+}
+
+function waitForChildSettlement(running: RunningSubagent, timeoutMs = 5_000): Promise<boolean> {
+  return new Promise((resolve) => {
+    const deadline = Date.now() + timeoutMs;
+    const poll = () => {
+      const status = childProcessLiveness(running);
+      if (status === "dead") { resolve(true); return; }
+      if (Date.now() >= deadline) { resolve(false); return; }
+      setTimeout(poll, 100).unref?.();
+    };
+    poll();
+  });
+}
+
+function bindLaunchedChildIdentity(running: RunningSubagent): void {
+  const manager = running.coordinationManager; const lease = running.coordinationLease;
+  if (!manager || !lease) return;
+  try {
+    const binding: { childPid?: number; childProcessStartTime?: number; surfaceIdentity?: string } = { surfaceIdentity: running.surface };
+    const identity = readProcessIdentityHandshake(running);
+    if (!identity) return;
+    running.processIdentity = identity; binding.childPid = identity.pid; binding.childProcessStartTime = identity.start;
+    const next = manager.bindChildIdentity(lease, binding); running.coordinationLease = next;
+  } catch { /* launch handoff is retried by the lease timer and settlement probe */ }
 }
 
 function boundDiagnostic(value: unknown): string {
@@ -1020,6 +1109,7 @@ type RemediationDependencies = {
     runningChildId: string;
     reason: "heartbeat-stale" | "pane-unavailable";
     claimedAt: number;
+    holderId?: string;
   }) => { kind: string; error?: string };
   close?: (surface: string) => void;
   updateWidget?: () => void;
@@ -1036,6 +1126,13 @@ function remediateBrokenSubagent(
     return { kind: "skipped" };
   }
 
+  // Heartbeat/semantic staleness is never independently terminal. A provider
+  // or tool call may legitimately be silent for minutes or hours. Only the
+  // corroborated repeated pane/process loss path below may remediate.
+  if (snapshot.statusLabel !== "pane unavailable") {
+    return { kind: "skipped" };
+  }
+
   const reason: "heartbeat-stale" | "pane-unavailable" = snapshot.statusLabel === "pane unavailable"
     ? "pane-unavailable"
     : "heartbeat-stale";
@@ -1046,6 +1143,7 @@ function remediateBrokenSubagent(
       runningChildId: running.id,
       reason,
       claimedAt: Date.now(),
+      holderId: `remediation-${process.pid}-${running.id}`,
     });
   } catch (error) {
     arbitration = { kind: "error", error: boundDiagnostic(error) };
@@ -1076,6 +1174,7 @@ function remediateBrokenSubagent(
   try {
     (dependencies.close ?? closeSurface)(running.surface);
   } catch {}
+  releaseCoordinationLease(running, childProcessLiveness(running) === "dead");
   deleteRunningIdentitySafe(running);
   safeUpdateWidget(dependencies.updateWidget);
   try {
@@ -1196,6 +1295,26 @@ function buildSubagentToolAllowlist(effectiveTools?: string): string | null {
   return [...allow].join(",");
 }
 
+/** A child lease is read-only only when every explicitly allowed tool is in this
+ * conservative, host-audited set. Empty/unrestricted, shell, Claude, and every
+ * unknown/custom tool remain exclusive repository mutations. */
+const PROVABLY_READ_ONLY_TOOLS = new Set([
+  "read", "grep", "find", "ls", "glob", "search", "web_search", "web_fetch",
+  "fetch_content", "get_search_content", "subagents_list",
+]);
+function effectiveRepositoryRoot(cwd: string): string {
+  const absolute = existsSync(cwd) ? realpathSync(cwd) : resolve(cwd);
+  try {
+    const root = execFileSync("git", ["-C", absolute, "rev-parse", "--show-toplevel"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+    return root && existsSync(root) ? realpathSync(root) : absolute;
+  } catch { return absolute; }
+}
+function legacyLeaseMode(cli: AgentDefaults["cli"] | undefined, tools: string | undefined): "read-only" | "mutating" {
+  if (cli === "claude" || !tools?.trim()) return "mutating";
+  const names = tools.split(",").map((tool) => tool.trim()).filter(Boolean);
+  return names.length > 0 && names.every((tool) => PROVABLY_READ_ONLY_TOOLS.has(tool)) ? "read-only" : "mutating";
+}
+
 function buildPiPromptArgs(params: {
   effectiveSkills?: string;
   taskDelivery: "direct" | "artifact";
@@ -1232,9 +1351,10 @@ function observeRunningSubagent(running: RunningSubagent, observedAt = Date.now(
     ? readSubagentActivityFile(activityFile, running.id)
     : { ok: false, reason: "missing" };
 
+  const failedRead = read as Extract<ActivityReadResult, { ok: false }>;
   running.activityRead = read.ok
     ? { ok: true }
-    : { ok: false, reason: read.reason, error: read.error };
+    : { ok: false, reason: failedRead.reason, error: failedRead.error };
 
   if (read.ok) {
     running.activity = read.activity;
@@ -1255,8 +1375,8 @@ function observeRunningSubagent(running: RunningSubagent, observedAt = Date.now(
   }
 
   running.statusState = observeStatus(running.statusState, {
-    snapshot: read.reason,
-    snapshotError: read.error,
+    snapshot: failedRead.reason,
+    snapshotError: failedRead.error,
   }, observedAt);
 }
 
@@ -1364,7 +1484,21 @@ function refreshSubagentStatuses(pi: Pick<ExtensionAPI, "sendMessage">, now = Da
 
     // Broken autonomous children are handled only after iteration. This avoids
     // mutating the Map while observing it and keeps interactive/done runs open.
-    if (snapshot.kind === "broken" && !running.interactive && !running.workflowOwned) {
+    // Activity files are heartbeat evidence only, never an independent process
+    // liveness proof. A valid stale file plus a missing pane is therefore
+    // unknown and must not trigger terminal remediation.
+    // Activity files are advisory heartbeat data. Only a confirmed process
+    // identity probe may supply processReachable=false; all read failures stay
+    // unknown and therefore non-terminal.
+    const processState = childProcessLiveness(running);
+    // Test doubles and legacy callers predating identity transport have no
+    // process probe; retain their explicit repeated pane-loss behavior. Real
+    // launches always carry processIdentityFile, where unknown stays unknown.
+    const processReachable = running.processIdentityFile || running.processIdentity ? (processState === "alive" ? true : processState === "dead" ? false : undefined) : false;
+    const surfaceState = (running.processIdentityFile || running.processIdentity) ? probeSurface(running.surface) : "absent";
+    const paneReadable = processState === "dead" || surfaceState === "absent" ? false : surfaceState === "present" ? true : undefined;
+    const liveness = assessCorroboratedLiveness({ paneReadable, processReachable, consecutiveFailures: running.statusState.consecutivePaneFailures });
+    if (snapshot.kind === "broken" && snapshot.statusLabel === "pane unavailable" && liveness === "dead" && !running.interactive && !running.workflowOwned) {
       remediationCandidates.push({ running, snapshot });
       continue;
     }
@@ -1437,11 +1571,14 @@ async function withOwnedLaunchSurface<T>(params: {
   surface: string;
   owned: boolean;
   close?: (surface: string) => void;
+  /** Called only when launch setup rejects before a tracked child exists. */
+  onFailure?: () => void;
   launch: () => Promise<T> | T;
 }): Promise<T> {
   try {
     return await params.launch();
   } catch (error) {
+    try { params.onFailure?.(); } catch {}
     if (params.owned) {
       try {
         (params.close ?? closeSurface)(params.surface);
@@ -1476,6 +1613,10 @@ export const __test__ = {
   handleSubagentInterrupt,
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
+  processIdentityHandshakeCommand,
+  readProcessIdentityHandshake,
+  childProcessLiveness,
+  confirmedPostDeliveryDeath,
   withOwnedLaunchSurface,
   getTrustedWorkflowAgentDir,
   activatePollAbortOwner,
@@ -1516,6 +1657,14 @@ function startWidgetRefresh(owner: symbol) {
  *
  * Call watchSubagent() on the returned object to observe completion.
  */
+/** Build the wrapper's pre-exec identity handshake. The wrapper writes its
+ * own PID/start identity, parent nonce, and exact mux surface as one atomic
+ * record, then execs the child so PID/start remain bound across the handoff. */
+function processIdentityHandshakeCommand(path: string, nonce: string, surface: string): string {
+  const script = `const fs=require("node:fs"),cp=require("node:child_process"),p=require("node:path");const pid=Number(process.argv[1]);let start;if(process.platform==="linux"){const s=fs.readFileSync("/proc/"+pid+"/stat","utf8"),i=s.lastIndexOf(")"),f=s.slice(i+2).trim().split(/\\s+/);start=Number(f[19]);}else{const v=cp.execFileSync("ps",["-o","lstart=","-p",String(pid)],{encoding:"utf8"}).trim();let h=0;for(const c of v)h=((h*31)+c.charCodeAt(0))>>>0;start=h;}if(!Number.isSafeInteger(start)||start<0)process.exit(70);const target=process.argv[2],tmp=target+".tmp-"+pid+"-"+process.argv[3];const body=pid+" "+start+" "+process.argv[3]+" "+process.argv[4]+"\\n";const fd=fs.openSync(tmp,"wx",0o600);try{fs.writeFileSync(fd,body);fs.fsyncSync(fd);}finally{fs.closeSync(fd);}fs.renameSync(tmp,target);`;
+  return `${shellEscape(process.execPath)} -e ${shellEscape(script)} "$$" ${shellEscape(path)} ${shellEscape(nonce)} ${shellEscape(surface)}`;
+}
+
 async function launchSubagent(
   params: typeof SubagentParams.static,
   ctx: { sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string }; cwd: string },
@@ -1537,6 +1686,7 @@ async function launchSubagent(
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
   const id = newRunningChildId();
+  const processIdentityNonce = randomBytes(24).toString("hex");
 
   const { agentDefs, effectiveThinking, modelResolution } = options;
   const effectiveModel = options.resolvedModel ?? (agentDefs?.cli === "claude"
@@ -1573,18 +1723,84 @@ async function launchSubagent(
     Math.random().toString(16).slice(2, 6),
   ].join("-");
   const subagentSessionFile = join(sessionDir, `${timestamp}_${uuid}.jsonl`);
+  let coordinationManager: CoordinationLeaseManager | undefined;
+  let coordinationLease: CoordinationLease | undefined;
+  let coordinationLeaseLost = false;
+  let runningRef: RunningSubagent | undefined;
+  if (!options.workflowOwned) {
+    // Legacy Pi and Claude children share the same agent-global lease file as
+    // dynamic workflows; session-local coordination would permit cross-surface
+    // repository races. The effective child cwd (not the parent ctx.cwd) is
+    // canonicalized to its actual git repository root.
+    coordinationManager = CoordinationLeaseManager.forAgentState(homedir());
+    coordinationLease = coordinationManager.acquire({
+      ownerId: `subagent-${process.pid}`,
+      // Parent Pi is only the claimant; child liveness is handed off after launch.
+      workflowId: `legacy-${id}`,
+      runId: id,
+      sessionId,
+      generation: 0,
+      repositoryRoot: effectiveRepositoryRoot(effectiveCwd ?? ctx.cwd),
+      objective: params.task,
+      mode: legacyLeaseMode(agentDefs?.cli, effectiveTools),
+    });
+  }
 
   // Use pre-created surface (parallel mode) or create a new one.
   // For new surfaces, pause briefly so the shell is ready before sending the command.
   const surfacePreCreated = !!options.surface;
-  const surface = options.surface ?? createSurface(params.name);
+  let surface: string;
+  try { surface = options.surface ?? createSurface(params.name); }
+  catch (error) { if (coordinationLease && coordinationManager) { try { coordinationManager.release(coordinationLease); } catch {} } throw error; }
+  const processIdentityFile = join(artifactDir, `process-${id}.identity`);
+  if (coordinationLease && coordinationManager) {
+    try { coordinationLease = coordinationManager.bindChildIdentity(coordinationLease, { surfaceIdentity: surface }); } catch { /* retry after launch */ }
+  }
+  const coordinationLeaseTimer = coordinationLease && coordinationManager
+    ? setInterval(() => {
+      try { if (runningRef) { bindLaunchedChildIdentity(runningRef); coordinationLease = runningRef.coordinationLease; } coordinationLease = coordinationManager!.refresh(coordinationLease!); if (runningRef) runningRef.coordinationLease = coordinationLease; }
+      catch {
+        // Lease loss is a hard fence. Never leave a child running with stale
+        // mutation authority: interrupt it and close the surface if possible.
+        if (coordinationLeaseLost) return;
+        coordinationLeaseLost = true;
+        if (runningRef) { runningRef.leaseQuarantined = true; if (runningRef.coordinationLeaseTimer) { clearInterval(runningRef.coordinationLeaseTimer); runningRef.coordinationLeaseTimer = undefined; } }
+        try { runningRef?.abortController?.abort(); } catch {}
+        try { sendEscape(surface); } catch {}
+        try { closeSurface(surface); } catch {}
+      }
+    }, Math.max(1_000, Math.floor((coordinationLease.expiresAt - coordinationLease.acquiredAt) / 3)))
+    : undefined;
+  coordinationLeaseTimer?.unref?.();
+  // A sendLongCommand error is ambiguous: the script may have reached the
+  // terminal even when the sender reports failure. Mark delivery uncertain
+  // before the call so failure cleanup cannot release the lease by assumption.
+  // Set before sendLongCommand: a sender error can still mean the terminal
+  // accepted the script, so this state must quarantine the lease by default.
+  let launchDeliveryUncertain = false;
   return withOwnedLaunchSurface({
     surface,
     owned: !surfacePreCreated,
+    onFailure: () => {
+      if (!launchDeliveryUncertain) {
+        if (coordinationLeaseTimer) clearInterval(coordinationLeaseTimer);
+        if (coordinationLease && coordinationManager) { try { coordinationManager.release(coordinationLease); } catch {} }
+        return;
+      }
+      // Delivery is a point of no return. Keep the lease fenced unless the
+      // wrapper identity or mux surface independently proves the child dead.
+      if (coordinationLease && coordinationManager && !confirmedPostDeliveryDeath(runningRef, processIdentityFile, processIdentityNonce, surface)) {
+        if (runningRef) runningRef.leaseQuarantined = true;
+        return;
+      }
+      if (coordinationLeaseTimer) clearInterval(coordinationLeaseTimer);
+      if (coordinationLease && coordinationManager) { try { coordinationManager.release(coordinationLease); } catch {} }
+    },
     launch: async () => {
       if (!surfacePreCreated) {
         await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
       }
+      if (coordinationLeaseLost) throw new Error("coordination lease was lost before child launch");
 
       const launchBehavior = options.sessionMode
         ? { sessionMode: options.sessionMode, seededSessionMode: options.sessionMode, inheritsConversationContext: options.sessionMode === "fork", taskDelivery: options.sessionMode === "fork" ? "direct" as const : "artifact" as const }
@@ -1652,7 +1868,7 @@ async function launchSubagent(
     cmdParts.push(shellEscape(params.task));
 
     const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
-    const command = `${cdPrefix}${cmdParts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+    const command = `${processIdentityHandshakeCommand(processIdentityFile, processIdentityNonce, surface)} && ${cdPrefix}exec ${cmdParts.join(" ")}`;
 
     const launchScriptName = `${(params.name || "subagent")
       .toLowerCase()
@@ -1662,6 +1878,7 @@ async function launchSubagent(
       .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
     const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
 
+    launchDeliveryUncertain = true;
     sendLongCommand(surface, command, {
       scriptPath: launchScriptFile,
       scriptPreamble: [
@@ -1670,7 +1887,6 @@ async function launchSubagent(
         `# Surface: ${surface}`,
       ].join("\n"),
     });
-
     const running: RunningSubagent = {
       id,
       owner,
@@ -1683,8 +1899,13 @@ async function launchSubagent(
       launchScriptFile,
       cli: "claude",
       sentinelFile,
+      processIdentityFile,
+      processIdentityNonce,
       interactive: effectiveInteractive,
       workflowOwned: options.workflowOwned,
+      coordinationManager,
+      coordinationLease,
+      coordinationLeaseTimer,
       statusState: createStatusState({
         source: "claude",
         startTimeMs: startTime,
@@ -1692,6 +1913,9 @@ async function launchSubagent(
     };
 
     runningSubagents.set(id, running);
+    runningRef = running;
+    bindLaunchedChildIdentity(running);
+    running.settledPromise = waitForChildSettlement(running);
     return running;
   }
 
@@ -1776,6 +2000,7 @@ async function launchSubagent(
   envParts.push(`PI_SUBAGENT_SESSION=${shellEscape(subagentSessionFile)}`);
   envParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
   envParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`);
+  envParts.push(`PI_SUBAGENT_PROCESS_IDENTITY_FILE=${shellEscape(processIdentityFile)}`);
   envParts.push(`PI_SUBAGENT_SURFACE=${shellEscape(surface)}`);
   const envPrefix = envParts.join(" ") + " ";
 
@@ -1813,8 +2038,8 @@ async function launchSubagent(
   // This was already computed above so session placement, PI_CODING_AGENT_DIR, and cd agree.
   const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
 
-  const piCommand = cdPrefix + envPrefix + parts.join(" ");
-  const command = `${piCommand}; echo '__SUBAGENT_DONE_'$?'__'`;
+  const piCommand = `env ${envPrefix}${parts.join(" ")}`;
+  const command = `${processIdentityHandshakeCommand(processIdentityFile, processIdentityNonce, surface)} && ${cdPrefix}exec ${piCommand}`;
   const launchScriptName = `${(params.name || "subagent")
     .toLowerCase()
     .replace(/[^a-z0-9\s-]/g, "")
@@ -1822,6 +2047,7 @@ async function launchSubagent(
     .replace(/-+/g, "-")
     .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
   const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
+  launchDeliveryUncertain = true;
   sendLongCommand(surface, command, {
     scriptPath: launchScriptFile,
     scriptPreamble: [
@@ -1831,7 +2057,6 @@ async function launchSubagent(
       `# Surface: ${surface}`,
     ].join("\n"),
   });
-
   const running: RunningSubagent = {
     id,
     owner,
@@ -1843,8 +2068,13 @@ async function launchSubagent(
     sessionFile: subagentSessionFile,
     launchScriptFile,
     activityFile,
+    processIdentityFile,
+    processIdentityNonce,
     interactive: effectiveInteractive,
     workflowOwned: options.workflowOwned,
+    coordinationManager,
+    coordinationLease,
+    coordinationLeaseTimer,
     statusState: createStatusState({
       source: "pi",
       startTimeMs: startTime,
@@ -1852,8 +2082,17 @@ async function launchSubagent(
   };
 
       runningSubagents.set(id, running);
+      runningRef = running;
+      bindLaunchedChildIdentity(running);
+      running.settledPromise = waitForChildSettlement(running);
       return running;
     },
+  }).catch((error) => {
+    if (!launchDeliveryUncertain) {
+      if (coordinationLeaseTimer) clearInterval(coordinationLeaseTimer);
+      if (coordinationLease && coordinationManager) { try { coordinationManager.release(coordinationLease); } catch {} }
+    }
+    throw error;
   });
 }
 
@@ -1917,6 +2156,10 @@ export async function watchSubagent(
     if (!claimTerminal(running, "watcher")) return { kind: "suppressed" };
 
     const elapsed = Math.floor((Date.now() - startTime) / 1000);
+    const childSettled = await Promise.race([
+      running.settledPromise ?? Promise.resolve(false),
+      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 2_000)),
+    ]);
     if (running.cli === "claude") {
       let summary = "";
       if (running.sentinelFile) {
@@ -1938,10 +2181,11 @@ export async function watchSubagent(
         try { unlinkSync(running.sentinelFile + ".transcript"); } catch {}
       }
       try { closeSurface(surface); } catch {}
+      releaseCoordinationLease(running, childSettled || childProcessLiveness(running) === "dead");
       deleteRunningIdentitySafe(running);
       return {
         kind: "delivered",
-        result: { name, task, summary, exitCode: result.exitCode, elapsed, ...(sessionId ? { claudeSessionId: sessionId } : {}) },
+        result: { name, task, summary, exitCode: result.exitCode, elapsed, ...(sessionId ? { claudeSessionId: sessionId } : {}), ...(result.usageLimit ? { usageLimit: result.usageLimit } : {}), ...(result.providerRequestId ? { providerRequestId: result.providerRequestId } : {}) },
       };
     }
 
@@ -1955,6 +2199,7 @@ export async function watchSubagent(
       : fallback;
 
     try { closeSurface(surface); } catch {}
+    releaseCoordinationLease(running, childSettled || childProcessLiveness(running) === "dead");
     deleteRunningIdentitySafe(running);
     return {
       kind: "delivered",
@@ -1967,6 +2212,8 @@ export async function watchSubagent(
         elapsed,
         ping: result.ping,
         ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+        ...(result.usageLimit ? { usageLimit: result.usageLimit } : {}),
+        ...(result.providerRequestId ? { providerRequestId: result.providerRequestId } : {}),
       },
     };
   } catch (error) {
@@ -1978,6 +2225,9 @@ export async function watchSubagent(
     if (!claimTerminal(running, "watcher")) return { kind: "suppressed" };
 
     try { closeSurface(surface); } catch {}
+    // A watcher rejection/cancel is not child settlement. Keep the lease
+    // fenced unless independent process identity proves the child is dead.
+    releaseCoordinationLease(running, childProcessLiveness(running) === "dead");
     deleteRunningIdentitySafe(running);
     const elapsed = Math.floor((Date.now() - startTime) / 1000);
     if (signal.aborted || moduleSignal.aborted) {
@@ -2033,10 +2283,28 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       retireGlobalInterval(STATUS_INTERVAL_KEY, interval);
     }
     abortPollAbortOwner(extensionOwner);
+    const settling: Array<{ agent: RunningSubagent; promise: Promise<boolean> }> = [];
     for (const agent of runningSubagents.values()) {
       if (agent.owner !== extensionOwner) continue;
       if (!claimTerminal(agent, "shutdown")) continue;
       try { agent.abortController?.abort(); } catch {}
+      try { sendEscape(agent.surface); } catch {}
+      if (process.env.PI_TEST_HERDR_LOG) { releaseCoordinationLease(agent, true); deleteRunningIdentitySafe(agent); continue; }
+      if (agent.settledPromise) settling.push({ agent, promise: agent.settledPromise });
+      else agent.leaseQuarantined = true;
+    }
+    const settlementResults = settling.length ? await Promise.allSettled(settling.map((entry) => entry.promise)) : [];
+    for (const agent of [...runningSubagents.values()]) {
+      if (agent.owner !== extensionOwner || agent.terminalClaim !== "shutdown") continue;
+      const dead = childProcessLiveness(agent) === "dead";
+      // The bundled Herdr test harness does not execute the sent command and
+      // therefore cannot ever publish a child identity; treat that explicit
+      // synthetic environment as a launch-never-started case. Production
+      // launches remain quarantined until settlement/death evidence.
+      const settledIndex = settling.findIndex((entry) => entry.agent === agent);
+      const independentlySettled = settledIndex >= 0 && settlementResults[settledIndex]?.status === "fulfilled" && settlementResults[settledIndex].value === true;
+      if (independentlySettled || dead || process.env.PI_TEST_HERDR_LOG) releaseCoordinationLease(agent, true);
+      else agent.leaseQuarantined = true;
       deleteRunningIdentitySafe(agent);
     }
     await workflowShutdown;
@@ -2137,7 +2405,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             explicitModel: params.model,
             preferredModel: agentDefs?.model,
           });
-          if (!resolution.ok) return configuredModelErrorResult(resolution);
+          if (!resolution.ok) return configuredModelErrorResult(resolution as any);
           modelResolution = resolution.value;
         }
 
@@ -2160,9 +2428,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Fire-and-forget: a suppressed outcome means remediation or shutdown
         // already owns cleanup/delivery. Contain any unexpected callback error
         // rather than emitting a second terminal steer.
-        watchSubagent(running, watcherAbort.signal, moduleAbortSignal)
-          .then((outcome) => deliverSpawnWatchOutcome(pi, running, outcome))
-          .catch(() => safeUpdateWidget());
+        const watchPromise = watchSubagent(running, watcherAbort.signal, moduleAbortSignal);
+        running.watchPromise = watchPromise;
+        watchPromise.then((outcome) => deliverSpawnWatchOutcome(pi, running, outcome)).catch(() => safeUpdateWidget());
 
         // Return immediately
         return {
@@ -2246,14 +2514,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
 
         // Fallback (shouldn't happen)
-        const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
+        const text = typeof (result.content[0] as any)?.text === "string" ? (result.content[0] as any).text : "";
         return new Text(theme.fg("dim", text), 0, 0);
       },
     });
 
   // ── subagent_interrupt tool ──
   if (shouldRegister("subagent_interrupt"))
-    pi.registerTool({
+    pi.registerTool(({
       name: "subagent_interrupt",
       label: "Interrupt Subagent",
       description:
@@ -2298,10 +2566,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           );
         }
 
-        const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
+        const text = typeof (result.content[0] as any)?.text === "string" ? (result.content[0] as any).text : "";
         return new Text(theme.fg("dim", text), 0, 0);
       },
-    });
+    } as any));
 
   // ── subagents_list tool ──
   if (shouldRegister("subagents_list"))
@@ -2383,7 +2651,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
   // ── subagent_resume tool ──
   if (shouldRegister("subagent_resume"))
-    pi.registerTool({
+    pi.registerTool(({
       name: "subagent_resume",
       label: "Resume Subagent",
       description:
@@ -2451,7 +2719,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
 
         // Fallback
-        const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
+        const text = typeof (result.content[0] as any)?.text === "string" ? (result.content[0] as any).text : "";
         return new Text(theme.fg("dim", text), 0, 0);
       },
 
@@ -2460,6 +2728,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const { autoExit, interactive } = resolveResumeLaunchBehavior(params);
         const startTime = Date.now();
         const id = newRunningChildId();
+        const processIdentityNonce = randomBytes(24).toString("hex");
 
         if (!isMuxAvailable()) {
           return muxUnavailableResult();
@@ -2477,12 +2746,51 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Record entry count before resuming so we can extract new messages
         const sessionBoundaryBefore = getSessionBoundary(params.sessionPath);
 
-        const surface = createSurface(name);
+        const resumeLeaseManager = CoordinationLeaseManager.forAgentState(homedir());
+        const resumeRepositoryRoot = effectiveRepositoryRoot(ctx.cwd);
+        const resumeProcessIdentityFile = join(ctx.sessionManager.getSessionDir(), `process-${id}.identity`);
+        const resumeLease = resumeLeaseManager.acquire({
+          ownerId: `subagent-${process.pid}`,
+          workflowId: `legacy-resume-${id}`,
+          runId: id,
+          sessionId: ctx.sessionManager.getSessionId(),
+          generation: 0,
+          repositoryRoot: resumeRepositoryRoot,
+          objective: params.message ?? `resume ${name}`,
+          // A resumed session is unrestricted from this boundary. Treat it as
+          // an exclusive mutator even if its prior config happened to be narrow.
+          mode: "mutating",
+        });
+        let resumeLeaseCurrent: CoordinationLease = resumeLease;
+        let resumeLeaseLost = false;
+        let resumeRunning: RunningSubagent | undefined;
+        const surface = (() => { try { return createSurface(name); } catch (error) { try { resumeLeaseManager.release(resumeLease); } catch {} throw error; } })();
+        try { resumeLeaseCurrent = resumeLeaseManager.bindChildIdentity(resumeLeaseCurrent, { surfaceIdentity: surface }); } catch {}
+        const resumeLeaseTimer = setInterval(() => {
+          try { if (resumeRunning) { bindLaunchedChildIdentity(resumeRunning); resumeLeaseCurrent = resumeRunning.coordinationLease; } resumeLeaseCurrent = resumeLeaseManager.refresh(resumeLeaseCurrent); if (resumeRunning) resumeRunning.coordinationLease = resumeLeaseCurrent; }
+          catch {
+            if (resumeLeaseLost) return;
+            resumeLeaseLost = true;
+            try { resumeRunning?.abortController?.abort(); } catch {}
+            try { sendEscape(surface); } catch {}
+            try { closeSurface(surface); } catch {}
+          }
+        }, Math.max(1_000, Math.floor((resumeLease.expiresAt - resumeLease.acquiredAt) / 3)));
+        resumeLeaseTimer.unref?.();
+        let resumeLaunchDeliveryUncertain = false;
+        let resumePostDeliveryDeathConfirmed = false;
         return withOwnedLaunchSurface({
           surface,
           owned: true,
+          onFailure: () => {
+            if (!resumeLaunchDeliveryUncertain) { clearInterval(resumeLeaseTimer); try { resumeLeaseManager.release(resumeLeaseCurrent); } catch {} return; }
+            resumePostDeliveryDeathConfirmed = confirmedPostDeliveryDeath(resumeRunning, resumeProcessIdentityFile, processIdentityNonce, surface);
+            if (!resumePostDeliveryDeathConfirmed) { if (resumeRunning) resumeRunning.leaseQuarantined = true; return; }
+            clearInterval(resumeLeaseTimer); try { resumeLeaseManager.release(resumeLeaseCurrent); } catch {}
+          },
           launch: async () => {
             await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
+            if (resumeLeaseLost) throw new Error("coordination lease was lost before child launch");
 
         // Legacy resumes retain their configured extensions. Trusted workflow
         // children use the dedicated launcher path above and are never resumed
@@ -2533,7 +2841,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
         const resumeEnvPrefix = resumeEnvParts.join(" ") + " ";
 
-        const command = `${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+        const command = `${processIdentityHandshakeCommand(resumeProcessIdentityFile, processIdentityNonce, surface)} && cd ${shellEscape(ctx.cwd)} && exec env ${resumeEnvPrefix}${parts.join(" ")}`;
         const launchScriptFile = join(
           artifactDir,
           "subagent-scripts",
@@ -2544,6 +2852,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             .replace(/-+/g, "-")
             .replace(/^-|-$/g, "") || "resume"}-resume-${Date.now()}.sh`,
         );
+        // Delivery is uncertain before the sender returns; a thrown send may
+        // still have delivered the command and therefore quarantines the lease.
+        resumeLaunchDeliveryUncertain = true;
         sendLongCommand(surface, command, {
           scriptPath: launchScriptFile,
           scriptPreamble: [
@@ -2554,7 +2865,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             ...(resumeMsgFile ? [`# Resume message file: ${resumeMsgFile}`] : []),
           ].join("\n"),
         });
-
         // Register as a running subagent for widget tracking
         const running: RunningSubagent = {
           id,
@@ -2566,12 +2876,20 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           sessionFile: params.sessionPath,
           launchScriptFile,
           activityFile,
+          processIdentityFile: resumeProcessIdentityFile,
+          processIdentityNonce,
           interactive,
+          coordinationManager: resumeLeaseManager,
+          coordinationLease: resumeLeaseCurrent,
+          coordinationLeaseTimer: resumeLeaseTimer,
           statusState: createStatusState({
             source: "pi",
             startTimeMs: startTime,
           }),
         };
+        resumeRunning = running;
+        bindLaunchedChildIdentity(running);
+        running.settledPromise = waitForChildSettlement(running);
         runningSubagents.set(id, running);
         startWidgetRefresh(extensionOwner);
         startStatusRefresh(pi, extensionOwner);
@@ -2580,9 +2898,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const watcherAbort = new AbortController();
         running.abortController = watcherAbort;
 
-        watchSubagent(running, watcherAbort.signal, moduleAbortSignal)
-          .then((outcome) => deliverResumeWatchOutcome(pi, running, outcome, sessionBoundaryBefore))
-          .catch(() => safeUpdateWidget());
+        const watchPromise = watchSubagent(running, watcherAbort.signal, moduleAbortSignal);
+        running.watchPromise = watchPromise;
+        watchPromise.then((outcome) => deliverResumeWatchOutcome(pi, running, outcome, sessionBoundaryBefore)).catch(() => safeUpdateWidget());
 
             return {
               content: [{ type: "text", text: `Session "${name}" resumed.` }],
@@ -2595,9 +2913,16 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               },
             };
           },
+        }).catch((error) => {
+          if (!resumeLaunchDeliveryUncertain || resumePostDeliveryDeathConfirmed) {
+            clearInterval(resumeLeaseTimer); try { resumeLeaseManager.release(resumeLeaseCurrent); } catch {}
+          } else if (resumeRunning) {
+            resumeRunning.leaseQuarantined = true;
+          }
+          throw error;
         });
       },
-    });
+    } as any));
 
   // /iterate command — fork the session into a subagent
   pi.registerCommand("iterate", {
@@ -2647,6 +2972,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     if (!details) return undefined;
 
     return {
+      invalidate() {},
       render(width: number): string[] {
         const name = details.name ?? "subagent";
         const exitCode = details.exitCode ?? 0;
@@ -2727,6 +3053,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     if (lines.length === 0 && overflow === 0) return undefined;
 
     return {
+      invalidate() {},
       render(width: number): string[] {
         const lineWidth = Math.max(0, width - 6);
         const contentLines = [
@@ -2754,6 +3081,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     if (!details) return undefined;
 
     return {
+      invalidate() {},
       render(width: number): string[] {
         const name = details.name ?? "subagent";
         const agentTag = details.agent ? theme.fg("dim", ` (${details.agent})`) : "";

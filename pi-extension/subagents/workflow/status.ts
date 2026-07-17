@@ -29,7 +29,7 @@ export function workflowNodeCounts(snapshot: WorkflowStatusSnapshot): WorkflowNo
   const values = Object.values(snapshot.nodes ?? {});
   const counts: Record<string, number> = { total: values.length };
   for (const value of values) counts[value] = (counts[value] ?? 0) + 1;
-  return counts as WorkflowNodeCounts;
+  return counts as unknown as WorkflowNodeCounts;
 }
 
 export function formatWorkflowElapsed(startTime: number, now = Date.now()): string {
@@ -66,36 +66,41 @@ export function workflowStatusDetails(snapshot: WorkflowStatusSnapshot) {
     runId: snapshot.metadata.runId,
     status: snapshot.metadata.status,
     nodeCounts: workflowNodeCounts(snapshot),
+    ...(snapshot.metadata.topology ? { topology: { nodeCount: snapshot.metadata.topology.nodeCount, edgeCount: snapshot.metadata.topology.edgeCount, maxDepth: snapshot.metadata.topology.maxDepth, topologyDigest: snapshot.metadata.topology.topologyDigest } } : {}),
+    ...(snapshot.metadata.pause ? { pause: { reason: snapshot.metadata.pause.reason, resetAt: snapshot.metadata.pause.resetAt, retryAfterMs: snapshot.metadata.pause.retryAfterMs, hintDigest: snapshot.metadata.pause.hintDigest } } : {}),
   };
 }
 
 /** Shared by legacy and workflow widgets so bordered surfaces use identical width accounting. */
 const ACCENT = "\x1b[38;2;77;163;255m";
 const RST = "\x1b[0m";
-export function workflowBorderLine(left: string, right: string, width: number): string {
+export function workflowBorderLine(left: string, right: string, width: number, accent?: (text: string) => string): string {
   if (width <= 0) return "";
-  if (width === 1) return `${ACCENT}│${RST}`;
+  const edge = accent ?? ((text: string) => `${ACCENT}${text}${RST}`);
+  if (width === 1) return edge("│");
   const contentWidth = Math.max(0, width - 2);
   const rightSafe = truncateToWidth(right, contentWidth);
   const rightVis = visibleWidth(rightSafe);
   const leftSafe = truncateToWidth(left, Math.max(0, contentWidth - rightVis));
   const pad = Math.max(0, contentWidth - visibleWidth(leftSafe) - rightVis);
-  return `${ACCENT}│${RST}${leftSafe}${" ".repeat(pad)}${rightSafe}${ACCENT}│${RST}`;
+  return edge(`│${leftSafe}${" ".repeat(pad)}${rightSafe}│`);
 }
-export function workflowBorderTop(title: string, info: string, width: number): string {
+export function workflowBorderTop(title: string, info: string, width: number, accent?: (text: string) => string): string {
   if (width <= 0) return "";
-  if (width === 1) return `${ACCENT}╭${RST}`;
+  const edge = accent ?? ((text: string) => `${ACCENT}${text}${RST}`);
+  if (width === 1) return edge("╭");
   const inner = Math.max(0, width - 2);
   const titlePart = `─ ${title} `;
   const infoPart = ` ${info} ─`;
   const fill = Math.max(0, inner - visibleWidth(titlePart) - visibleWidth(infoPart));
   const content = truncateToWidth(`${titlePart}${"─".repeat(fill)}${infoPart}`, inner).padEnd(inner, "─");
-  return `${ACCENT}╭${content}╮${RST}`;
+  return edge(`╭${content}╮`);
 }
-export function workflowBorderBottom(width: number): string {
+export function workflowBorderBottom(width: number, accent?: (text: string) => string): string {
   if (width <= 0) return "";
-  if (width === 1) return `${ACCENT}╰${RST}`;
-  return `${ACCENT}╰${"─".repeat(Math.max(0, width - 2))}╯${RST}`;
+  const edge = accent ?? ((text: string) => `${ACCENT}${text}${RST}`);
+  if (width === 1) return edge("╰");
+  return edge(`╰${"─".repeat(Math.max(0, width - 2))}╯`);
 }
 
 /** A stable, visually distinct icon for every node lifecycle state. */
@@ -133,5 +138,5 @@ export function workflowWidgetRight(snapshot: WorkflowStatusSnapshot): string {
   const failed = (counts.failed ?? 0) + (counts.blocked ?? 0);
   const icon = snapshot.metadata.status === "completed" ? "✓" : snapshot.metadata.status === "failed" || failed ? "✗" : snapshot.metadata.status === "cancelling" ? "…" : "•";
   const summary = total ? `${done}/${total}` : snapshot.metadata.status;
-  return `${icon} ${summary} ${snapshot.metadata.status}`;
+  return `${icon} ${summary} · ${snapshot.metadata.status}`;
 }
